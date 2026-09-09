@@ -1,0 +1,19 @@
+.{
+    .name = .Velocitty,
+    .version = "0.9.0",
+    .fingerprint = 0x6d8b32cc71fd876e, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .sdl3_win32_x64 = .{
+            .url = "https://github.com/libsdl-org/SDL/releases/download/release-3.4.16/SDL3-3.4.16-win32-x64.zip",
+            .hash = "N-V-__8AAB5tKwDtx53QkXJrR4unodgSE2a_jDP1ymrukNSP",
+            .lazy = true,
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "lib",
+    },
+}

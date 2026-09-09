@@ -1,0 +1,36 @@
+# Zig
+.zig-cache/
+zig-cache/
+zig-out/
+
+# Fetched package cache
+zig-pkg/
+
+# Local bench dumps 
+/bench
+/last_bench
+
+# Compiled leftovers
+*.o
+*.obj
+*.exe
+*.pdb
+*.a
+*.so
+*.dylib
+*.dll
+a.out
+*.out
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editors
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.code-workspace
