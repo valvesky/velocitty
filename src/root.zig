@@ -15,9 +15,10 @@ pub const parseScheme = @import("scheme.zig").parseScheme;
 pub const Draw = @import("draw.zig");
 pub const Type = @import("type.zig");
 pub const Events = @import("events.zig");
+pub const Select = @import("select.zig");
 pub const Kitty = @import("kitty.zig");
-pub const Daemon = @import("daemon.zig");
-pub const Mux = @import("mux.zig");
+
+
 pub const Engine = @import("engine.zig").Engine;
 pub const Platform = @import("platform.zig").Platform;
 pub const Loop = @import("loop.zig").Loop;
@@ -38,6 +39,7 @@ test {
     _ = Draw;
     _ = Type;
     _ = Events;
+    _ = Select;
     _ = Kitty;
     _ = Daemon;
     _ = Mux;

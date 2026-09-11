@@ -164,6 +164,12 @@ const c = struct {
     pub var SDL_GetWindowProperties: *const fn (window: *Window) callconv(.c) u32 = undefined;
     pub var SDL_GetPointerProperty: *const fn (props: u32, name: [*:0]const u8, default_value: ?*anyopaque) callconv(.c) ?*anyopaque = undefined;
     pub var SDL_GetNumberProperty: *const fn (props: u32, name: [*:0]const u8, default_value: i64) callconv(.c) i64 = undefined;
+    pub var SDL_SetClipboardText: *const fn (text: [*:0]const u8) callconv(.c) bool = undefined;
+    pub var SDL_GetClipboardText: *const fn () callconv(.c) [*:0]u8 = undefined;
+    pub var SDL_HasClipboardText: *const fn () callconv(.c) bool = undefined;
+    pub var SDL_free: *const fn (mem: ?*anyopaque) callconv(.c) void = undefined;
+    pub var SDL_SetPrimarySelectionText: ?*const fn (text: [*:0]const u8) callconv(.c) bool = null;
+    pub var SDL_GetPrimarySelectionText: ?*const fn () callconv(.c) [*:0]u8 = null;
 };
 
 var sdl_loaded: bool = false;
@@ -255,12 +261,22 @@ fn bindAll(lookup: anytype, ctx: anytype) bool {
         .{ "SDL_GetPointerProperty", &c.SDL_GetPointerProperty },
         .{ "SDL_GetNumberProperty", &c.SDL_GetNumberProperty },
         .{ "SDL_GetError", &c.SDL_GetError },
+        .{ "SDL_SetClipboardText", &c.SDL_SetClipboardText },
+        .{ "SDL_GetClipboardText", &c.SDL_GetClipboardText },
+        .{ "SDL_HasClipboardText", &c.SDL_HasClipboardText },
+        .{ "SDL_free", &c.SDL_free },
     }) |pair| {
         const ptr = lookup(ctx, pair[0]) orelse return false;
         pair[1].* = @ptrCast(@alignCast(ptr));
     }
     if (lookup(ctx, "SDL_SetRenderVSync")) |ptr| {
         c.SDL_SetRenderVSync = @ptrCast(@alignCast(ptr));
+    }
+    if (lookup(ctx, "SDL_SetPrimarySelectionText")) |ptr| {
+        c.SDL_SetPrimarySelectionText = @ptrCast(@alignCast(ptr));
+    }
+    if (lookup(ctx, "SDL_GetPrimarySelectionText")) |ptr| {
+        c.SDL_GetPrimarySelectionText = @ptrCast(@alignCast(ptr));
     }
     return true;
 }
@@ -278,6 +294,8 @@ pub const Host = struct {
     loop: ?*Loop = null,
     last_mouse_col: u16 = 0xffff,
     last_mouse_row: u16 = 0xffff,
+    selecting: bool = false,
+    sel_click: u8 = 1,
     pty_file: xev.File = undefined,
     pty_c: xev.Completion = .{},
     win_file: xev.File = undefined,
@@ -444,7 +462,7 @@ pub const Host = struct {
                 },
                 c.EVENT_TEXT_INPUT => {
                     const mods = modsFrom(c.SDL_GetModState());
-                    if (mods.ctrl or mods.alt) continue;
+                    if (mods.ctrl or mods.alt or mods.super) continue;
                     const s = std.mem.span(ev.text.text);
                     if (s.len != 0) self.send(loop, s);
                 },
@@ -464,7 +482,7 @@ pub const Host = struct {
                         .button = button,
                         .action = if (down) .press else .release,
                         .mods = modsFrom(c.SDL_GetModState()),
-                    }, ev.button.x, ev.button.y);
+                    }, ev.button.x, ev.button.y, ev.button.clicks);
                 },
                 c.EVENT_MOUSE_MOTION => {
                     const button = motionButton(ev.motion.state);
@@ -475,7 +493,7 @@ pub const Host = struct {
                         .button = button,
                         .action = action,
                         .mods = modsFrom(c.SDL_GetModState()),
-                    }, ev.motion.x, ev.motion.y);
+                    }, ev.motion.x, ev.motion.y, 0);
                 },
                 c.EVENT_MOUSE_WHEEL => {
                     var y_ticks = ev.wheel.integer_y;
@@ -499,7 +517,7 @@ pub const Host = struct {
                                 .button = button,
                                 .action = .press,
                                 .mods = mods,
-                            }, ev.wheel.mouse_x, ev.wheel.mouse_y);
+                            }, ev.wheel.mouse_x, ev.wheel.mouse_y, 0);
                         }
                     }
                     if (x_ticks != 0) {
@@ -512,7 +530,7 @@ pub const Host = struct {
                                 .button = button,
                                 .action = .press,
                                 .mods = mods,
-                            }, ev.wheel.mouse_x, ev.wheel.mouse_y);
+                            }, ev.wheel.mouse_x, ev.wheel.mouse_y, 0);
                         }
                     }
                 },
@@ -560,9 +578,17 @@ pub const Host = struct {
             if (loop.engine) |engine| self.present(&engine.frame);
             return;
         }
+        const code = mapSdlKey(sdl_key);
+        if (isCopy(mods, sdl_key)) {
+            if (!repeat) self.copySelection(loop);
+            return;
+        }
+        if (isPaste(mods, sdl_key, code)) {
+            if (!repeat) self.pasteClipboard(loop, .clipboard);
+            return;
+        }
         const printable = sdl_key >= 0x20 and sdl_key < 0x7f;
         if (printable and !mods.ctrl and !mods.alt) return;
-        const code = mapSdlKey(sdl_key);
         if (code == 0) return;
         const engine = loop.engine orelse return;
         var buf: [32]u8 = undefined;
@@ -576,7 +602,7 @@ pub const Host = struct {
         return .{ .x = x * s, .y = y * s };
     }
 
-    fn handleMouse(self: *Host, loop: *Loop, mouse: zt.Events.Mouse, px: f32, py: f32) void {
+    fn handleMouse(self: *Host, loop: *Loop, mouse: zt.Events.Mouse, px: f32, py: f32, clicks: u8) void {
         const engine = loop.engine orelse return;
         const pix = self.toPixels(px, py);
         var m = mouse;
@@ -588,6 +614,41 @@ pub const Host = struct {
             .wheel_up, .wheel_down, .wheel_left, .wheel_right => true,
             else => false,
         };
+        if (self.selecting) {
+            if (mouse.action == .drag) {
+                engine.selection.extend(cell.col, cell.row);
+                engine.redraw();
+                self.present(&engine.frame);
+                return;
+            }
+            if (mouse.action == .release and mouse.button == .left) {
+                self.selecting = false;
+                if (self.sel_click < 2 and engine.selection.sameCell()) engine.selection.clear();
+                engine.redraw();
+                self.present(&engine.frame);
+                if (engine.selection.on) self.copySelection(loop);
+                return;
+            }
+        }
+        const grab = mouse.button == .left and (mode.mouse == .off or mouse.mods.shift);
+        if (grab and mouse.action == .press) {
+            self.selecting = true;
+            self.sel_click = if (clicks == 0) 1 else clicks;
+            if (self.sel_click >= 3) {
+                engine.selection = zt.Select.lineAt(&engine.screen, cell.row);
+            } else if (self.sel_click == 2) {
+                engine.selection = zt.Select.wordAt(&engine.screen, cell.col, cell.row);
+            } else {
+                engine.selection.begin(cell.col, cell.row);
+            }
+            engine.redraw();
+            self.present(&engine.frame);
+            return;
+        }
+        if (mouse.button == .middle and mouse.action == .press and (mode.mouse == .off or mouse.mods.shift)) {
+            self.pasteClipboard(loop, .primary);
+            return;
+        }
         if (mode.mouse == .off) {
             if (!wheel) return;
             if (engine.screen.altScreen() and mode.alt_scroll) {
@@ -608,6 +669,11 @@ pub const Host = struct {
             }
             return;
         }
+        if (mouse.action == .press and mouse.button == .left and engine.selection.on) {
+            engine.selection.clear();
+            engine.redraw();
+            self.present(&engine.frame);
+        }
         if (mouse.action == .move or mouse.action == .drag) {
             if (cell.col == self.last_mouse_col and cell.row == self.last_mouse_row) return;
         }
@@ -621,6 +687,51 @@ pub const Host = struct {
             .pixels = mode.mouse_pixels,
         });
         if (bytes.len != 0) self.send(loop, bytes);
+    }
+
+    fn copySelection(self: *Host, loop: *Loop) void {
+        _ = self;
+        const engine = loop.engine orelse return;
+        const text = engine.selectedTextAlloc() catch return;
+        defer engine.allocator.free(text);
+        if (text.len == 0) return;
+        const z = engine.allocator.allocSentinel(u8, text.len, 0) catch return;
+        defer engine.allocator.free(z);
+        @memcpy(z, text);
+        _ = c.SDL_SetClipboardText(z);
+        if (c.SDL_SetPrimarySelectionText) |f| _ = f(z);
+    }
+
+    const ClipSrc = enum { clipboard, primary };
+
+    fn pasteClipboard(self: *Host, loop: *Loop, src: ClipSrc) void {
+        const p = switch (src) {
+            .clipboard => c.SDL_GetClipboardText(),
+            .primary => if (c.SDL_GetPrimarySelectionText) |f| f() else c.SDL_GetClipboardText(),
+        };
+        if (@intFromPtr(p) == 0) return;
+        defer c.SDL_free(@ptrCast(p));
+        const s = std.mem.span(p);
+        if (s.len == 0) {
+            if (src == .primary) self.pasteClipboard(loop, .clipboard);
+            return;
+        }
+        self.pasteBytes(loop, s);
+    }
+
+    fn pasteBytes(self: *Host, loop: *Loop, bytes: []const u8) void {
+        const engine = loop.engine orelse return;
+        const bracket = engine.screen.inputMode().bracket_paste;
+        if (bracket) self.send(loop, zt.Events.paste_start);
+        var rest = bytes;
+        var buf: [4096]u8 = undefined;
+        while (rest.len != 0) {
+            const n = zt.Events.filterPaste(&buf, rest, bracket);
+            if (n.in == 0) break;
+            if (n.out != 0) self.send(loop, buf[0..n.out]);
+            rest = rest[n.in..];
+        }
+        if (bracket) self.send(loop, zt.Events.paste_end);
     }
 
     fn send(self: *Host, loop: *Loop, bytes: []const u8) void {
@@ -810,6 +921,20 @@ fn modsFrom(m: u16) zt.Events.Mods {
         .alt = m & c.KMOD_ALT != 0,
         .super = m & c.KMOD_GUI != 0,
     };
+}
+
+fn isCopy(mods: zt.Events.Mods, sdl_key: u32) bool {
+    const letter = sdl_key == 'c' or sdl_key == 'C';
+    if (!letter) return false;
+    if (mods.ctrl and mods.shift and !mods.alt) return true;
+    return mods.super and !mods.ctrl and !mods.alt;
+}
+
+fn isPaste(mods: zt.Events.Mods, sdl_key: u32, code: u32) bool {
+    const letter = sdl_key == 'v' or sdl_key == 'V';
+    if (letter and mods.ctrl and mods.shift and !mods.alt) return true;
+    if (letter and mods.super and !mods.ctrl and !mods.alt) return true;
+    return code == @intFromEnum(zt.Events.KeySym.insert) and mods.shift and !mods.ctrl and !mods.alt;
 }
 
 fn sdlButton(b: u8) zt.Events.Button {

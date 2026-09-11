@@ -5,12 +5,6 @@ const Host = @import("host.zig").Host;
 const Pty = @import("pty.zig").Pty;
 const Debug = zt.Debug;
 
-const Mode = union(enum) {
-    standalone,
-    daemon,
-    attach: []const u8,
-};
-
 const font_paths: []const []const u8 = switch (builtin.os.tag) {
     .macos, .ios, .tvos, .watchos, .visionos => &.{
         "/Library/Fonts/Courier New.ttf",
@@ -51,6 +45,7 @@ const fallback_paths: []const []const u8 = switch (builtin.os.tag) {
 };
 
 pub fn main(init: std.process.Init) !void {
+
     var it = try init.minimal.args.iterateAllocator(init.gpa);
     defer it.deinit();
 
@@ -58,124 +53,109 @@ pub fn main(init: std.process.Init) !void {
     defer list.deinit(init.gpa);
     while (it.next()) |a| try list.append(init.gpa, a);
 
-    const mode = parseMode(list.items) catch {
-        std.debug.print("usage: zt [--daemon | --attach [session]]\n", .{});
-        return error.InvalidArg;
+    const cols: u16 = 80;
+    const rows: u16 = 24;
+    const size_px: f32 = 16;
+    var cell_w: u32 = 8;
+    var cell_h: u32 = 16;
+
+    const config = loadConfig(init.io, init.gpa);
+
+    var font_bufs: std.ArrayList([]u8) = .empty;
+
+    defer {
+        for (font_bufs.items) |b| init.gpa.free(b);
+        font_bufs.deinit(init.gpa);
+    }
+
+    loadFonts(init.io, init.gpa, &font_bufs) catch |err| {
+        Debug.log("font: {}", .{err});
     };
 
-    switch (mode) {
-        .standalone => {
-            const cols: u16 = 80;
-            const rows: u16 = 24;
-            const size_px: f32 = 16;
-            var cell_w: u32 = 8;
-            var cell_h: u32 = 16;
-            const config = loadConfig(init.io, init.gpa);
+    var type_ctx: ?zt.Type.Context = null;
+    defer if (type_ctx) |*t| t.deinit();
 
-            var font_bufs: std.ArrayList([]u8) = .empty;
-            defer {
-                for (font_bufs.items) |b| init.gpa.free(b);
-                font_bufs.deinit(init.gpa);
-            }
-            loadFonts(init.io, init.gpa, &font_bufs) catch |err| {
-                Debug.log("font: {}", .{err});
-            };
+    if (font_bufs.items.len != 0) {
+        type_ctx = zt.Type.Context.init(init.gpa, .{}) catch |err| blk: {
+            Debug.log("type init: {}", .{err});
+            break :blk null;
+        };
 
-            var type_ctx: ?zt.Type.Context = null;
-            defer if (type_ctx) |*t| t.deinit();
-            if (font_bufs.items.len != 0) {
-                type_ctx = zt.Type.Context.init(init.gpa, .{}) catch |err| blk: {
-                    Debug.log("type init: {}", .{err});
-                    break :blk null;
+        if (type_ctx) |*t| {
+            var fallbacks: std.ArrayList(zt.Type.FontId) = .empty;
+            defer fallbacks.deinit(init.gpa);
+            var have_primary = false;
+            for (font_bufs.items) |bytes| {
+                const id = t.addFont(bytes, .{}) catch |err| {
+                    Debug.log("addFont: {}", .{err});
+                    continue;
                 };
-                if (type_ctx) |*t| {
-                    var fallbacks: std.ArrayList(zt.Type.FontId) = .empty;
-                    defer fallbacks.deinit(init.gpa);
-                    var have_primary = false;
-                    for (font_bufs.items) |bytes| {
-                        const id = t.addFont(bytes, .{}) catch |err| {
-                            Debug.log("addFont: {}", .{err});
-                            continue;
-                        };
-                        if (!have_primary) {
-                            have_primary = true;
-                        } else {
-                            fallbacks.append(init.gpa, id) catch {};
-                        }
-                    }
-                    if (fallbacks.items.len != 0) {
-                        t.setFallbacks(fallbacks.items) catch |err| {
-                            Debug.log("fallbacks: {}", .{err});
-                        };
-                    }
-                    if (t.metrics(size_px)) |m| {
-                        const h = m.ascender - m.descender + m.line_gap;
-                        cell_h = @max(1, @as(u32, @intFromFloat(@ceil(h))));
-                    } else |err| Debug.log("metrics: {}", .{err});
-                    if (t.glyph('M', size_px)) |g| {
-                        cell_w = @max(1, @as(u32, @intFromFloat(@ceil(g.advance))));
-                    } else |err| Debug.log("glyph M: {}", .{err});
+                if (!have_primary) {
+                    have_primary = true;
+                } else {
+                    fallbacks.append(init.gpa, id) catch {};
                 }
-            } else {
-                Debug.log("no monospace font found", .{});
             }
-
-            const px_w: u32 = @as(u32, cols) * cell_w;
-            const px_h: u32 = @as(u32, rows) * cell_h;
-            var pty = try Pty.open(
-                cols,
-                rows,
-                @intCast(@min(px_w, 65535)),
-                @intCast(@min(px_h, 65535)),
-            );
-            defer pty.close();
-
-            var host = zt.Platform.init(init.gpa);
-            defer host.deinit();
-            const id = try host.open(.{ .engine = .{
-                .cols = cols,
-                .rows = rows,
-                .cell_w = cell_w,
-                .cell_h = cell_h,
-                .size_px = size_px,
-                .hz = config.hz,
-                .scheme = config.scheme,
-                .whitelist = config.whitelist,
-            } });
-            const window = host.get(id);
-            if (type_ctx) |*t| window.engine.type_ctx = t;
-
-            var loop = try zt.Loop.init(init.gpa);
-            defer loop.deinit();
-            loop.engine = &window.engine;
-            var display = try Host.open(window.title, window.engine.frame.width, window.engine.frame.height);
-            defer display.close();
-            display.pty = &pty;
-            loop.userdata = &display;
-            loop.on_frame = &onFrame;
-            display.syncEngine(&window.engine);
-            window.engine.refresh() catch |err| Debug.log("refresh: {}", .{err});
-            display.present(&window.engine.frame);
-            display.watch(&loop);
-            try loop.run();
-        },
-        .daemon => {
-            var loop = try zt.Loop.init(init.gpa);
-            defer loop.deinit();
-            var server = zt.Daemon.Server.init(init.gpa, &loop, .{});
-            defer server.deinit();
-            try server.listen();
-            std.debug.print("zt daemon\n", .{});
-            try loop.run();
-        },
-        .attach => |session| {
-            var loop = try zt.Loop.init(init.gpa);
-            defer loop.deinit();
-            const reply = try zt.Daemon.request(init.gpa, &loop, zt.Daemon.default_port, .attach, session);
-            defer init.gpa.free(reply);
-            std.debug.print("{s}", .{reply});
-        },
+            if (fallbacks.items.len != 0) {
+                t.setFallbacks(fallbacks.items) catch |err| {
+                    Debug.log("fallbacks: {}", .{err});
+                };
+            }
+            if (t.metrics(size_px)) |m| {
+                const h = m.ascender - m.descender + m.line_gap;
+                cell_h = @max(1, @as(u32, @intFromFloat(@ceil(h))));
+            } else |err| Debug.log("metrics: {}", .{err});
+            if (t.glyph('M', size_px)) |g| {
+                cell_w = @max(1, @as(u32, @intFromFloat(@ceil(g.advance))));
+            } else |err| Debug.log("glyph M: {}", .{err});
+        }
+    } else {
+        Debug.log("no monospace font found", .{});
     }
+
+    const px_w: u32 = @as(u32, cols) * cell_w;
+    const px_h: u32 = @as(u32, rows) * cell_h;
+    var pty = try Pty.open(
+        cols,
+        rows,
+        @intCast(@min(px_w, 65535)),
+        @intCast(@min(px_h, 65535)),
+    );
+    defer pty.close();
+
+    var host = zt.Platform.init(init.gpa);
+    defer host.deinit();
+
+    const id = try host.open(.{ .engine = .{
+        .cols = cols,
+        .rows = rows,
+        .cell_w = cell_w,
+        .cell_h = cell_h,
+        .size_px = size_px,
+        .hz = config.hz,
+        .scheme = config.scheme,
+        .whitelist = config.whitelist,
+    } });
+
+    const window = host.get(id);
+    if (type_ctx) |*t| window.engine.type_ctx = t;
+
+    var loop = try zt.Loop.init(init.gpa);
+    defer loop.deinit();
+    loop.engine = &window.engine;
+    var display = try Host.open(window.title, window.engine.frame.width, window.engine.frame.height);
+    defer display.close();
+
+    display.pty = &pty;
+    loop.userdata = &display;
+    loop.on_frame = &onFrame;
+
+    display.syncEngine(&window.engine);
+    window.engine.refresh() catch |err| Debug.log("refresh: {}", .{err});
+    display.present(&window.engine.frame);
+    display.watch(&loop);
+
+    try loop.run();
 }
 
 fn loadConfig(io: std.Io, gpa: std.mem.Allocator) zt.Config {

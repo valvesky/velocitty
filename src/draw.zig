@@ -5,6 +5,7 @@ const assert = std.debug.assert;
 const Term = @import("term.zig");
 const Type = @import("type.zig");
 const Box = @import("draw/box.zig");
+const Select = @import("select.zig");
 
 const vec_len = std.simd.suggestVectorLength(u32) orelse 4;
 
@@ -31,6 +32,7 @@ pub const Frame = struct {
     dirty_full: bool = true,
     last_fill_ns: u64 = 0,
     last_glyph_ns: u64 = 0,
+    prev_sel: Select.State = .{},
 
     pub fn init(allocator: std.mem.Allocator, width: u32, height: u32) std.mem.Allocator.Error!Frame {
         assert(width > 0);
@@ -86,6 +88,10 @@ pub const Frame = struct {
     }
 
     pub fn render(self: *Frame, screen: *const Term.Screen, cell_w: u32, cell_h: u32, type_ctx: ?*Type.Context, size_px: f32) void {
+        self.renderSel(screen, cell_w, cell_h, type_ctx, size_px, .{});
+    }
+
+    pub fn renderSel(self: *Frame, screen: *const Term.Screen, cell_w: u32, cell_h: u32, type_ctx: ?*Type.Context, size_px: f32, sel: Select.State) void {
         assert(cell_w > 0);
         assert(cell_h > 0);
         assert(self.width == @as(u32, screen.cols) * cell_w);
@@ -145,8 +151,9 @@ pub const Frame = struct {
             const cursor_row = mustPaintCursorRow(r, self.prev_cursor, self.prev_cursor_on, cur, cur_on) or
                 (style_changed and (r == cur.row or r == self.prev_cursor.row)) or
                 (scroll != 0 and cur_on and r == cur.row);
+            const sel_row = sel.coversRow(r, cols) or self.prev_sel.coversRow(r, cols);
             var need = true;
-            if (!paint_all and !cursor_row) {
+            if (!paint_all and !cursor_row and !sel_row) {
                 if (use_bits and !screen.lineDirty(r)) {
                     need = false;
                 } else if (have_prev and rowEql(screen.rowCells(r), self.prevRow(r, cols))) {
@@ -185,7 +192,7 @@ pub const Frame = struct {
             const run = run_buf[ri];
             const y0 = @as(u32, run.start) * cell_h;
             const tf0 = nowNs();
-            fillRun(self, screen, run.start, run.end, cell_w, cell_h);
+            fillRun(self, screen, run.start, run.end, cell_w, cell_h, sel);
             fill_ns += @intCast(nowNs() - tf0);
             const clip = Clip{
                 .x0 = 0,
@@ -200,7 +207,7 @@ pub const Frame = struct {
                 if (gr < 0 or gr >= rows) continue;
                 const rr: u16 = @intCast(gr);
                 const line = screen.rowCells(rr);
-                blitLine(self, line, rr, 0, @intCast(line.len), cell_w, cell_h, type_ctx, size, baseline, clip);
+                blitLine(self, line, rr, 0, @intCast(line.len), cell_w, cell_h, type_ctx, size, baseline, clip, sel);
             }
             var rr: u16 = run.start;
             while (rr < run.end) : (rr += 1) {
@@ -221,6 +228,7 @@ pub const Frame = struct {
         self.prev_cursor = cur;
         self.prev_cursor_on = cur_on;
         self.prev_cursor_style = style;
+        self.prev_sel = sel;
         if (self.dirty_h == self.height) self.dirty_full = true;
     }
 
@@ -233,6 +241,7 @@ pub const Frame = struct {
         self.prev_rows = 0;
         self.prev_cursor_on = false;
         self.prev_cursor_style = .block;
+        self.prev_sel = .{};
     }
 
     fn ensurePrev(self: *Frame, cols: u16, rows: u16) bool {
@@ -268,14 +277,16 @@ fn fillRun(
     end: u16,
     cell_w: u32,
     cell_h: u32,
+    sel: Select.State,
 ) void {
     const y0 = @as(u32, start) * cell_h;
-    if (runUniformBg(screen, start, end)) |bg| {
+    const uniform = if (sel.overlapsRows(start, end, screen.cols)) null else runUniformBg(screen, start, end);
+    if (uniform) |bg| {
         fillRect(self, 0, y0, self.width, @as(u32, end - start) * cell_h, bg);
     } else {
         var rr: u16 = start;
         while (rr < end) : (rr += 1) {
-            paintBg(self, screen.rowCells(rr), rr, cell_w, cell_h);
+            paintBg(self, screen.rowCells(rr), rr, cell_w, cell_h, sel, screen.cols);
         }
     }
     var rr: u16 = start;
@@ -392,21 +403,32 @@ fn effectiveFg(cell: Term.Cell) Term.Color {
     return fg;
 }
 
-fn paintBg(self: *Frame, line: []const Term.Cell, row: u16, cell_w: u32, cell_h: u32) void {
-    paintBgSpan(self, line, row, 0, @intCast(line.len), cell_w, cell_h);
+fn paintBg(self: *Frame, line: []const Term.Cell, row: u16, cell_w: u32, cell_h: u32, sel: Select.State, cols: u16) void {
+    paintBgSpan(self, line, row, 0, @intCast(line.len), cell_w, cell_h, sel, cols);
 }
 
-fn paintBgSpan(self: *Frame, line: []const Term.Cell, row: u16, col0: u16, col1: u16, cell_w: u32, cell_h: u32) void {
+fn paintBgSpan(self: *Frame, line: []const Term.Cell, row: u16, col0: u16, col1: u16, cell_w: u32, cell_h: u32, sel: Select.State, cols: u16) void {
     const y0 = @as(u32, row) * cell_h;
     const last: u16 = @intCast(@min(@as(usize, col1), line.len));
     var c = col0;
     while (c < last) {
-        const bg = packColor(effectiveBg(line[c]));
+        const bg = packColor(paintColors(line[c], sel.contains(c, row, cols)).bg);
         var n: u16 = 1;
-        while (c + n < last and packColor(effectiveBg(line[c + n])) == bg) : (n += 1) {}
+        while (c + n < last and packColor(paintColors(line[c + n], sel.contains(c + n, row, cols)).bg) == bg) : (n += 1) {}
         fillRect(self, @as(u32, c) * cell_w, y0, @as(u32, n) * cell_w, cell_h, bg);
         c += n;
     }
+}
+
+fn paintColors(cell: Term.Cell, selected: bool) struct { fg: Term.Color, bg: Term.Color } {
+    var fg = effectiveFg(cell);
+    var bg = effectiveBg(cell);
+    if (selected) {
+        const tmp = fg;
+        fg = bg;
+        bg = tmp;
+    }
+    return .{ .fg = fg, .bg = bg };
 }
 
 fn packColor(color: Term.Color) u32 {
@@ -425,6 +447,7 @@ fn blitLine(
     size: f32,
     baseline: f32,
     clip: Clip,
+    sel: Select.State,
 ) void {
     const y0 = @as(u32, row) * cell_h;
     const last: u16 = @intCast(@min(@as(usize, col1), line.len));
@@ -432,8 +455,9 @@ fn blitLine(
     while (c < last) : (c += 1) {
         const cell = line[c];
         if (cell.attrs.hidden or cell.codepoint == 0) continue;
-        const fg = packColor(effectiveFg(cell));
-        const bg = packColor(effectiveBg(cell));
+        const painted = paintColors(cell, sel.contains(c, row, @intCast(line.len)));
+        const fg = packColor(painted.fg);
+        const bg = packColor(painted.bg);
         const x0 = @as(u32, c) * cell_w;
         if (!(cell.codepoint >= 0x80 and Box.paint(
             self.pixels,
@@ -898,4 +922,24 @@ test "ncmpcpp acs header bars fill the cell" {
     try std.testing.expectEqual(red, frame.pixels[4 * 24 + 0]);
     try std.testing.expectEqual(red, frame.pixels[4 * 24 + 7]);
     try std.testing.expectEqual(@as(u32, 0xff000000), frame.pixels[0]);
+}
+
+test "selection inverts cell colors" {
+    const gpa = std.testing.allocator;
+    var screen = try Term.Screen.init(gpa, 2, 1);
+    defer screen.deinit();
+    const Runs = @import("runs.zig");
+    var runs: std.ArrayList(Runs.Run) = .empty;
+    defer runs.deinit(gpa);
+    const src = "\x1b[?25lAB";
+    try Runs.split(gpa, src, &runs);
+    screen.feed(runs.items, src);
+    var frame = try Frame.init(gpa, 8, 4);
+    defer frame.deinit();
+    const sel: Select.State = .{ .on = true, .a = .{ .col = 0, .row = 0 }, .b = .{ .col = 0, .row = 0 } };
+    frame.renderSel(&screen, 4, 4, null, 4, sel);
+    const fg = Frame.pack(Term.Color.default_fg);
+    const bg = Frame.pack(Term.Color.default_bg);
+    try std.testing.expectEqual(fg, frame.pixels[0]);
+    try std.testing.expectEqual(bg, frame.pixels[4]);
 }

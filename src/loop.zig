@@ -5,7 +5,10 @@ const xev = @import("xev");
 const Engine = @import("engine.zig").Engine;
 const Debug = @import("debug.zig");
 
+/// The loop struct exists so that it's easier to understand
+/// and test very specific behaviour of VT.
 pub const Loop = struct {
+
     allocator: std.mem.Allocator,
     pool: *xev.ThreadPool,
     inner: xev.Loop,

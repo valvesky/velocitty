@@ -9,6 +9,7 @@ const Runs = @import("runs.zig");
 const Term = @import("term.zig");
 const Draw = @import("draw.zig");
 const Type = @import("type.zig");
+const Select = @import("select.zig");
 
 pub const PumpStat = struct {
     bytes_in: usize = 0,
@@ -59,6 +60,7 @@ pub const Engine = struct {
     fed_epoch: u64 = 0,
     query_at: u64 = 0,
     query_epoch: u64 = 0,
+    selection: Select.State = .{},
 
     pub fn init(allocator: std.mem.Allocator, options: Options) std.mem.Allocator.Error!Engine {
         assert(options.hz > 0);
@@ -120,6 +122,7 @@ pub const Engine = struct {
         assert(cols > 0);
         assert(rows > 0);
         try self.screen.resize(cols, rows);
+        self.selection.clear();
         try self.frame.resize(
             @as(u32, cols) * self.cell_w,
             @as(u32, rows) * self.cell_h,
@@ -324,15 +327,23 @@ pub const Engine = struct {
 
     pub fn scrollBy(self: *Engine, delta: i32) void {
         self.screen.scrollBy(delta);
-        self.frame.render(&self.screen, self.cell_w, self.cell_h, self.type_ctx, self.size_px);
+        self.redraw();
         self.screen.clearDirty();
+    }
+
+    pub fn selectedTextAlloc(self: *Engine) std.mem.Allocator.Error![]u8 {
+        return Select.copyAlloc(self.allocator, &self.screen, self.selection);
+    }
+
+    pub fn redraw(self: *Engine) void {
+        self.frame.renderSel(&self.screen, self.cell_w, self.cell_h, self.type_ctx, self.size_px, self.selection);
     }
 
     pub fn refresh(self: *Engine) std.mem.Allocator.Error!void {
         self.addNewQueries();
         try self.feedNew();
         self.drainRing();
-        self.frame.render(&self.screen, self.cell_w, self.cell_h, self.type_ctx, self.size_px);
+        self.redraw();
         self.screen.clearDirty();
     }
 };
@@ -915,4 +926,27 @@ test "visualizer pump with frozen clock still ends on last frame" {
     _ = try engine.pump(&src, &src, Tap{});
     try engine.refresh();
     try expectVisualizer(&engine.screen, 11);
+}
+
+test "selected text from visible grid" {
+    const gpa = std.testing.allocator;
+    var engine = try Engine.init(gpa, .{
+        .cols = 8,
+        .rows = 2,
+        .buf_cap = 64,
+        .cell_w = 2,
+        .cell_h = 2,
+        .hz = 60,
+    });
+    defer engine.deinit();
+    engine.ingest("hello\nworld");
+    try engine.refresh();
+    engine.selection = Select.State{
+        .on = true,
+        .a = .{ .col = 0, .row = 0 },
+        .b = .{ .col = 4, .row = 1 },
+    };
+    const text = try engine.selectedTextAlloc();
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings("hello\nworld", text);
 }

@@ -225,23 +225,59 @@ pub fn encodeFocus(on: bool) []const u8 {
     return if (on) "\x1b[I" else "\x1b[O";
 }
 
+pub const paste_start = "\x1b[200~";
+pub const paste_end = "\x1b[201~";
+
 pub fn encodePaste(out: []u8, bytes: []const u8, bracket: bool) []const u8 {
     if (!bracket) {
-        const n = @min(bytes.len, out.len);
-        @memcpy(out[0..n], bytes[0..n]);
-        return out[0..n];
+        const n = filterPaste(out, bytes, false);
+        return out[0..n.out];
     }
-    const prefix = "\x1b[200~";
-    const suffix = "\x1b[201~";
-    if (prefix.len + bytes.len + suffix.len > out.len) {
-        const n = @min(bytes.len, out.len);
-        @memcpy(out[0..n], bytes[0..n]);
-        return out[0..n];
+    if (paste_start.len + paste_end.len > out.len) return &.{};
+    @memcpy(out[0..paste_start.len], paste_start);
+    const n = filterPaste(out[paste_start.len .. out.len - paste_end.len], bytes, true);
+    const end = paste_start.len + n.out;
+    @memcpy(out[end..][0..paste_end.len], paste_end);
+    return out[0 .. end + paste_end.len];
+}
+
+/// Copy `src` into `out`. Drops C0 except tab/CR/LF; maps LF to CR.
+/// Unbracketed pastes drop ESC. Bracketed pastes strip the end sequence.
+pub fn filterPaste(out: []u8, src: []const u8, bracket: bool) struct { in: usize, out: usize } {
+    var i: usize = 0;
+    var o: usize = 0;
+    while (i < src.len and o < out.len) {
+        const c = src[i];
+        if (c == 0x1b) {
+            if (bracket and i + paste_end.len <= src.len and std.mem.eql(u8, src[i .. i + paste_end.len], paste_end)) {
+                i += paste_end.len;
+                continue;
+            }
+            if (!bracket) {
+                i += 1;
+                continue;
+            }
+        }
+        if (c < 0x20) {
+            if (c == '\n') {
+                out[o] = '\r';
+                o += 1;
+            } else if (c == '\r' or c == '\t') {
+                out[o] = c;
+                o += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if (c == 0x7f) {
+            i += 1;
+            continue;
+        }
+        out[o] = c;
+        o += 1;
+        i += 1;
     }
-    @memcpy(out[0..prefix.len], prefix);
-    @memcpy(out[prefix.len..][0..bytes.len], bytes);
-    @memcpy(out[prefix.len + bytes.len ..][0..suffix.len], suffix);
-    return out[0 .. prefix.len + bytes.len + suffix.len];
+    return .{ .in = i, .out = o };
 }
 
 fn keySym(code: u32) KeySym {
@@ -427,4 +463,14 @@ test "encode mouse urxvt and pixels" {
         .action = .press,
     }, 4, 2, .{ .tracking = .btn, .sgr = true, .pixels = true });
     try std.testing.expectEqualStrings("\x1b[<0;11;21M", px);
+}
+
+test "encode paste bracket and filter" {
+    var buf: [64]u8 = undefined;
+    const p = encodePaste(&buf, "hi\nthere", true);
+    try std.testing.expectEqualStrings("\x1b[200~hi\rthere\x1b[201~", p);
+    const q = encodePaste(&buf, "hi\x1b[201~x", true);
+    try std.testing.expectEqualStrings("\x1b[200~hix\x1b[201~", q);
+    const raw = encodePaste(&buf, "a\x1bx\nb", false);
+    try std.testing.expectEqualStrings("ax\rb", raw);
 }
