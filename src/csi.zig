@@ -14,68 +14,94 @@ pub const CsiSeq = struct {
     intermediate: u8 = 0,
     seq: []const u8 = "",
     params: []u16 = &.{},
-    final: u8,
+    final: u8 = 0, // 0 indicates an invalid stub sequence
     private: u8 = 0,
 
-    /// Returns valid CSI sequences, otherwise null.
-    pub fn parse(seq: []const u8, param_buf: []u16) ?CsiSeq {
-        if (seq.len < 3) return null; // Ran out of bytes.
-        assert(seq[0] == 0x1b and seq[1] == '['); // Must be an actual CSI.
+    // LUTs for character classification
+    const CharKind = enum(u3) { digit, sep, inter, final, invalid };
 
-        // Branchless detection of private prefix byte 
+    const CHAR_MAP: [256]CharKind = initMap: {
+        var map = [_]CharKind{.invalid} ** 256;
+        for ('0'..'9' + 1) |c| map[c] = .digit;
+        map[';'] = .sep;
+        map[':'] = .sep;
+        for (0x20..0x2F + 1) |c| map[c] = .inter;
+        for (0x40..0x7E + 1) |c| map[c] = .final;
+        break :initMap map;
+    };
+
+    pub fn parse(seq: []const u8, param_buf: []u16) CsiSeq {
+        // Stub default returned on early failure
+        const STUB = CsiSeq{ .final = 0, .seq = seq };
+
+        const valid_header = @intFromBool(
+            seq.len >= 3 and seq[0] == 0x1b and seq[1] == '['
+        );
+        if (valid_header == 0) return STUB;
+
+        // Branchless private byte identification ('?', '>', '=', '<')
         const c2 = seq[2];
-        const is_priv: u8 = @intFromBool((c2 & 0xFC) == 0x3C);
+        const is_priv: u8 = @intFromBool(c2 >= 0x3C and c2 <= 0x3F);
         const priv = c2 * is_priv;
 
         var i: usize = 2 + is_priv;
         var n: usize = 0;
         var val: u16 = 0;
-        var have = false;
+        var have: u16 = 0;
         var intermediate: u8 = 0;
+        var is_valid: u8 = 1;
 
-        while (i + 1 < seq.len) : (i += 1) {
+        const max_body = seq.len - 1; // Exclude the final byte
+
+        while (i < max_body) : (i += 1) {
             const c = seq[i];
-            switch (c) {
-                '0'...'9' => {
-                    have = true;
-                    val = val *% 10 +% (c - '0');
-                },
-                ';', ':' => {
-                    if (n < param_buf.len) param_buf[n] = if (have) val else 0;
-                    n += 1;
-                    val = 0;
-                    have = false;
-                },
-                0x20...0x2f => {
-                    intermediate = c;
-                },
-                else => return null,
+            const kind = CHAR_MAP[c];
+
+            // Branchless state updates via mask/mul
+            const is_dig = @intFromBool(kind == .digit);
+            const is_sep = @intFromBool(kind == .sep);
+            const is_mid = @intFromBool(kind == .inter);
+            const is_bad = @intFromBool(kind == .invalid or kind == .final);
+
+            // Invalidate if unexpected final/invalid character occurs early in body
+            is_valid &= (is_bad ^ 1);
+
+            // Accumulate digits
+            have |= is_dig;
+            val = (val *% 10 +% (c -% '0')) * is_dig + val * (is_dig ^ 1);
+
+            // Push param on delimiter
+            if (is_sep != 0) {
+                if (n < param_buf.len) param_buf[n] = val;
+                n += 1;
+                val = 0;
+                have = 0;
             }
+
+            // Capture intermediate byte
+            intermediate = c * is_mid + intermediate * (is_mid ^ 1);
         }
 
-        if (have or n > 0 or seq.len > 3 + is_priv) {
-            if (n < param_buf.len) param_buf[n] = if (have) val else 0;
+        const push_last = (have | @intFromBool(n > 0) | @intFromBool(seq.len > 3 + is_priv));
+        if (push_last != 0 and n < param_buf.len) {
+            param_buf[n] = val;
             n += 1;
         }
 
+        const final_byte = seq[seq.len - 1];
+        const valid_final = @intFromBool(CHAR_MAP[final_byte] == .final);
+        const ok = is_valid & valid_final;
+
         return .{
-            .intermediate = intermediate,
+            .intermediate = intermediate * ok,
             .seq = seq,
-            .final = seq[seq.len - 1],
-            .params = param_buf[0..@min(n, param_buf.len)],
-            .private = priv,
+            .final = final_byte * ok,
+            .params = param_buf[0..(@min(n, param_buf.len) * ok)],
+            .private = priv * ok,
         };
     }
 
-    /// Only accepts valid CSI sequences.
-    /// Valid as in "well-structured" not necessarily
-    /// those we implement.
-    ///
-    /// Applies the sequence to the terminal.
     pub fn apply(self: CsiSeq, term: *Term) void {
-        assert(self.seq.len >= 3);
-        assert(self.seq[0] == 0x1b and self.seq[1] == '[');
-        assert(self.final >= 0x40 and self.final <= 0x7e);
 
         const params = self.params;
         const final = self.final;
@@ -91,16 +117,14 @@ pub const CsiSeq = struct {
         // Yes, it edits terminal state directly.
         // That's the point.
 
-        switch (final) {
-            // --- Queries ---
-            'c' => switch (priv) {
-                0 => term.respond("\x1b[?62;c"),
-                '>' => term.respond("\x1b[>0;10;0c"),
-                else => {},
-            },
+        switch (priv) {
+            // --- Standard ANSI / VT100 Sequences ---
+            0 => switch (final) {
+                0 => return,
 
-            'n' => switch (priv) {
-                0, '?' => if (p0 == 6) {
+                // Queries & Reports
+                'c' => term.respond("\x1b[?62;c"),
+                'n' => if (p0 == 6) {
                     var buf: [32]u8 = undefined;
                     const resp = std.fmt.bufPrint(&buf, "\x1b[{d};{d}R", .{
                         term.grid().cursor.row + 1,
@@ -108,94 +132,178 @@ pub const CsiSeq = struct {
                     }) catch return;
                     term.respond(resp);
                 },
-                else => {},
-            },
-            
-            // --- SGR ---
-            'm' => switch (priv) {
-                '>' => term.setModifyKeys(params),
-                0 => self.sgr(term),
+
+                // Modes & Styling
+                'm' => self.sgr(term),
+                'h' => term.setMode(params, true),
+                'l' => term.setMode(params, false),
+                's' => term.saveCursor(),
+                'r' => term.decstbm(p0, if (params.len > 1) params[1] else 0),
+
+                // Resets & Cursor Properties
+                'p' => switch (inter) {
+                    '!' => term.softReset(),
+                    else => {},
+                },
+                'q' => switch (inter) {
+                    0, ' ' => term.setCursorStyle(p0),
+                    else => {},
+                },
+
+                // Cursor Movement
+                'H', 'f' => term.cup(n1, if (params.len > 1 and params[1] != 0) params[1] else 1),
+                'J' => term.ed(p0),
+                'K' => term.el(p0),
+                'A' => term.cursorUp(n1),
+                'B', 'e' => term.cursorDown(n1),
+                'C', 'a' => {
+                    const g = term.grid();
+                    g.cursor.col = @min(g.cursor.col + n1, term.cols - 1);
+                },
+                'D' => term.cursor().col -|= n1,
+                'E' => {
+                    term.cursorDown(n1);
+                    term.grid().cursor.col = 0;
+                },
+                'F' => {
+                    term.cursorUp(n1);
+                    term.grid().cursor.col = 0;
+                },
+                'G', '`' => term.grid().cursor.col = @min(n1 -| 1, term.cols - 1),
+                'd' => term.cup(n1, term.grid().cursor.col + 1),
+
+                // Text Editing & Scrolling
+                '@' => term.ich(n1),
+                'P' => term.dch(n1),
+                'X' => term.ech(n1),
+                'L' => term.il(n1),
+                'M' => term.dl(n1),
+                'S' => term.regionScrollUp(n1),
+                'T' => term.regionScrollDown(n1),
+                'u' => term.restoreCursor(),
+                'b' => term.rep(n1),
+
+                // Tabs
+                'I' => {
+                    var k: u16 = 0;
+                    while (k < n1) : (k += 1) {
+                        const g = term.grid();
+                        g.cursor.col += 8 - (g.cursor.col % 8);
+                        if (g.cursor.col >= term.cols) g.cursor.col = term.cols - 1;
+                    }
+                },
+                'Z' => {
+                    var k: u16 = 0;
+                    while (k < n1) : (k += 1) {
+                        const g = term.grid();
+                        const col = g.cursor.col;
+                        const prev = if (col == 0) 0 else col - 1;
+                        g.cursor.col = prev - (prev % 8);
+                    }
+                },
+
                 else => {},
             },
 
-            // --- Modes & Extensions ---
-            'h' => switch (priv) {
-                '?' => term.setPrivate(params, true),
-                0 => term.setMode(params, true),
-                else => {},
-            },
-            'l' => switch (priv) {
-                '?' => term.setPrivate(params, false),
-                0 => term.setMode(params, false),
-                else => {},
-            },
-            's' => switch (priv) {
-                '?' => term.savePrivate(params),
-                0 => term.saveCursor(),
-                else => {},
-            },
-            'r' => switch (priv) {
-                '?' => term.restorePrivate(params),
-                0 => term.decstbm(p0, if (params.len > 1) params[1] else 0),
+            // --- DEC Private Extensions ('?') ---
+            '?' => switch (final) {
+                'n' => if (p0 == 6) {
+                    var buf: [32]u8 = undefined;
+                    const resp = std.fmt.bufPrint(&buf, "\x1b[{d};{d}R", .{
+                        term.grid().cursor.row + 1,
+                        term.grid().cursor.col + 1,
+                    }) catch return;
+                    term.respond(resp);
+                },
+                'h' => term.setPrivate(params, true),
+                'l' => term.setPrivate(params, false),
+                's' => term.savePrivate(params),
+                'r' => term.restorePrivate(params),
                 else => {},
             },
 
-            // --- Resets ---
-            'p' => if (inter == '!') term.softReset(),
-            'q' => if (inter == ' ' or inter == 0) term.setCursorStyle(p0),
+            // --- Secondary Device / Modifier Extensions ('>') ---
+            '>' => switch (final) {
+                'c' => term.respond("\x1b[>0;10;0c"),
+                'm' => term.setModifyKeys(params),
+                else => {},
+            },
 
-            // --- Standard Cursor Movement ---
-            'H', 'f' => if (priv == 0) term.cup(n1, if (params.len > 1 and params[1] != 0) params[1] else 1),
-            'J' => if (priv == 0) term.ed(p0),
-            'K' => if (priv == 0) term.el(p0),
-            'A' => if (priv == 0) term.cursorUp(n1),
-            'B', 'e' => if (priv == 0) term.cursorDown(n1),
-            'C', 'a' => if (priv == 0) {
+            else => {},
+        }
+    }
+
+    fn applyStandard(self: CsiSeq, term: *Term) void {
+        const params = self.params;
+        const p0 = if (params.len > 0) params[0] else 0;
+        const n1: u16 = if (p0 == 0) 1 else p0;
+
+        switch (self.final) {
+            0 => return,
+            'c' => term.respond("\x1b[?62;c"),
+            'n' => if (p0 == 6) respondCursorPosition(term),
+            'm' => self.sgr(term),
+            'h' => term.setMode(params, true),
+            'l' => term.setMode(params, false),
+            's' => term.saveCursor(),
+            'r' => term.decstbm(p0, if (params.len > 1) params[1] else 0),
+            'p' => if (self.intermediate == '!') term.softReset(),
+            'q' => if (self.intermediate == 0 or self.intermediate == ' ') term.setCursorStyle(p0),
+            'H', 'f' => term.cup(n1, if (params.len > 1 and params[1] != 0) params[1] else 1),
+            'J' => term.ed(p0),
+            'K' => term.el(p0),
+            'A' => term.cursorUp(n1),
+            'B', 'e' => term.cursorDown(n1),
+            'C', 'a' => {
                 const g = term.grid();
                 g.cursor.col = @min(g.cursor.col + n1, term.cols - 1);
             },
-            'D' => if (priv == 0) term.grid().cursor.col -|= n1,
-            'E' => if (priv == 0) {
+            'D' => term.cursor().col -|= n1,
+            'E' => {
                 term.cursorDown(n1);
                 term.grid().cursor.col = 0;
             },
-            'F' => if (priv == 0) {
+            'F' => {
                 term.cursorUp(n1);
                 term.grid().cursor.col = 0;
             },
-            'G', '`' => if (priv == 0) term.grid().cursor.col = @min(n1 -| 1, term.cols - 1),
-            'd' => if (priv == 0) term.cup(n1, term.grid().cursor.col + 1),
+            'G', '`' => term.grid().cursor.col = @min(n1 -| 1, term.cols - 1),
+            'd' => term.cup(n1, term.grid().cursor.col + 1),
 
-            // --- Editing ---
-            '@' => if (priv == 0) term.ich(n1),
-            'P' => if (priv == 0) term.dch(n1),
-            'X' => if (priv == 0) term.ech(n1),
-            'L' => if (priv == 0) term.il(n1),
-            'M' => if (priv == 0) term.dl(n1),
-            'S' => if (priv == 0) term.regionScrollUp(n1),
-            'T' => if (priv == 0) term.regionScrollDown(n1),
-            'u' => if (priv == 0) term.restoreCursor(),
-            'b' => if (priv == 0) term.rep(n1),
+            // Text Editing & Scrolling
+            '@' => term.ich(n1),
+            'P' => term.dch(n1),
+            'X' => term.ech(n1),
+            'L' => term.il(n1),
+            'M' => term.dl(n1),
+            'S' => term.regionScrollUp(n1),
+            'T' => term.regionScrollDown(n1),
+            'u' => term.restoreCursor(),
+            'b' => term.rep(n1),
+            'I' => stepTabForward(term, n1),
+            'Z' => stepTabBackward(term, n1),
+            else => {},
+        }
+    }
 
-            // --- Tabs ---
-            'I' => if (priv == 0) {
-                var k: u16 = 0;
-                while (k < n1) : (k += 1) {
-                    const g = term.grid();
-                    g.cursor.col += 8 - (g.cursor.col % 8);
-                    if (g.cursor.col >= term.cols) g.cursor.col = term.cols - 1;
-                }
-            },
-            'Z' => if (priv == 0) {
-                var k: u16 = 0;
-                while (k < n1) : (k += 1) {
-                    const g = term.grid();
-                    const col = g.cursor.col;
-                    const prev = if (col == 0) 0 else col - 1;
-                    g.cursor.col = prev - (prev % 8);
-                }
-            },
+    fn applyDecPrivate(self: CsiSeq, term: *Term) void {
+        const params = self.params;
+        const p0 = if (params.len > 0) params[0] else 0;
 
+        switch (self.final) {
+            'n' => if (p0 == 6) respondCursorPosition(term),
+            'h' => term.setPrivate(params, true),
+            'l' => term.setPrivate(params, false),
+            's' => term.savePrivate(params),
+            'r' => term.restorePrivate(params),
+            else => {},
+        }
+    }
+
+    fn applySecondary(self: CsiSeq, term: *Term) void {
+        switch (self.final) {
+            'c' => term.respond("\x1b[>0;10;0c"),
+            'm' => term.setModifyKeys(self.params),
             else => {},
         }
     }
@@ -246,6 +354,33 @@ pub const CsiSeq = struct {
             }
         }
     }
+
+    fn respondCursorPosition(term: *Term) void {
+        var buf: [32]u8 = undefined;
+        const resp = std.fmt.bufPrint(&buf, "\x1b[{d};{d}R", .{
+            term.grid().cursor.row + 1,
+            term.grid().cursor.col + 1,
+        }) catch return;
+        term.respond(resp);
+    }
+
+    fn stepTabForward(term: *Term, count: u16) void {
+        var k: u16 = 0;
+        while (k < count) : (k += 1) {
+            const g = term.grid();
+            g.cursor.col += 8 - (g.cursor.col % 8);
+            if (g.cursor.col >= term.cols) g.cursor.col = term.cols - 1;
+        }
+    }
+
+    fn stepTabBackward(term: *Term, count: u16) void {
+        var k: u16 = 0;
+        while (k < count) : (k += 1) {
+            const g = term.grid();
+            const col = g.cursor.col;
+            const prev = if (col == 0) 0 else col - 1;
+            g.cursor.col = prev - (prev % 8);
+        }
+    }
+
 };
-
-

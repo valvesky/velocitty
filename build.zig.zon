@@ -1,7 +1,7 @@
 .{
     .name = .Velocitty,
     .version = "0.9.0",
-    .fingerprint = 0x6d8b32cc71fd876e, // Changing this has security and trust implications.
+    .fingerprint = 0x63301961c26f0d7f, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .sdl3_win32_x64 = .{

@@ -3,11 +3,13 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-const Preparse = @import("preparse.zig");
-const Runs = @import("runs.zig");
-const Events = @import("events.zig");
-const EastAsian = @import("type/east_asian.zig");
+
 const Kitty = @import("kitty.zig");
+const EastAsian = @import("type/eastasian.zig");
+const CsiSeq = @import("csi.zig");
+
+const Platform = @import("platform/platform.zig");
+
 
 pub const Color = packed struct {
     r: u8,
@@ -107,7 +109,7 @@ inline fn decodeUtf8At(bytes: []const u8, j: usize) struct { cp: u21, n: usize }
     return .{ .cp = cp, .n = n };
 }
 
-pub const Screen = struct {
+pub const Term = struct {
     allocator: std.mem.Allocator,
     cols: u16,
     rows: u16,
@@ -143,15 +145,15 @@ pub const Screen = struct {
     scheme: Scheme = .{},
     kitty: Kitty.Store,
 
-    pub fn init(allocator: std.mem.Allocator, cols: u16, rows: u16) std.mem.Allocator.Error!Screen {
+    pub fn init(allocator: std.mem.Allocator, cols: u16, rows: u16) std.mem.Allocator.Error!Term {
         return initScrollback(allocator, cols, rows, default_scrollback);
     }
 
-    pub fn initScrollback(allocator: std.mem.Allocator, cols: u16, rows: u16, extra: u32) std.mem.Allocator.Error!Screen {
+    pub fn initScrollback(allocator: std.mem.Allocator, cols: u16, rows: u16, extra: u32) std.mem.Allocator.Error!Term {
         return initWithScheme(allocator, cols, rows, extra, .{});
     }
 
-    pub fn initWithScheme(allocator: std.mem.Allocator, cols: u16, rows: u16, extra: u32, scheme: Scheme) std.mem.Allocator.Error!Screen {
+    pub fn initWithScheme(allocator: std.mem.Allocator, cols: u16, rows: u16, extra: u32, scheme: Scheme) std.mem.Allocator.Error!Term {
         assert(cols > 0);
         assert(rows > 0);
         const primary_cap = @as(u32, rows) + extra;
@@ -182,7 +184,7 @@ pub const Screen = struct {
         };
     }
 
-    pub fn deinit(self: *Screen) void {
+    pub fn deinit(self: *Term) void {
         self.kitty.deinit();
         self.allocator.free(self.line_dirty);
         self.allocator.free(self.grids[1].starts);
@@ -192,7 +194,7 @@ pub const Screen = struct {
         self.* = undefined;
     }
 
-    pub fn resize(self: *Screen, cols: u16, rows: u16) std.mem.Allocator.Error!void {
+    pub fn resize(self: *Term, cols: u16, rows: u16) std.mem.Allocator.Error!void {
         assert(cols > 0);
         assert(rows > 0);
         if (cols == self.cols and rows == self.rows) return;
@@ -202,7 +204,7 @@ pub const Screen = struct {
         self.* = next;
     }
 
-    pub fn clear(self: *Screen) void {
+    pub fn clear(self: *Term) void {
         self.which = 0;
         self.origin_mode = false;
         self.auto_wrap = true;
@@ -234,19 +236,19 @@ pub const Screen = struct {
         self.resetGrid(1);
     }
 
-    pub fn cell(self: *const Screen, row: u16, col: u16) Cell {
+    pub fn cell(self: *const Term, row: u16, col: u16) Cell {
         assert(row < self.rows);
         assert(col < self.cols);
         return self.viewSlice(row)[col];
     }
 
-    pub fn rowCells(self: *const Screen, row: u16) []const Cell {
+    pub fn rowCells(self: *const Term, row: u16) []const Cell {
         return self.viewSlice(row);
     }
 
     /// Visual dump: every cell as UTF-8, NUL continuation as space, trailing
     /// spaces kept, rows joined by `\n` (no trailing newline after the last row).
-    pub fn dumpAlloc(self: *const Screen, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
+    pub fn dumpAlloc(self: *const Term, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
         var y: u16 = 0;
@@ -266,7 +268,7 @@ pub const Screen = struct {
     }
 
     /// One line per non-blank cell: `y x U+XXXX #rrggbb #rrggbb ATTRS`.
-    pub fn dumpCellsAlloc(self: *const Screen, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
+    pub fn dumpCellsAlloc(self: *const Term, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
         var y: u16 = 0;
@@ -297,7 +299,7 @@ pub const Screen = struct {
         return out.toOwnedSlice(allocator);
     }
 
-    fn cellIsBlank(self: *const Screen, c: Cell) bool {
+    fn cellIsBlank(self: *const Term, c: Cell) bool {
         if (c.codepoint != ' ' and c.codepoint != 0) return false;
         if (c.fg.r != self.scheme.fg.r or c.fg.g != self.scheme.fg.g or c.fg.b != self.scheme.fg.b) return false;
         if (c.bg.r != self.scheme.bg.r or c.bg.g != self.scheme.bg.g or c.bg.b != self.scheme.bg.b) return false;
@@ -305,45 +307,45 @@ pub const Screen = struct {
         return std.meta.eql(c.attrs, z);
     }
 
-    pub fn lineDirty(self: *const Screen, row: u16) bool {
+    pub fn lineDirty(self: *const Term, row: u16) bool {
         assert(row < self.rows);
         const i = row / 64;
         const b: u6 = @intCast(row % 64);
         return self.line_dirty[i] & (@as(u64, 1) << b) != 0;
     }
 
-    pub fn clearDirty(self: *Screen) void {
+    pub fn clearDirty(self: *Term) void {
         @memset(self.line_dirty, 0);
     }
 
-    fn markDirty(self: *Screen, row: u16) void {
+    fn markDirty(self: *Term, row: u16) void {
         assert(row < self.rows);
         const i = row / 64;
         const b: u6 = @intCast(row % 64);
         self.line_dirty[i] |= @as(u64, 1) << b;
     }
 
-    fn markDirtyAll(self: *Screen) void {
+    fn markDirtyAll(self: *Term) void {
         @memset(self.line_dirty, std.math.maxInt(u64));
     }
 
-    pub fn cursor(self: *const Screen) Cursor {
+    pub fn cursor(self: *const Term) Cursor {
         return self.gridConst().cursor;
     }
 
-    pub fn cursorVisible(self: *const Screen) bool {
+    pub fn cursorVisible(self: *const Term) bool {
         return self.cursor_visible;
     }
 
-    pub fn cursorStyle(self: *const Screen) CursorStyle {
+    pub fn cursorStyle(self: *const Term) CursorStyle {
         return self.cursor_style;
     }
 
-    pub fn altScreen(self: *const Screen) bool {
+    pub fn altTerm(self: *const Term) bool {
         return self.which == 1;
     }
 
-    pub fn inputMode(self: *const Screen) Events.InputMode {
+    pub fn inputMode(self: *const Term) Events.InputMode {
         return .{
             .app_cursor = self.app_cursor,
             .app_keypad = self.app_keypad,
@@ -358,11 +360,11 @@ pub const Screen = struct {
         };
     }
 
-    pub fn scrollOffset(self: *const Screen) u32 {
+    pub fn scrollOffset(self: *const Term) u32 {
         return self.gridConst().scroll;
     }
 
-    pub fn setScrollOffset(self: *Screen, v: u32) void {
+    pub fn setScrollOffset(self: *Term, v: u32) void {
         const g = self.grid();
         const n = @min(v, self.scrollMax());
         if (g.scroll == n) return;
@@ -370,11 +372,11 @@ pub const Screen = struct {
         self.markDirtyAll();
     }
 
-    pub fn scrollMax(self: *const Screen) u32 {
+    pub fn scrollMax(self: *const Term) u32 {
         return self.gridConst().used - self.rows;
     }
 
-    pub fn scrollBy(self: *Screen, delta: i32) void {
+    pub fn scrollBy(self: *Term, delta: i32) void {
         const max = self.scrollMax();
         const g = self.grid();
         const old = g.scroll;
@@ -386,12 +388,12 @@ pub const Screen = struct {
         if (g.scroll != old) self.markDirtyAll();
     }
 
-    pub fn lineFeed(self: *Screen) void {
+    pub fn lineFeed(self: *Term) void {
         self.grid().cursor.col = 0;
         self.index();
     }
 
-    pub fn feed(self: *Screen, items: []const Runs.Run, src: []const u8) void {
+    pub fn feed(self: *Term, items: []const Run, src: []const u8) void {
         for (items) |run| {
             const bytes = src[run.off .. run.off + run.len];
             switch (run.kind) {
@@ -407,7 +409,7 @@ pub const Screen = struct {
         }
     }
 
-    fn feedKitty(self: *Screen, bytes: []const u8) void {
+    fn feedKitty(self: *Term, bytes: []const u8) void {
         const cur = self.grid().cursor;
         const which = self.which;
         if (self.kitty.feed(bytes, .{ .row = cur.row, .col = cur.col }, self.cols, self.rows, which)) |next| {
@@ -418,7 +420,7 @@ pub const Screen = struct {
         self.markDirtyAll();
     }
 
-    fn feedPlain(self: *Screen, bytes: []const u8) void {
+    fn feedPlain(self: *Term, bytes: []const u8) void {
         if (bytes.len == 0) return;
         const set = if (self.gl == 1) self.g1 else self.g0;
         if (self.insert_mode or set == .dec_special) {
@@ -462,7 +464,7 @@ pub const Screen = struct {
         }
     }
 
-    fn feedUtf8(self: *Screen, bytes: []const u8) void {
+    fn feedUtf8(self: *Term, bytes: []const u8) void {
         if (bytes.len == 0) return;
         if (self.insert_mode) {
             var j: usize = 0;
@@ -543,7 +545,7 @@ pub const Screen = struct {
         self.grid().cursor.col = col;
     }
 
-    fn put(self: *Screen, cp: u21) void {
+    fn put(self: *Term, cp: u21) void {
         const mapped = self.mapCp(cp);
         var width: u16 = @max(1, EastAsian.cellWidth(mapped));
         var g = self.grid();
@@ -587,25 +589,25 @@ pub const Screen = struct {
         self.last_cp = mapped;
     }
 
-    fn mapCp(self: *const Screen, cp: u21) u21 {
+    fn mapCp(self: *const Term, cp: u21) u21 {
         if (cp < 0x20 or cp > 0x7e) return cp;
         const set = if (self.gl == 1) self.g1 else self.g0;
         if (set != .dec_special) return cp;
         return decSpecial(cp);
     }
 
-    fn paintAttrs(self: *const Screen) Attrs {
+    fn paintAttrs(self: *const Term) Attrs {
         var a = self.gridConst().attrs;
         a.link = self.osc8;
         return a;
     }
 
-    fn eraseCell(self: *const Screen) Cell {
+    fn eraseCell(self: *const Term) Cell {
         const g = self.gridConst();
         return .{ .fg = g.fg, .bg = g.bg };
     }
 
-    fn feedOsc(self: *Screen, bytes: []const u8) void {
+    fn feedOsc(self: *Term, bytes: []const u8) void {
         if (bytes.len < 4 or bytes[0] != 0x1b or bytes[1] != ']') return;
         var i: usize = 2;
         var id: u16 = 0;
@@ -630,7 +632,7 @@ pub const Screen = struct {
         self.osc8 = i > uri_start;
     }
 
-    fn feedC0(self: *Screen, bytes: []const u8) void {
+    fn feedC0(self: *Term, bytes: []const u8) void {
         for (bytes) |c| {
             switch (c) {
                 '\n', 0x0b, 0x0c => self.lineFeed(),
@@ -648,7 +650,7 @@ pub const Screen = struct {
         }
     }
 
-    fn feedEsc(self: *Screen, bytes: []const u8) void {
+    fn feedEsc(self: *Term, bytes: []const u8) void {
         if (bytes.len < 2) return;
         switch (bytes[1]) {
             'D' => self.index(),
@@ -669,12 +671,13 @@ pub const Screen = struct {
         }
     }
 
-    fn feedCsi(self: *Screen, bytes: []const u8) void {
-        var csi_seq : CsiSeq = csi.parse();
-        csi_seq?.apply(self);
+    fn feedCsi(self: *Term, bytes: []const u8) void {
+        if (CsiSeq.parse(bytes)) |seq| {
+            seq.apply(self);
+        }
     }
 
-    fn setPrivate(self: *Screen, params: []const u16, enable: bool) void {
+    fn setPrivate(self: *Term, params: []const u16, enable: bool) void {
         for (params) |p| {
             switch (p) {
                 1 => self.app_cursor = enable,
@@ -709,7 +712,7 @@ pub const Screen = struct {
         }
     }
 
-    fn setMode(self: *Screen, params: []const u16, enable: bool) void {
+    fn setMode(self: *Term, params: []const u16, enable: bool) void {
         for (params) |p| {
             switch (p) {
                 4 => self.insert_mode = enable,
@@ -718,7 +721,7 @@ pub const Screen = struct {
         }
     }
 
-    fn setModifyKeys(self: *Screen, params: []const u16) void {
+    fn setModifyKeys(self: *Term, params: []const u16) void {
         if (params.len == 0) {
             self.modify_other_keys = 0;
             return;
@@ -728,7 +731,7 @@ pub const Screen = struct {
         self.modify_other_keys = @intCast(@min(pv, 2));
     }
 
-    fn savePrivate(self: *Screen, params: []const u16) void {
+    fn savePrivate(self: *Term, params: []const u16) void {
         const all = params.len == 0 or (params.len == 1 and params[0] == 0);
         if (all) {
             const modes = [_]u16{ 1, 6, 7, 9, 12, 25, 47, 66, 1000, 1001, 1002, 1003, 1004, 1006, 1007, 1015, 1016, 1047, 1049, 2004, 2026 };
@@ -740,7 +743,7 @@ pub const Screen = struct {
         }
     }
 
-    fn saveOnePrivate(self: *Screen, mode: u16) void {
+    fn saveOnePrivate(self: *Term, mode: u16) void {
         const raw = self.privateMode(mode);
         const val: u8 = if (raw == 0) 2 else @intCast(raw);
         var slot: ?usize = null;
@@ -756,7 +759,7 @@ pub const Screen = struct {
         self.saved_mode_val[i] = val;
     }
 
-    fn restorePrivate(self: *Screen, params: []const u16) void {
+    fn restorePrivate(self: *Term, params: []const u16) void {
         const all = params.len == 0 or (params.len == 1 and params[0] == 0);
         if (all) {
             for (self.saved_mode, 0..) |m, i| {
@@ -775,7 +778,7 @@ pub const Screen = struct {
         }
     }
 
-    fn setCursorStyle(self: *Screen, n: u16) void {
+    fn setCursorStyle(self: *Term, n: u16) void {
         const style: CursorStyle = switch (n) {
             0, 1, 2 => .block,
             3, 4 => .underline,
@@ -789,7 +792,7 @@ pub const Screen = struct {
         self.markDirty(self.grid().cursor.row);
     }
 
-    fn softReset(self: *Screen) void {
+    fn softReset(self: *Term) void {
         self.origin_mode = false;
         self.auto_wrap = true;
         self.insert_mode = false;
@@ -815,7 +818,7 @@ pub const Screen = struct {
         self.markDirty(g.cursor.row);
     }
 
-    fn eraseScrollback(self: *Screen) void {
+    fn eraseScrollback(self: *Term) void {
         const g = self.grid();
         if (g.used <= self.rows) return;
         g.head = (g.head + (g.used - self.rows)) % g.cap;
@@ -824,7 +827,7 @@ pub const Screen = struct {
         self.markDirtyAll();
     }
 
-    pub fn privateMode(self: *const Screen, n: u16) u16 {
+    pub fn privateMode(self: *const Term, n: u16) u16 {
         const on: bool = switch (n) {
             1 => self.app_cursor,
             6 => self.origin_mode,
@@ -850,14 +853,14 @@ pub const Screen = struct {
         return if (on) 1 else 2;
     }
 
-    pub fn ansiMode(self: *const Screen, n: u16) u16 {
+    pub fn ansiMode(self: *const Term, n: u16) u16 {
         return switch (n) {
             4 => if (self.insert_mode) 1 else 2,
             else => 0,
         };
     }
 
-    fn sgrString(self: *const Screen, out: []u8) []const u8 {
+    fn sgrString(self: *const Term, out: []u8) []const u8 {
         const g = self.gridConst();
         var n: usize = 0;
         const add = struct {
@@ -889,7 +892,7 @@ pub const Screen = struct {
         return out[0..n];
     }
 
-    fn setAlt(self: *Screen, on: bool, save: bool, wipe: bool) void {
+    fn setAlt(self: *Term, on: bool, save: bool, wipe: bool) void {
         if (on) {
             if (self.which == 1) return;
             if (save) self.saveCursor();
@@ -903,7 +906,7 @@ pub const Screen = struct {
         self.markDirtyAll();
     }
 
-    fn saveCursor(self: *Screen) void {
+    fn saveCursor(self: *Term) void {
         const g = self.grid();
         g.saved_cursor = g.cursor;
         g.saved_fg = g.fg;
@@ -911,7 +914,7 @@ pub const Screen = struct {
         g.saved_attrs = g.attrs;
     }
 
-    fn restoreCursor(self: *Screen) void {
+    fn restoreCursor(self: *Term) void {
         const g = self.grid();
         g.cursor = g.saved_cursor;
         g.fg = g.saved_fg;
@@ -921,13 +924,13 @@ pub const Screen = struct {
         if (g.cursor.col >= self.cols) g.cursor.col = self.cols - 1;
     }
 
-    fn goHome(self: *Screen) void {
+    fn goHome(self: *Term) void {
         const g = self.grid();
         g.cursor.col = 0;
         g.cursor.row = if (self.origin_mode) g.scroll_top else 0;
     }
 
-    fn cup(self: *Screen, row1: u16, col1: u16) void {
+    fn cup(self: *Term, row1: u16, col1: u16) void {
         const g = self.grid();
         var row: u16 = row1 -| 1;
         var col: u16 = col1 -| 1;
@@ -942,20 +945,20 @@ pub const Screen = struct {
         g.cursor.col = col;
     }
 
-    fn cursorUp(self: *Screen, n: u16) void {
+    fn cursorUp(self: *Term, n: u16) void {
         const g = self.grid();
         g.cursor.row -|= n;
         const floor: u16 = if (self.origin_mode) g.scroll_top else 0;
         if (g.cursor.row < floor) g.cursor.row = floor;
     }
 
-    fn cursorDown(self: *Screen, n: u16) void {
+    fn cursorDown(self: *Term, n: u16) void {
         const g = self.grid();
         const limit: u16 = if (self.origin_mode) g.scroll_bottom else self.rows - 1;
         g.cursor.row = @min(g.cursor.row + n, limit);
     }
 
-    fn decstbm(self: *Screen, top1: u16, bot1: u16) void {
+    fn decstbm(self: *Term, top1: u16, bot1: u16) void {
         const top: u16 = if (top1 == 0) 1 else top1;
         const bot: u16 = if (bot1 == 0) self.rows else bot1;
         if (top > bot or bot > self.rows) return;
@@ -965,7 +968,7 @@ pub const Screen = struct {
         self.goHome();
     }
 
-    fn index(self: *Screen) void {
+    fn index(self: *Term) void {
         const g = self.grid();
         if (g.cursor.row == g.scroll_bottom) {
             self.regionScrollUp(1);
@@ -974,7 +977,7 @@ pub const Screen = struct {
         }
     }
 
-    fn reverseIndex(self: *Screen) void {
+    fn reverseIndex(self: *Term) void {
         const g = self.grid();
         if (g.cursor.row == g.scroll_top) {
             self.regionScrollDown(1);
@@ -983,7 +986,7 @@ pub const Screen = struct {
         }
     }
 
-    fn ed(self: *Screen, mode: u16) void {
+    fn ed(self: *Term, mode: u16) void {
         const blank = self.eraseCell();
         switch (mode) {
             0 => {
@@ -1006,7 +1009,7 @@ pub const Screen = struct {
         }
     }
 
-    fn el(self: *Screen, mode: u16) void {
+    fn el(self: *Term, mode: u16) void {
         const line = self.liveSlice(self.grid().cursor.row);
         const blank = self.eraseCell();
         switch (mode) {
@@ -1022,7 +1025,7 @@ pub const Screen = struct {
         }
     }
 
-    fn takeColor(self: *Screen, rest: []const u16, fg: bool) usize {
+    fn takeColor(self: *Term, rest: []const u16, fg: bool) usize {
         if (rest.len == 0) return 0;
         if (rest[0] == 5) {
             if (rest.len < 2) return rest.len;
@@ -1044,7 +1047,7 @@ pub const Screen = struct {
         return 1;
     }
 
-    fn setRgb(self: *Screen, r: u16, g: u16, b: u16, fg: bool) void {
+    fn setRgb(self: *Term, r: u16, g: u16, b: u16, fg: bool) void {
         const c = Color{
             .r = clip(r),
             .g = clip(g),
@@ -1053,7 +1056,7 @@ pub const Screen = struct {
         if (fg) self.grid().fg = c else self.grid().bg = c;
     }
 
-    fn ich(self: *Screen, n: u16) void {
+    fn ich(self: *Term, n: u16) void {
         const line = self.rowSlice(self.grid().cursor.row);
         const col = @as(usize, self.grid().cursor.col);
         const count = @min(@as(usize, n), line.len - col);
@@ -1062,7 +1065,7 @@ pub const Screen = struct {
         @memset(line[col .. col + count], self.eraseCell());
     }
 
-    fn dch(self: *Screen, n: u16) void {
+    fn dch(self: *Term, n: u16) void {
         const line = self.rowSlice(self.grid().cursor.row);
         const col = @as(usize, self.grid().cursor.col);
         const count = @min(@as(usize, n), line.len - col);
@@ -1071,14 +1074,14 @@ pub const Screen = struct {
         @memset(line[line.len - count ..], self.eraseCell());
     }
 
-    fn ech(self: *Screen, n: u16) void {
+    fn ech(self: *Term, n: u16) void {
         const line = self.rowSlice(self.grid().cursor.row);
         const col = @as(usize, self.grid().cursor.col);
         const count = @min(@as(usize, n), line.len - col);
         @memset(line[col .. col + count], self.eraseCell());
     }
 
-    fn il(self: *Screen, n: u16) void {
+    fn il(self: *Term, n: u16) void {
         const g = self.grid();
         if (g.cursor.row < g.scroll_top or g.cursor.row > g.scroll_bottom) return;
         var k: u16 = 0;
@@ -1091,7 +1094,7 @@ pub const Screen = struct {
         }
     }
 
-    fn dl(self: *Screen, n: u16) void {
+    fn dl(self: *Term, n: u16) void {
         const g = self.grid();
         if (g.cursor.row < g.scroll_top or g.cursor.row > g.scroll_bottom) return;
         var k: u16 = 0;
@@ -1104,17 +1107,17 @@ pub const Screen = struct {
         }
     }
 
-    fn rep(self: *Screen, n: u16) void {
+    fn rep(self: *Term, n: u16) void {
         const cp = self.last_cp;
         var k: u16 = 0;
         while (k < n) : (k += 1) self.put(cp);
     }
 
-    fn rowSlice(self: *Screen, row: u16) []Cell {
+    fn rowSlice(self: *Term, row: u16) []Cell {
         return self.liveSlice(row);
     }
 
-    fn liveSlice(self: *Screen, row: u16) []Cell {
+    fn liveSlice(self: *Term, row: u16) []Cell {
         assert(row < self.rows);
         self.markDirty(row);
         const g = self.grid();
@@ -1122,7 +1125,7 @@ pub const Screen = struct {
         return g.cells[off .. off + self.cols];
     }
 
-    fn viewSlice(self: *const Screen, row: u16) []const Cell {
+    fn viewSlice(self: *const Term, row: u16) []const Cell {
         assert(row < self.rows);
         const g = self.gridConst();
         const sc = @min(g.scroll, g.used - self.rows);
@@ -1130,12 +1133,12 @@ pub const Screen = struct {
         return g.cells[off .. off + self.cols];
     }
 
-    fn startAt(_: *const Screen, g: *const Grid, logical: u32) u32 {
+    fn startAt(_: *const Term, g: *const Grid, logical: u32) u32 {
         assert(logical < g.used);
         return g.starts[(g.head + logical) % g.cap];
     }
 
-    fn regionScrollUp(self: *Screen, n: u16) void {
+    fn regionScrollUp(self: *Term, n: u16) void {
         var k: u16 = 0;
         while (k < n) : (k += 1) {
             const g = self.grid();
@@ -1151,7 +1154,7 @@ pub const Screen = struct {
         }
     }
 
-    fn regionScrollDown(self: *Screen, n: u16) void {
+    fn regionScrollDown(self: *Term, n: u16) void {
         var k: u16 = 0;
         while (k < n) : (k += 1) {
             const g = self.grid();
@@ -1167,14 +1170,14 @@ pub const Screen = struct {
         }
     }
 
-    fn resetPen(self: *Screen) void {
+    fn resetPen(self: *Term) void {
         const g = self.grid();
         g.fg = self.scheme.fg;
         g.bg = self.scheme.bg;
         g.attrs = .{};
     }
 
-    fn ringScrollUp(self: *Screen) void {
+    fn ringScrollUp(self: *Term) void {
         const g = self.grid();
         const live = g.scroll == 0;
         const slot = if (g.used < g.cap)
@@ -1192,7 +1195,7 @@ pub const Screen = struct {
         self.kitty.scrollUp(self.which, if (self.which == 0) self.cap - self.rows else 0);
     }
 
-    fn scrollDown(self: *Screen) void {
+    fn scrollDown(self: *Term) void {
         if (self.rows == 1) {
             @memset(self.liveSlice(0), self.eraseCell());
             return;
@@ -1204,7 +1207,7 @@ pub const Screen = struct {
         @memset(self.liveSlice(0), self.eraseCell());
     }
 
-    fn resetGrid(self: *Screen, i: u1) void {
+    fn resetGrid(self: *Term, i: u1) void {
         const g = &self.grids[i];
         @memset(g.cells, .{ .fg = self.scheme.fg, .bg = self.scheme.bg });
         for (g.starts, 0..) |*s, idx| s.* = @intCast(idx * self.cols);
@@ -1221,15 +1224,15 @@ pub const Screen = struct {
         g.saved_attrs = .{};
         g.scroll_top = 0;
         g.scroll_bottom = self.rows - 1;
-        self.kitty.dropScreen(i);
+        self.kitty.dropTerm(i);
         self.markDirtyAll();
     }
 
-    fn grid(self: *Screen) *Grid {
+    fn grid(self: *Term) *Grid {
         return &self.grids[self.which];
     }
 
-    fn gridConst(self: *const Screen) *const Grid {
+    fn gridConst(self: *const Term) *const Grid {
         return &self.grids[self.which];
     }
 };
@@ -1393,7 +1396,7 @@ fn clip(v: u16) u8 {
     return @truncate(@min(v, 255));
 }
 
-fn indexedColor(self: *const Screen, i: u16) Color {
+fn indexedColor(self: *const Term, i: u16) Color {
     const n: u8 = clip(i);
     if (n < 16) return self.scheme.palette[n];
     if (n < 232) {
@@ -1407,509 +1410,3 @@ fn indexedColor(self: *const Screen, i: u16) Color {
     const v: u8 = 8 + 10 * (n - 232);
     return .{ .r = v, .g = v, .b = v };
 }
-
-test "feed plain" {
-    const gpa = std.testing.allocator;
-    var screen = try Screen.init(gpa, 8, 2);
-    defer screen.deinit();
-    var runs: std.ArrayList(Runs.Run) = .empty;
-    defer runs.deinit(gpa);
-    const src = "Hi";
-    try Runs.split(gpa, src, &runs);
-    screen.feed(runs.items, src);
-    try std.testing.expectEqual(@as(u21, 'H'), screen.cell(0, 0).codepoint);
-    try std.testing.expectEqual(@as(u21, 'i'), screen.cell(0, 1).codepoint);
-    const dump = try screen.dumpAlloc(gpa);
-    defer gpa.free(dump);
-    try std.testing.expectEqualStrings("Hi      \n        ", dump);
-}
-
-test "el at wrap pending does not panic" {
-    const gpa = std.testing.allocator;
-    var screen = try Screen.init(gpa, 4, 1);
-    defer screen.deinit();
-    var runs: std.ArrayList(Runs.Run) = .empty;
-    defer runs.deinit(gpa);
-    const src = "ABCD\x1b[1K";
-    try Runs.split(gpa, src, &runs);
-    screen.feed(runs.items, src);
-    try std.testing.expectEqual(@as(u16, 4), screen.cursor().col);
-    try std.testing.expectEqual(@as(u21, ' '), screen.cell(0, 0).codepoint);
-}
-
-test "sgr and cup" {
-    const gpa = std.testing.allocator;
-    var screen = try Screen.init(gpa, 8, 2);
-    defer screen.deinit();
-    var runs: std.ArrayList(Runs.Run) = .empty;
-    defer runs.deinit(gpa);
-    const src = "\x1b[31mA\x1b[2;3H";
-    try Runs.split(gpa, src, &runs);
-    screen.feed(runs.items, src);
-    try std.testing.expectEqual(@as(u8, 170), screen.cell(0, 0).fg.r);
-    try std.testing.expectEqual(@as(u16, 1), screen.cursor().row);
-    try std.testing.expectEqual(@as(u16, 2), screen.cursor().col);
-}
-
-test "sgr 256 and truecolor" {
-    const gpa = std.testing.allocator;
-    var screen = try Screen.init(gpa, 8, 2);
-    defer screen.deinit();
-    var runs: std.ArrayList(Runs.Run) = .empty;
-    defer runs.deinit(gpa);
-    const src = "\x1b[38;5;196mA\x1b[38:2::10:20:30mB";
-    try Runs.split(gpa, src, &runs);
-    screen.feed(runs.items, src);
-    try std.testing.expectEqual(@as(u8, 255), screen.cell(0, 0).fg.r);
-    try std.testing.expectEqual(@as(u8, 0), screen.cell(0, 0).fg.g);
-    try std.testing.expectEqual(@as(u8, 10), screen.cell(0, 1).fg.r);
-    try std.testing.expectEqual(@as(u8, 20), screen.cell(0, 1).fg.g);
-    try std.testing.expectEqual(@as(u8, 30), screen.cell(0, 1).fg.b);
-}
-
-test "osc and str are not drawn" {
-    const gpa = std.testing.allocator;
-    var screen = try Screen.init(gpa, 16, 2);
-    defer screen.deinit();
-    var runs: std.ArrayList(Runs.Run) = .empty;
-    defer runs.deinit(gpa);
-    const src = "ab\x1b]0;title\x07cd\x1b^hid\x1b\\ef";
-    try Runs.split(gpa, src, &runs);
-    screen.feed(runs.items, src);
-    try std.testing.expectEqual(@as(u21, 'a'), screen.cell(0, 0).codepoint);
-    try std.testing.expectEqual(@as(u21, 'b'), screen.cell(0, 1).codepoint);
-    try std.testing.expectEqual(@as(u21, 'c'), screen.cell(0, 2).codepoint);
-    try std.testing.expectEqual(@as(u21, 'd'), screen.cell(0, 3).codepoint);
-    try std.testing.expectEqual(@as(u21, 'e'), screen.cell(0, 4).codepoint);
-    try std.testing.expectEqual(@as(u21, 'f'), screen.cell(0, 5).codepoint);
-}
-
-test "csi insert delete" {
-    const gpa = std.testing.allocator;
-    var screen = try Screen.init(gpa, 8, 2);
-    defer screen.deinit();
-    var runs: std.ArrayList(Runs.Run) = .empty;
-    defer runs.deinit(gpa);
-    const src = "ABC\x1b[2D\x1b[@X";
-    try Runs.split(gpa, src, &runs);
-    screen.feed(runs.items, src);
-    try std.testing.expectEqual(@as(u21, 'A'), screen.cell(0, 0).codepoint);
-    try std.testing.expectEqual(@as(u21, 'X'), screen.cell(0, 1).codepoint);
-    try std.testing.expectEqual(@as(u21, 'B'), screen.cell(0, 2).codepoint);
-    try std.testing.expectEqual(@as(u21, 'C'), screen.cell(0, 3).codepoint);
-}
-
-test "scrollback ring" {
-    const gpa = std.testing.allocator;
-    var screen = try Screen.initScrollback(gpa, 4, 2, 4);
-    defer screen.deinit();
-    var runs: std.ArrayList(Runs.Run) = .empty;
-    defer runs.deinit(gpa);
-    const src = "a\nb\nc";
-    try Runs.split(gpa, src, &runs);
-    screen.feed(runs.items, src);
-    try std.testing.expectEqual(@as(u21, 'b'), screen.cell(0, 0).codepoint);
-    try std.testing.expectEqual(@as(u21, 'c'), screen.cell(1, 0).codepoint);
-    try std.testing.expectEqual(@as(u32, 1), screen.scrollMax());
-    screen.scrollBy(1);
-    try std.testing.expectEqual(@as(u21, 'a'), screen.cell(0, 0).codepoint);
-    try std.testing.expectEqual(@as(u21, 'b'), screen.cell(1, 0).codepoint);
-    screen.scrollBy(8);
-    try std.testing.expectEqual(@as(u32, 1), screen.scrollOffset());
-    screen.scrollBy(-8);
-    try std.testing.expectEqual(@as(u32, 0), screen.scrollOffset());
-    try std.testing.expectEqual(@as(u21, 'b'), screen.cell(0, 0).codepoint);
-}
-
-test "alt screen preserves primary" {
-    const gpa = std.testing.allocator;
-    var screen = try Screen.init(gpa, 8, 2);
-    defer screen.deinit();
-    var runs: std.ArrayList(Runs.Run) = .empty;
-    defer runs.deinit(gpa);
-    const src = "AB\x1b[?1049hXY\x1b[?1049l";
-    try Runs.split(gpa, src, &runs);
-    screen.feed(runs.items, src);
-    try std.testing.expect(!screen.altScreen());
-    try std.testing.expectEqual(@as(u21, 'A'), screen.cell(0, 0).codepoint);
-    try std.testing.expectEqual(@as(u21, 'B'), screen.cell(0, 1).codepoint);
-}
-
-test "alt screen is blank" {
-    const gpa = std.testing.allocator;
-    var screen = try Screen.init(gpa, 8, 2);
-    defer screen.deinit();
-    var runs: std.ArrayList(Runs.Run) = .empty;
-    defer runs.deinit(gpa);
-    const src = "AB\x1b[?1049h";
-    try Runs.split(gpa, src, &runs);
-    screen.feed(runs.items, src);
-    try std.testing.expect(screen.altScreen());
-    try std.testing.expectEqual(@as(u21, ' '), screen.cell(0, 0).codepoint);
-    try std.testing.expectEqual(@as(u16, 0), screen.cursor().row);
-    try std.testing.expectEqual(@as(u16, 0), screen.cursor().col);
-}
-
-test "scroll region lf" {
-    const gpa = std.testing.allocator;
-    var screen = try Screen.init(gpa, 4, 4);
-    defer screen.deinit();
-    var runs: std.ArrayList(Runs.Run) = .empty;
-    defer runs.deinit(gpa);
-    const src = "AAAA\r\nBBBB\r\nCCCC\r\nDDDD\x1b[2;3r\x1b[3;1H\n";
-    try Runs.split(gpa, src, &runs);
-    screen.feed(runs.items, src);
-    try std.testing.expectEqual(@as(u21, 'A'), screen.cell(0, 0).codepoint);
-    try std.testing.expectEqual(@as(u21, 'C'), screen.cell(1, 0).codepoint);
-    try std.testing.expectEqual(@as(u21, ' '), screen.cell(2, 0).codepoint);
-    try std.testing.expectEqual(@as(u21, 'D'), screen.cell(3, 0).codepoint);
-}
-
-test "private sgr is ignored" {
-    const gpa = std.testing.allocator;
-    var screen = try Screen.init(gpa, 8, 2);
-    defer screen.deinit();
-    var runs: std.ArrayList(Runs.Run) = .empty;
-    defer runs.deinit(gpa);
-    const src = "\x1b[>4;2mA";
-    try Runs.split(gpa, src, &runs);
-    screen.feed(runs.items, src);
-    try std.testing.expect(!screen.cell(0, 0).attrs.underline);
-    try std.testing.expectEqual(@as(u21, 'A'), screen.cell(0, 0).codepoint);
-    try std.testing.expectEqual(@as(u8, 2), screen.inputMode().modify_other_keys);
-}
-
-test "save restore cursor" {
-    const gpa = std.testing.allocator;
-    var screen = try Screen.init(gpa, 8, 4);
-    defer screen.deinit();
-    var runs: std.ArrayList(Runs.Run) = .empty;
-    defer runs.deinit(gpa);
-    const src = "\x1b[2;3H\x1b7\x1b[H\x1b8";
-    try Runs.split(gpa, src, &runs);
-    screen.feed(runs.items, src);
-    try std.testing.expectEqual(@as(u16, 1), screen.cursor().row);
-    try std.testing.expectEqual(@as(u16, 2), screen.cursor().col);
-}
-
-test "insert mode" {
-    const gpa = std.testing.allocator;
-    var screen = try Screen.init(gpa, 8, 2);
-    defer screen.deinit();
-    var runs: std.ArrayList(Runs.Run) = .empty;
-    defer runs.deinit(gpa);
-    const src = "ABC\x1b[2D\x1b[4hX";
-    try Runs.split(gpa, src, &runs);
-    screen.feed(runs.items, src);
-    try std.testing.expectEqual(@as(u21, 'A'), screen.cell(0, 0).codepoint);
-    try std.testing.expectEqual(@as(u21, 'X'), screen.cell(0, 1).codepoint);
-    try std.testing.expectEqual(@as(u21, 'B'), screen.cell(0, 2).codepoint);
-    try std.testing.expectEqual(@as(u21, 'C'), screen.cell(0, 3).codepoint);
-}
-
-test "resize" {
-    const gpa = std.testing.allocator;
-    var screen = try Screen.initScrollback(gpa, 8, 2, 4);
-    defer screen.deinit();
-    try screen.resize(4, 6);
-    try std.testing.expectEqual(@as(u16, 4), screen.cols);
-    try std.testing.expectEqual(@as(u16, 6), screen.rows);
-    try std.testing.expectEqual(@as(u32, 10), screen.cap);
-    try std.testing.expectEqual(@as(u21, ' '), screen.cell(5, 3).codepoint);
-    try screen.resize(4, 6);
-    try std.testing.expectEqual(@as(u16, 6), screen.rows);
-}
-
-test "dec special graphics" {
-    const gpa = std.testing.allocator;
-    var screen = try Screen.init(gpa, 8, 2);
-    defer screen.deinit();
-    var runs: std.ArrayList(Runs.Run) = .empty;
-    defer runs.deinit(gpa);
-    const src = "\x1b(0qx\x1b(B";
-    try Runs.split(gpa, src, &runs);
-    screen.feed(runs.items, src);
-    try std.testing.expectEqual(@as(u21, 0x2500), screen.cell(0, 0).codepoint);
-    try std.testing.expectEqual(@as(u21, 0x2502), screen.cell(0, 1).codepoint);
-}
-
-test "mouse and cursor key modes" {
-    const gpa = std.testing.allocator;
-    var screen = try Screen.init(gpa, 8, 2);
-    defer screen.deinit();
-    var runs: std.ArrayList(Runs.Run) = .empty;
-    defer runs.deinit(gpa);
-    const src = "\x1b[?1h\x1b[?1000;1002;1006h\x1b[?2004h\x1b[?1004h";
-    try Runs.split(gpa, src, &runs);
-    screen.feed(runs.items, src);
-    const mode = screen.inputMode();
-    try std.testing.expect(mode.app_cursor);
-    try std.testing.expectEqual(Events.MouseTracking.drag, mode.mouse);
-    try std.testing.expect(mode.mouse_sgr);
-    try std.testing.expect(mode.bracket_paste);
-    try std.testing.expect(mode.focus_event);
-}
-
-test "device reports" {
-    var q: Queries = .{};
-    q.add("\x1b[c\x1b[6n\x1b[>c\x1b[18t");
-    try std.testing.expect(q.pending());
-    try std.testing.expectEqual(@as(u8, 1), q.da);
-    try std.testing.expectEqual(@as(u8, 1), q.cpr);
-    try std.testing.expectEqual(@as(u8, 1), q.da2);
-    try std.testing.expectEqual(@as(u8, 1), q.cells);
-    const gpa = std.testing.allocator;
-    var screen = try Screen.init(gpa, 80, 24);
-    defer screen.deinit();
-    var buf: [128]u8 = undefined;
-    const n = q.write(&screen, 800, 384, 10, 16, &buf);
-    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "\x1b[?64;1;2;6;9;15;16;21;22c") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "\x1b[1;1R") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "\x1b[8;24;80t") != null);
-    try std.testing.expect(!q.pending());
-}
-
-test "sgr dim hidden" {
-    const gpa = std.testing.allocator;
-    var screen = try Screen.init(gpa, 8, 2);
-    defer screen.deinit();
-    var runs: std.ArrayList(Runs.Run) = .empty;
-    defer runs.deinit(gpa);
-    const src = "\x1b[2;8mA";
-    try Runs.split(gpa, src, &runs);
-    screen.feed(runs.items, src);
-    try std.testing.expect(screen.cell(0, 0).attrs.dim);
-    try std.testing.expect(screen.cell(0, 0).attrs.hidden);
-}
-
-test "dirty lines on write and clear" {
-    const gpa = std.testing.allocator;
-    var screen = try Screen.init(gpa, 8, 2);
-    defer screen.deinit();
-    try std.testing.expect(screen.lineDirty(0));
-    screen.clearDirty();
-    try std.testing.expect(!screen.lineDirty(0));
-    try std.testing.expect(!screen.lineDirty(1));
-    var runs: std.ArrayList(Runs.Run) = .empty;
-    defer runs.deinit(gpa);
-    const src = "A\nB\nC";
-    try Runs.split(gpa, src, &runs);
-    screen.feed(runs.items, src);
-    try std.testing.expect(screen.lineDirty(0));
-    try std.testing.expect(screen.lineDirty(1));
-    screen.clearDirty();
-    try std.testing.expect(!screen.lineDirty(0));
-    screen.scrollBy(1);
-    try std.testing.expect(screen.lineDirty(0));
-    try std.testing.expect(screen.lineDirty(1));
-    screen.clearDirty();
-    screen.clear();
-    try std.testing.expect(screen.lineDirty(0));
-}
-
-test "decstr soft reset" {
-    const gpa = std.testing.allocator;
-    var screen = try Screen.init(gpa, 8, 4);
-    defer screen.deinit();
-    var runs: std.ArrayList(Runs.Run) = .empty;
-    defer runs.deinit(gpa);
-    const src = "ABC\x1b[2D\x1b[4h\x1b[2;3r\x1b[31m\x1b[!p\x1b[1;2HX";
-    try Runs.split(gpa, src, &runs);
-    screen.feed(runs.items, src);
-    try std.testing.expectEqual(@as(u21, 'A'), screen.cell(0, 0).codepoint);
-    try std.testing.expectEqual(@as(u21, 'X'), screen.cell(0, 1).codepoint);
-    try std.testing.expectEqual(@as(u21, 'C'), screen.cell(0, 2).codepoint);
-    try std.testing.expectEqual(@as(u8, Color.default_fg.r), screen.cell(0, 1).fg.r);
-    try std.testing.expect(!screen.insert_mode);
-    try std.testing.expect(screen.auto_wrap);
-    try std.testing.expect(!screen.origin_mode);
-}
-
-test "hpa hpr vpr" {
-    const gpa = std.testing.allocator;
-    var screen = try Screen.init(gpa, 8, 4);
-    defer screen.deinit();
-    var runs: std.ArrayList(Runs.Run) = .empty;
-    defer runs.deinit(gpa);
-    const src = "\x1b[5`A\x1b[H\x1b[3aB\x1b[H\x1b[2eC";
-    try Runs.split(gpa, src, &runs);
-    screen.feed(runs.items, src);
-    try std.testing.expectEqual(@as(u21, 'A'), screen.cell(0, 4).codepoint);
-    try std.testing.expectEqual(@as(u21, 'B'), screen.cell(0, 3).codepoint);
-    try std.testing.expectEqual(@as(u21, 'C'), screen.cell(2, 0).codepoint);
-    try std.testing.expectEqual(@as(u16, 2), screen.cursor().row);
-}
-
-test "decscusr" {
-    const gpa = std.testing.allocator;
-    var screen = try Screen.init(gpa, 8, 2);
-    defer screen.deinit();
-    var runs: std.ArrayList(Runs.Run) = .empty;
-    defer runs.deinit(gpa);
-    try Runs.split(gpa, "\x1b[6 q", &runs);
-    screen.feed(runs.items, "\x1b[6 q");
-    try std.testing.expectEqual(CursorStyle.bar, screen.cursorStyle());
-    runs.clearRetainingCapacity();
-    try Runs.split(gpa, "\x1b[4q", &runs);
-    screen.feed(runs.items, "\x1b[4q");
-    try std.testing.expectEqual(CursorStyle.underline, screen.cursorStyle());
-    try std.testing.expect(!screen.cursor_blink);
-    runs.clearRetainingCapacity();
-    try Runs.split(gpa, "\x1b[1 q", &runs);
-    screen.feed(runs.items, "\x1b[1 q");
-    try std.testing.expectEqual(CursorStyle.block, screen.cursorStyle());
-    try std.testing.expect(screen.cursor_blink);
-}
-
-test "ed 3 clears scrollback" {
-    const gpa = std.testing.allocator;
-    var screen = try Screen.initScrollback(gpa, 4, 2, 4);
-    defer screen.deinit();
-    var runs: std.ArrayList(Runs.Run) = .empty;
-    defer runs.deinit(gpa);
-    const src = "a\nb\nc\nd";
-    try Runs.split(gpa, src, &runs);
-    screen.feed(runs.items, src);
-    try std.testing.expect(screen.scrollMax() > 0);
-    try std.testing.expectEqual(@as(u21, 'c'), screen.cell(0, 0).codepoint);
-    try std.testing.expectEqual(@as(u21, 'd'), screen.cell(1, 0).codepoint);
-    runs.clearRetainingCapacity();
-    try Runs.split(gpa, "\x1b[3J", &runs);
-    screen.feed(runs.items, "\x1b[3J");
-    try std.testing.expectEqual(@as(u32, 0), screen.scrollMax());
-    try std.testing.expectEqual(@as(u21, 'c'), screen.cell(0, 0).codepoint);
-    try std.testing.expectEqual(@as(u21, 'd'), screen.cell(1, 0).codepoint);
-}
-
-test "sgr blink and double underline" {
-    const gpa = std.testing.allocator;
-    var screen = try Screen.init(gpa, 8, 2);
-    defer screen.deinit();
-    var runs: std.ArrayList(Runs.Run) = .empty;
-    defer runs.deinit(gpa);
-    const src = "\x1b[5;21mA\x1b[25;24mB";
-    try Runs.split(gpa, src, &runs);
-    screen.feed(runs.items, src);
-    try std.testing.expect(screen.cell(0, 0).attrs.blink);
-    try std.testing.expect(screen.cell(0, 0).attrs.underline);
-    try std.testing.expect(!screen.cell(0, 1).attrs.blink);
-    try std.testing.expect(!screen.cell(0, 1).attrs.underline);
-}
-
-test "vt and ff are line feeds" {
-    const gpa = std.testing.allocator;
-    var screen = try Screen.init(gpa, 8, 4);
-    defer screen.deinit();
-    var runs: std.ArrayList(Runs.Run) = .empty;
-    defer runs.deinit(gpa);
-    const src = "A\x0bB\x0cC";
-    try Runs.split(gpa, src, &runs);
-    screen.feed(runs.items, src);
-    try std.testing.expectEqual(@as(u21, 'A'), screen.cell(0, 0).codepoint);
-    try std.testing.expectEqual(@as(u21, 'B'), screen.cell(1, 0).codepoint);
-    try std.testing.expectEqual(@as(u21, 'C'), screen.cell(2, 0).codepoint);
-}
-
-test "decrqm da3 xtversion" {
-    var q: Queries = .{};
-    q.add("\x1b[=c\x1b[>0q\x1b[?25$p\x1b[4$p");
-    try std.testing.expect(q.pending());
-    try std.testing.expectEqual(@as(u8, 1), q.da3);
-    try std.testing.expectEqual(@as(u8, 1), q.xtversion);
-    try std.testing.expectEqual(@as(u8, 2), q.decrqm_n);
-    const gpa = std.testing.allocator;
-    var screen = try Screen.init(gpa, 80, 24);
-    defer screen.deinit();
-    var buf: [128]u8 = undefined;
-    const n = q.write(&screen, 800, 384, 10, 16, &buf);
-    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "\x1bP!|00000000\x1b\\") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "\x1bP>|ZT\x1b\\") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "\x1b[?25;1$y") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "\x1b[4;2$y") != null);
-    try std.testing.expect(!q.pending());
-}
-
-test "bce el uses current background" {
-    const gpa = std.testing.allocator;
-    var screen = try Screen.init(gpa, 8, 2);
-    defer screen.deinit();
-    var runs: std.ArrayList(Runs.Run) = .empty;
-    defer runs.deinit(gpa);
-    const src = "\x1b[41mAB\x1b[1D\x1b[K";
-    try Runs.split(gpa, src, &runs);
-    screen.feed(runs.items, src);
-    try std.testing.expectEqual(@as(u21, 'A'), screen.cell(0, 0).codepoint);
-    try std.testing.expectEqual(@as(u21, ' '), screen.cell(0, 1).codepoint);
-    try std.testing.expectEqual(@as(u8, 170), screen.cell(0, 1).bg.r);
-    try std.testing.expectEqual(@as(u8, 0), screen.cell(0, 1).bg.g);
-}
-
-test "osc 8 sets link attr" {
-    const gpa = std.testing.allocator;
-    var screen = try Screen.init(gpa, 8, 2);
-    defer screen.deinit();
-    var runs: std.ArrayList(Runs.Run) = .empty;
-    defer runs.deinit(gpa);
-    const src = "\x1b]8;;http://x\x1b\\A\x1b]8;;\x1b\\B";
-    try Runs.split(gpa, src, &runs);
-    screen.feed(runs.items, src);
-    try std.testing.expect(screen.cell(0, 0).attrs.link);
-    try std.testing.expect(!screen.cell(0, 1).attrs.link);
-}
-
-test "xtsave restore private mode" {
-    const gpa = std.testing.allocator;
-    var screen = try Screen.init(gpa, 8, 2);
-    defer screen.deinit();
-    var runs: std.ArrayList(Runs.Run) = .empty;
-    defer runs.deinit(gpa);
-    const src = "\x1b[?25l\x1b[?25s\x1b[?25h\x1b[?25r";
-    try Runs.split(gpa, src, &runs);
-    screen.feed(runs.items, src);
-    try std.testing.expect(!screen.cursorVisible());
-    try std.testing.expectEqual(@as(u16, 2), screen.privateMode(25));
-}
-
-test "modes 1015 1016 2026" {
-    const gpa = std.testing.allocator;
-    var screen = try Screen.init(gpa, 8, 2);
-    defer screen.deinit();
-    var runs: std.ArrayList(Runs.Run) = .empty;
-    defer runs.deinit(gpa);
-    const src = "\x1b[?1015;1016;2026h";
-    try Runs.split(gpa, src, &runs);
-    screen.feed(runs.items, src);
-    const mode = screen.inputMode();
-    try std.testing.expect(mode.mouse_urxvt);
-    try std.testing.expect(mode.mouse_pixels);
-    try std.testing.expectEqual(@as(u16, 1), screen.privateMode(2026));
-}
-
-test "kitty decrqss xtgettcap reports" {
-    var q: Queries = .{};
-    q.add("\x1b[?u\x1bP$qm\x1b\\\x1bP+q4D73\x1b\\");
-    try std.testing.expect(q.pending());
-    try std.testing.expectEqual(@as(u8, 1), q.kitty_kb);
-    try std.testing.expectEqual(@as(u8, 1), q.decrqss_m);
-    try std.testing.expectEqual(@as(u8, 1), q.tcap_n);
-    const gpa = std.testing.allocator;
-    var screen = try Screen.init(gpa, 80, 24);
-    defer screen.deinit();
-    var buf: [128]u8 = undefined;
-    const n = q.write(&screen, 800, 384, 10, 16, &buf);
-    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "\x1b[?0u") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "\x1bP1$r0m\x1b\\") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "\x1bP0+r4D73\x1b\\") != null);
-    try std.testing.expect(!q.pending());
-}
-
-test "sync depth from 2026" {
-    var q: Queries = .{};
-    q.add("\x1b[?2026hX\x1b[?2026l");
-    try std.testing.expectEqual(@as(u8, 0), q.sync_depth);
-    try std.testing.expect(q.sync_flush);
-    q.add("\x1b[?2026h");
-    try std.testing.expectEqual(@as(u8, 1), q.sync_depth);
-    try std.testing.expect(!q.sync_flush);
-}
-

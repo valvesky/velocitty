@@ -16,10 +16,11 @@
 - `term.zig` — minimal-state emulator; `feedUtf8` bulk-writes like `feedPlain`
 - `draw.zig` — CPU framebuffer; line-dirty fill + uniform strip memset + SIMD glyph blit; `peekGlyph` on the blit
 - `type.zig` — TrueType rasterizer, atlas, glyph LRU (codepoint → cmap → LRU, not UTF-8 bytes); ASCII 32..126 warmed into ascii slots on size change and clearAtlas; `peekGlyph` / `ensureGlyph`
-- `engine.zig` — ingest / EAGAIN refresh; `Preparse.consume` → `lastLines` → `runs.split` → `term.feed`; drain parsed only; `fed` clamped to ring; `rewindInput`. Plain firehose memcpy+truncate only; queries/preparse/paint run on EAGAIN if 1/hz has passed (not per chunk, not when the ring is full). Live TUI (alt screen) feeds every parsed line, flushes the ring into the grid before overflow so in-place frames (ncmpcpp-style visualizer) are not truncated, and paints at hz while still readable. `whitelist` (default off) skips payload-bearing ESC interior newlines during consume.
+- `engine.zig` — ingest / EAGAIN refresh; `Preparse.consume` → `lastLines` → `runs.split` → `term.feed`; drain parsed only; `fed` clamped to ring; `rewindInput`. Plain firehose memcpy+truncate only; queries/preparse/paint run on EAGAIN if 1/hz has passed (not per chunk, not when the ring is full). Live TUI (alt screen) feeds every parsed line, flushes the ring into the grid before overflow so in-place frames (ncmpcpp-style visualizer) are not truncated, and paints at hz while still readable. `whitelist` (default off) skips payload-bearing ESC interior newlines during consume. `selection` is a cell-stream on the visible grid; `redraw` paints it.
 - `scheme.zig` — TOML config: colors + `[general] refreshrate` (hz), `whitelist` (bool, default false)
 - `loop.zig` — libxev loop, 1/hz timer
-- `events.zig` — input events
+- `events.zig` — input events; `encodePaste` / `filterPaste` (bracket 2004, LF→CR, strip 201~)
+- `select.zig` — cell-stream selection, word/line expand, copy from visible grid
 - `kitty.zig` — kitty graphics
 - `daemon.zig` — JSONL protocol / TCP server
 - `mux.zig` — tiling panes

@@ -1,4 +1,5 @@
-//! Host PTY. Bytes to a child shell. Not part of the library pipeline.
+//! Host PTY. Send bytes to a shell.
+//! 
 
 const std = @import("std");
 const builtin = @import("builtin");

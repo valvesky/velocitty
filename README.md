@@ -11,7 +11,7 @@ Velocitty is a lightning-fast cross-platform terminal multiplexor.
 - Extensive unicode support.
 
 ## Anti-Features
-- No strange CTL.
+- No CTL.
 - No multiplexing.
 
 ## Architecture / Design
