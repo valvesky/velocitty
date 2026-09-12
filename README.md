@@ -1,46 +1,73 @@
-# ⚡⚡ Velocitty ⚡⚡
+<!-- LOGO -->
+<h1>
+<p align="center">
+  <img src="docs/velocitty.2x.gif" alt="Logo" width="128">
+  <br>vt
+</h1>
+  <p align="center">
+     ⚡⚡ Velocitty ⚡⚡
+    <br />
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License: MIT"></a>
+    <a href="https://github.com/valvesky/velocitty"><img src="https://img.shields.io/github/languages/top/valvesky/velocitty?style=flat-square" alt="Language"></a>
+    <img src="https://img.shields.io/badge/Linux-FCC624?style=flat-square&logo=linux&logoColor=black" alt="Linux">
+    <!-- <img src="https://img.shields.io/badge/Windows-0078D4?style=flat-square&logo=windows&logoColor=white" alt="Windows"> -->
+    <!-- <img src="https://img.shields.io/badge/macOS-000000?style=flat-square&logo=apple&logoColor=white" alt="macOS"> -->
+    <!-- <a href="https://github.com/valvesky/velocitty/commits/master"><img src="https://img.shields.io/github/last-commit/valvesky/velocitty?style=flat-square" alt="Last commit"></a> -->
+    <a href="https://github.com/valvesky/velocitty/stargazers"><img src="https://img.shields.io/github/stars/valvesky/velocitty?style=flat-square" alt="Stars"></a>
+    <br />
+    <br />
+    <a href="#features">Features</a>
+    ·
+    <a href="#install">Install</a>
+    ·
+    <a href="#build">Build</a>
+    ·
+    <a href="#shoutouts">Shoutouts</a>
+  </p>
+</p>
 
 Velocitty is a lightning-fast cross-platform terminal multiplexor.
 
 ## Features
-- Lightning fast (multiple GiB/s per second)
+- Omarchy color pallete change and font change (live reloaded).
+- Lightning fast (literally bottle-necked by the kernel)
 - `cat` large files. 
 - Cross-platform.
 - CPU rendered.
 - Image support (kitty protocol)
 - Extensive unicode support.
+- Simple config file.
+- No external dependencies.
 
 ## Anti-Features
 - No CTL.
 - No multiplexing.
+- No scrollback (subject to change).
 
-## Architecture / Design
-1. IO:
-    - Truncates firehose input through a mirrored circular buffer allowing users to cat large files.
-    - EAGAIN: We only consume on EAGAIN if 1/hz time has passed and we need to refresh the screen.
-    - Otherwise we keep reading until EOF.
-2. VECTORIZED PREPARSING:
-    - After truncating input, input is split into lines via AVX2 accelerated preparsing.
-    - For correctness we detect escape sequences and newlines. 
-    - Escape sequences may contain payloads with newlines that effect correct line splitting.
-    - While splitting new lines we must account for:
-        - Payload bearing escape sequences that may contain newline bytes that dont shift to the newline.
-        - Escape sequences that change the end graphical result or update the cursor.
-        - Therefore we will need a smaller pre-parse only parser that accepts whitelisted escape sequences. 
-        - Non whitelisted escape sequences will return us to vectorized parsing.
-3. VECTORIZED SPLITTING INTO RUNS:
-    - Now that we have a correct cursor and input split by lines, we will fetch **only the lines that fit on the screen.**
-    - Split the lines that fit on the screen into "runs".
-    - Runs will be split into C0 (<0x1b), (>=DEL) C1, Esc (0x1b), EscKitty, EscSixel, Plain, UTF-8, possibly more in the future.
-4. MINIMAL STATE TERMINAL EMULATOR:
-    - Feed the runs into the optimized minimal-state terminal emulator to get the final screen.
-    - The final terminal cells and lines will be added to the buffer of cells and get indexed allowing for 
-    - The minimal state terminal should also use vectorization when possible.
-    - ADVANCED UNICODE PARSING:
-        - While producing the final screen we must also check for glyphs that might ocupy multiple cells and leave details for the renderer.
-        - UTS 11 - character width
-        - UTS 24 - script property
-        - UTS 29 - text segmentation (grapheme cluster, word boundary)
-        - UTS 51 - Emoji
-5. DRAW THE SCREEN:
-    - The font is prebaked an atlas and has an LRU cache for quick access and eviction of least recently used glyphs.
+## Install
+
+See [releases]() tab
+
+## Build
+
+Just clone the repo and run:
+```
+zig build release
+```
+The binary will be in `zig-out/`
+
+## Supported Platforms 
+- [x] Linux (Wayland)
+- [ ] Linux (X11)
+- [ ] MacOS
+- [ ] Windows
+
+## Shoutouts
+- [st](https://st.suckless.org) --- how to suck less
+- [refterm](https://github.com/cmuratori/refterm) --- how to black magic
+- [kitty](https://sw.kovidgoyal.net/kitty/) — how to meow
+- [ghostty](https://ghostty.org) --- how to render glyph good
+- [foot](https://codeberg.org/dnkl/foot) --- how to vt parsing good
+
+---
+

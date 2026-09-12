@@ -42,7 +42,8 @@
 //! Unknown keys are ignored.
 //!
 //! `load` overlays user config then the current Omarchy theme so SIGUSR can
-//! re-read colors and font without a restart.
+//! re-read colors and font without a restart. Unset family uses fontconfig
+//! `monospace` (`omarchy font current`). Size falls back to Alacritty, then 9.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -100,12 +101,11 @@ pub fn load(io: std.Io, gpa: std.mem.Allocator) Config {
 }
 
 fn fillUnsetFont(io: std.Io, gpa: std.mem.Allocator, buf: []u8, cfg: *Config) void {
+    // Omarchy's source of truth is fontconfig `monospace` (`omarchy font current`).
+    // Copy size from Alacritty when unset; leave family empty so loadFonts fc-matches
+    // monospace (user fonts.conf + ~/.local/share/fonts) instead of a stale terminal config.
     var tmp: Config = .{};
     if (xdgConfigPath(buf, "alacritty/alacritty.toml")) |path| overlayFile(io, gpa, path, &tmp);
-    if (cfg.font_family_len == 0 and tmp.font_family_len != 0) {
-        cfg.font_family = tmp.font_family;
-        cfg.font_family_len = tmp.font_family_len;
-    }
     if (cfg.font_size == 0 and tmp.font_size != 0) cfg.font_size = tmp.font_size;
     if (cfg.font_size == 0 and omarchyThemePath(buf, "colors.toml") != null) cfg.font_size = 9;
 }

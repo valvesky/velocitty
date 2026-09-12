@@ -142,6 +142,10 @@ pub const Window = struct {
         _ = c.XCloseDisplay(self.display);
     }
 
+    pub fn eventFd(self: *const Window) posix.fd_t {
+        return @intCast(c.XConnectionNumber(self.display));
+    }
+
     pub fn pollEvent(self: *Window, ev: *Platform.Event) bool {
         while (c.XPending(self.display) > 0) {
             var xev: c.XEvent = undefined;

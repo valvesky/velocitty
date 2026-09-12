@@ -61,6 +61,7 @@ fn loadFontPath(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
 }
 
 fn resolveFamilyFile(io: std.Io, gpa: std.mem.Allocator, family: []const u8) ?[]u8 {
+    // fontconfig reads HOME / FONTCONFIG_* from the child environment.
     const result = std.process.run(gpa, io, .{
         .argv = &.{ "fc-match", "-f", "%{file}", family },
         .stdout_limit = .limited(4096),
@@ -154,7 +155,7 @@ fn jsonFloatAfter(obj: []const u8, key: []const u8) ?f32 {
     return std.fmt.parseFloat(f32, obj[start..p]) catch null;
 }
 
-fn parseFocusedScale(json: []const u8) ?f32 {
+fn parseFocusedFloat(json: []const u8, key: []const u8) ?f32 {
     var fallback: ?f32 = null;
     var i: usize = 0;
     while (i < json.len) {
@@ -176,12 +177,16 @@ fn parseFocusedScale(json: []const u8) ?f32 {
             i += 1;
         }
         const obj = json[start..i];
-        const scale = jsonFloatAfter(obj, "\"scale\":") orelse continue;
-        fallback = scale;
-        if (std.mem.indexOf(u8, obj, "\"focused\":true") != null) return scale;
-        if (std.mem.indexOf(u8, obj, "\"focused\": true") != null) return scale;
+        const value = jsonFloatAfter(obj, key) orelse continue;
+        fallback = value;
+        if (std.mem.indexOf(u8, obj, "\"focused\":true") != null) return value;
+        if (std.mem.indexOf(u8, obj, "\"focused\": true") != null) return value;
     }
     return fallback;
+}
+
+fn parseFocusedScale(json: []const u8) ?f32 {
+    return parseFocusedFloat(json, "\"scale\":");
 }
 
 fn hyprlandScale(io: std.Io, gpa: std.mem.Allocator) ?f32 {
@@ -199,6 +204,39 @@ fn hyprlandScale(io: std.Io, gpa: std.mem.Allocator) ?f32 {
     const scale = parseFocusedScale(result.stdout) orelse return null;
     if (scale < 0.25 or scale > 8) return null;
     return scale;
+}
+
+fn hyprlandRefreshHz(io: std.Io, gpa: std.mem.Allocator) ?u32 {
+    const result = std.process.run(gpa, io, .{
+        .argv = &.{ "hyprctl", "monitors", "-j" },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(4096),
+    }) catch return null;
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code != 0) return null,
+        else => return null,
+    }
+    const hz = parseFocusedFloat(result.stdout, "\"refreshRate\":") orelse return null;
+    if (hz < 20 or hz > 500) return null;
+    return @max(1, @as(u32, @intFromFloat(@round(hz))));
+}
+
+fn fdReady(fd: std.posix.fd_t) bool {
+    var fds = [_]std.posix.pollfd{
+        .{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 },
+    };
+    const n = std.posix.poll(&fds, 0) catch return false;
+    return n > 0 and (fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0;
+}
+
+fn waitFds(a: std.posix.fd_t, b: std.posix.fd_t, timeout_ms: i32) void {
+    var fds = [_]std.posix.pollfd{
+        .{ .fd = a, .events = std.posix.POLL.IN, .revents = 0 },
+        .{ .fd = b, .events = std.posix.POLL.IN, .revents = 0 },
+    };
+    _ = std.posix.poll(&fds, timeout_ms) catch {};
 }
 
 fn gdkScale() f32 {
@@ -323,18 +361,20 @@ fn textLen(text: [32]u8) usize {
     return std.mem.indexOfScalar(u8, &text, 0) orelse text.len;
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var io = std.Io.Threaded.init(allocator, .{});
+    // Empty environ makes fc-match ignore Omarchy's fonts.conf (and ~/.local/share/fonts).
+    var io = std.Io.Threaded.init(allocator, .{ .environ = init.environ });
     defer io.deinit();
 
     installReloadSignal();
 
     var config = loadConfig(io.io(), allocator);
-    var hz: u32 = if (config.hz == 0) 30 else config.hz;
+    const display_hz: u32 = hyprlandRefreshHz(io.io(), allocator) orelse 60;
+    var hz: u32 = display_hz;
 
     var cols: u16 = 80;
     var rows: u16 = 24;
@@ -395,8 +435,13 @@ pub fn main() !void {
     });
     defer pty.close();
 
+    const x_fd = window.eventFd();
+    const pty_fd = pty.impl.master;
+    const frame_ms: i32 = @intCast(@max(1, 1000 / display_hz));
+
     var running = true;
     var theme_stamp = Scheme.watchStamp(io.io());
+    var need_draw = true;
 
     while (running) {
         var ev: Platform.Event = undefined;
@@ -418,6 +463,7 @@ pub fn main() !void {
                             .px_h = r.px_h,
                         });
                         frame.invalidate();
+                        need_draw = true;
                     }
                 },
                 .key_press => |k| {
@@ -439,7 +485,7 @@ pub fn main() !void {
 
         if (reload_requested.swap(false, .acq_rel)) {
             config = loadConfig(io.io(), allocator);
-            hz = if (config.hz == 0) 30 else config.hz;
+            hz = display_hz;
             size_px = fontPixels(config, scale, dpi);
             term.applyScheme(config.scheme);
 
@@ -481,12 +527,15 @@ pub fn main() !void {
             }
             frame.invalidate();
             theme_stamp = Scheme.watchStamp(io.io());
+            need_draw = true;
         }
 
         var hangup = false;
-        circbuffer.readPTY(pty.impl.master, hz) catch {
-            hangup = true;
-        };
+        if (fdReady(pty_fd)) {
+            circbuffer.readPTY(pty_fd, hz) catch {
+                hangup = true;
+            };
+        }
 
         if (circbuffer.pending()) {
             const runs = circbuffer.consumeAndGetRuns(std.math.maxInt(usize));
@@ -495,12 +544,19 @@ pub fn main() !void {
                 pty.write(term.reply.items);
                 term.reply.clearRetainingCapacity();
             }
+            need_draw = true;
         }
-        frame.render(&term, cell_w, cell_h, type_ptr, size_px);
-        term.clearDirty();
-        const fb = window.framebuffer();
-        blitFrame(fb, &frame, padColor(&term));
-        window.present();
+
+        if (need_draw) {
+            frame.render(&term, cell_w, cell_h, type_ptr, size_px);
+            term.clearDirty();
+            const fb = window.framebuffer();
+            blitFrame(fb, &frame, padColor(&term));
+            window.present();
+            need_draw = false;
+        } else {
+            waitFds(x_fd, pty_fd, frame_ms);
+        }
 
         if (hangup) running = false;
     }

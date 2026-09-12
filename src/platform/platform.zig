@@ -89,6 +89,11 @@ pub const Window = struct {
         return self.impl.pollEvent(ev);
     }
 
+    /// X connection fd (`ConnectionNumber(dpy)`). Poll with the PTY; do not read it.
+    pub fn eventFd(self: *Window) std.posix.fd_t {
+        return self.impl.eventFd();
+    }
+
     pub fn getClipboard(self: *Window, gpa: std.mem.Allocator) ?[]const u8 {
         return self.impl.getClipboard(gpa);
     }
