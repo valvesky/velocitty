@@ -1,6 +1,6 @@
 //! Mirrored circular buffer for dealing with firehose PTY input.
 //!
-//! The mirrored buffer is also responsible for preparsing 
+//! The mirrored buffer is also responsible for preparsing
 //! and splitting the input into lines and then into runs
 //! of easy to parse sequences.
 //!
@@ -26,7 +26,6 @@ pub const Line = packed struct {
 };
 
 pub const Run = struct {
-
     pub const Kind = enum {
         c0,
         c1,
@@ -46,7 +45,6 @@ pub const Run = struct {
 };
 
 pub const CircBuffer = struct {
-
     allocator: std.mem.Allocator,
     storage: []u8,
     capacity: usize,
@@ -110,36 +108,84 @@ pub const CircBuffer = struct {
     /// Consume everything and return runs.
     pub fn consumeAndGetRuns(self: *CircBuffer, nlines: usize) []Run {
         self.consumeAndPreparse();
+        if (self.lines.items.len == 0) return &.{};
         const lines = self.getLastNLines(nlines);
+        if (lines.len == 0) return &.{};
         self.splitIntoRuns(lines);
         return self.runs.items;
     }
 
-    /// Read directly from a file descriptor.
-    pub fn read(self: *CircBuffer, reader: std.io.AnyReader) !usize {
-        assert(self.mapped);
-
-        // NOTE(vasco): we can always read capacity because the buffer is mmap'd
-        const target_slice = self.storage[self.head..][0..self.capacity];
-        const bytes_read = try reader.read(target_slice);
-        self.head += bytes_read;
-        return bytes_read;
+    pub fn pending(self: *const CircBuffer) bool {
+        return self.head != self.tail;
     }
 
-    /// Consume all the bytes. Will be a maximum of the size 
+    /// The circular buffer read directly from the PTY using
+    /// it's very particular logic.
+    ///
+    /// 1. We are allowed to truncate data and to delete old data.
+    /// That's the purpose of a circular buffer in the first place. 
+    /// Meaning that if we recieve firehose input it will be trucated
+    /// by this function to the size of the circular buffer. 
+    ///
+    /// 2. So as to not completely freeze the program, we will
+    /// return on EAGAIN IF AND ONLY IF 1/hz has passed. By default
+    /// hz should be 30.
+    ///
+    /// To agents and humans: DO NOT CHANGE THIS COMMENT and do not
+    /// break this logic.
+    pub fn readPTY(self: *CircBuffer, pty: posix.fd_t, hz: u32) error{Hangup}!void {
+        const rate: u32 = if (hz == 0) 30 else hz;
+        const period_ns: i128 = @divTrunc(1_000_000_000, rate);
+        const start_ns = nowNs();
+        const mask = self.capacity - 1;
+
+        while (true) {
+            const off: usize = @intCast(self.head & mask);
+            const dest = self.storage[off..][0..self.capacity];
+            const n = posix.read(pty, dest) catch |err| switch (err) {
+                error.WouldBlock => {
+                    const elapsed = nowNs() - start_ns;
+                    if (elapsed >= period_ns) return;
+                    const remaining_ms = @divTrunc(period_ns - elapsed, 1_000_000);
+                    const timeout_ms: i32 = @intCast(@min(@max(remaining_ms, 0), 1000));
+                    waitReadable(pty, timeout_ms);
+                    continue;
+                },
+                else => return error.Hangup,
+            };
+            if (n == 0) return error.Hangup;
+            self.syncMirror(off, n);
+            self.head += n;
+        }
+    }
+
+    fn syncMirror(self: *CircBuffer, off: usize, n: usize) void {
+        if (self.mapped or n == 0) return;
+        const cap = self.capacity;
+        const a = self.storage;
+        const first = @min(n, cap - off);
+        if (first != 0) {
+            @memcpy(a[off + cap ..][0..first], a[off..][0..first]);
+        }
+        const rest = n - first;
+        if (rest != 0) {
+            @memcpy(a[0..rest], a[cap..][0..rest]);
+        }
+    }
+
+    /// Consume all the bytes. Will be a maximum of the size
     /// of the buffer since data is meant to be truncated.
     /// This function will preparse input into lines.
     ///
-    /// Needs a terminal to apply a few "whitelisted" 
+    /// Needs a terminal to apply a few "whitelisted"
     /// sequences that could effect the final screen.
     fn consumeAndPreparse(self: *CircBuffer) void {
-
         assert(self.tail <= self.head);
 
         // NOTE(vasco): indices are monotonic and keep growing forever
         // therefore we must make sure the head hasn't skipped too far
         // ahead of tail.
-        if ((self.head - self.tail) > self.capacity) 
+        if ((self.head - self.tail) > self.capacity)
             self.tail = self.head - self.capacity;
         splitIntoLines(self);
         self.tail = self.head;
@@ -147,29 +193,29 @@ pub const CircBuffer = struct {
 
     /// Get last N lines of input. May be less than expected.
     fn getLastNLines(self: CircBuffer, n: usize) []Line {
-        const min = @min(n, self.lines.items.len);
-        return self.lines.items[0..min];
+        const len = self.lines.items.len;
+        const min = @min(n, len);
+        return self.lines.items[len - min ..];
     }
 
     /// Vectorized loop that splits circular buffer into lines
     fn splitIntoLines(self: *CircBuffer) void {
 
         // NOTE(vasco): again, because this is a mapped
-        // circular buffed, we can also read read without
+        // circular buffed, we can also read without
         // wrapping without any worries
         assert(std.math.isPowerOfTwo(self.capacity));
-        assert(self.mapped);
         assert(self.tail <= self.head);
 
         self.lines.clearRetainingCapacity();
 
         const to_read: u32 = @intCast(self.head - self.tail);
-        const start   = self.tail & (self.capacity - 1); // same as %
-        const end     = start + to_read;
+        const start: u32 = @intCast(self.tail & (self.capacity - 1)); // same as %
+        const end = start + to_read;
         const slice = self.storage[start..end];
 
         var i: u32 = 0;
-        var line_start: u32 = 0; 
+        var line_start: u32 = 0;
         var esc: bool = false;
 
         while (i < to_read) {
@@ -181,21 +227,22 @@ pub const CircBuffer = struct {
             // to split the screen.
 
             i += SIMD.skipEqualEither(slice[i..], 0x0A, 0x1B);
+            if (i >= to_read) break;
 
             switch (slice[i]) {
                 0x0A => {
                     self.pushLine(.{
-                        .off = line_start,
-                        .len = i - line_start,
+                        .off = start + line_start,
+                        .len = i - line_start + 1,
                         .esc = esc,
                     });
-                    esc = true;
-                    i+= 1;
+                    esc = false;
+                    i += 1;
                     line_start = i;
                 },
                 0x1B => {
                     esc = true;
-                    i+= 1;
+                    i += 1;
                     // TODO: some actual parsing
                     // for the sake of correctness
                 },
@@ -206,21 +253,19 @@ pub const CircBuffer = struct {
         // push trailing line
         if (line_start < to_read) {
             self.pushLine(.{
-                .off = line_start,
+                .off = start + line_start,
                 .len = to_read - line_start,
                 .esc = esc,
             });
         }
-
     }
-
 
     fn splitIntoRuns(self: *CircBuffer, lines: []Line) void {
 
-        // NOTE(vasco): Splitting into Runs should be 
+        // NOTE(vasco): Splitting into Runs should be
         // pretty simple: scan for <= SPC and >= DEL
         // Once we know if we have either we can
-        // use a pretty simple switch to and determine 
+        // use a pretty simple switch to and determine
         // the run type.
 
         // NOTE(vasco): We want to parse lines as if they are contiguous
@@ -285,7 +330,7 @@ pub const CircBuffer = struct {
                         },
                         else => {
                             kind = .esc;
-                            seq_len = 2; // Simple ESC sequence (e.g., ESC M, ESC 7)
+                            seq_len = @intCast(skipEsc(slice[i..]));
                         },
                     }
                 } else {
@@ -379,6 +424,14 @@ pub const CircBuffer = struct {
     }
 };
 
+inline fn skipEsc(slice: []const u8) usize {
+    if (slice.len < 2) return slice.len;
+    var i: usize = 1;
+    while (i < slice.len and slice[i] >= 0x20 and slice[i] <= 0x2F) i += 1;
+    if (i < slice.len) return i + 1;
+    return slice.len;
+}
+
 inline fn skipCsi(slice: []const u8) usize {
     if (slice.len < 3) return slice.len;
     const offset = 2 + SIMD.skipInRange(slice[2..], 0x40, 0x7E);
@@ -415,6 +468,17 @@ inline fn skipStTerminated(slice: []const u8) usize {
     return slice.len;
 }
 
+fn nowNs() i128 {
+    return @intCast(std.Io.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .awake).nanoseconds);
+}
+
+fn waitReadable(fd: posix.fd_t, timeout_ms: i32) void {
+    var fds = [_]posix.pollfd{
+        .{ .fd = fd, .events = posix.POLL.IN, .revents = 0 },
+    };
+    _ = posix.poll(&fds, timeout_ms) catch {};
+}
+
 inline fn skipAsciiPrintable(slice: []const u8) usize {
     return SIMD.skipOutRange(slice, 0x20, 0x7E);
 }
@@ -423,9 +487,7 @@ inline fn skipHighBit(slice: []const u8) usize {
     return SIMD.skipToLowerThan(slice, 0x80);
 }
 
-test "correct line split" {
-}
-
+test "correct line split" {}
 
 test "hardware level mirroring" {
     const gpa = std.testing.allocator;
@@ -433,7 +495,7 @@ test "hardware level mirroring" {
     var buf = try CircBuffer.create(gpa, cap);
     if (buf.mapped) return;
 
-    // We should be able to write capacity bytes 
+    // We should be able to write capacity bytes
     // at any point in time and have it wrap
     // automagically
     //
@@ -447,7 +509,41 @@ test "hardware level mirroring" {
     //
     // |1234xxxx|
 
+    defer buf.destroy();
+}
 
+
+// NOTE(vasco): The circular buffer must be fed in a very particular way.
+// We must guarrantee that circbuffer.readPTY(); will read until one of two
+// conditions are met: 
+// 1. EOF
+// 2. EAGAIN and 1/hz time has passed since the first read.
+//    Meaning that once we start reading we will be updating the 
+//    screen (aka consuming)
+test "correct circular buffer feed" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+    const cap = std.heap.pageSize();
+    var buf = try CircBuffer.create(gpa, cap);
     defer buf.destroy();
 
+    var fds: [2]i32 = undefined;
+    const pipe_rc = std.os.linux.pipe2(&fds, .{ .NONBLOCK = true, .CLOEXEC = true });
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(pipe_rc));
+    defer _ = std.os.linux.close(fds[0]);
+
+    const t0 = nowNs();
+    try buf.readPTY(fds[0], 1000);
+    try std.testing.expect(nowNs() - t0 >= 500_000);
+    try std.testing.expect(!buf.pending());
+
+    const msg = "hello\nworld";
+    const wr = std.os.linux.write(fds[1], msg.ptr, msg.len);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(wr));
+    _ = std.os.linux.close(fds[1]);
+
+    try std.testing.expectError(error.Hangup, buf.readPTY(fds[0], 1000));
+    try std.testing.expect(buf.pending());
+    try std.testing.expectEqual(@as(u64, msg.len), buf.head - buf.tail);
 }

@@ -1,7 +1,7 @@
 //! Cell-stream selection and copy from the visible grid.
 
 const std = @import("std");
-const Term = @import("term.zig");
+const Term = @import("vt.zig");
 
 pub const Point = struct {
     col: u16 = 0,
@@ -144,4 +144,3 @@ fn isWord(cp: u21) bool {
     }
     return true;
 }
-

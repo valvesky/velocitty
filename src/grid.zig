@@ -39,7 +39,9 @@ pub const Attrs = packed struct {
     strikethrough: bool = false,
     blink: bool = false,
     link: bool = false,
-    _padding: u7 = 0,
+    /// 0 none, 1 single, 2 double, 3 curly, 4 dotted, 5 dashed (foot SGR 4:n).
+    underline_style: u3 = 0,
+    _padding: u4 = 0,
 };
 
 pub const Cell = packed struct {

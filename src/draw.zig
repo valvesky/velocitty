@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-const Term = @import("term.zig");
+const Term = @import("vt.zig");
 const Type = @import("type.zig");
 const Box = @import("draw/box.zig");
 const Select = @import("select.zig");
@@ -762,4 +762,3 @@ fn mixVec(bg: @Vector(vec_len, u32), fg: @Vector(vec_len, u32), cover: @Vector(v
     const b = (t * fb + u * bb) * k >> sh;
     return (ba << s24) | (r << s16) | (g << s8) | b;
 }
-

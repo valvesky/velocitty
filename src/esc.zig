@@ -24,10 +24,21 @@ pub fn dispatch(vt: *Vt, bytes: []const u8) void {
             vt.grid().cursor.col = 0;
             vt.index();
         },
+        'H' => vt.setTab(),
         'M' => vt.reverseIndex(),
+        'N' => { // SS2
+            vt.ss = 2;
+            vt.ss_active = true;
+        },
+        'O' => { // SS3
+            vt.ss = 3;
+            vt.ss_active = true;
+        },
         '7' => vt.saveCursor(),
         '8' => vt.restoreCursor(),
         'c' => vt.reset(),
+        'n' => vt.gl = 2, // LS2
+        'o' => vt.gl = 3, // LS3
         '=' => vt.flags.app_keypad = true,
         '>' => vt.flags.app_keypad = false,
         '(' => if (bytes.len >= 3) {
@@ -36,6 +47,13 @@ pub fn dispatch(vt: *Vt, bytes: []const u8) void {
         ')' => if (bytes.len >= 3) {
             vt.g1 = charsetOf(bytes[2]);
         },
+        '*' => if (bytes.len >= 3) {
+            vt.g2 = charsetOf(bytes[2]);
+        },
+        '+' => if (bytes.len >= 3) {
+            vt.g3 = charsetOf(bytes[2]);
+        },
+        '#' => if (seq.arg == '8') vt.decaln(),
         else => {},
     }
 }

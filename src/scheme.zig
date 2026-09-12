@@ -36,9 +36,9 @@
 //! Unknown keys are ignored.
 
 const std = @import("std");
-const Term = @import("term.zig");
+const Grid = @import("grid.zig");
 
-pub const Scheme = Term.Scheme;
+pub const Scheme = Grid.Scheme;
 
 pub const Config = struct {
     scheme: Scheme = .{},
@@ -56,93 +56,14 @@ pub fn parseScheme(src: []const u8) error{InvalidToml}!Scheme {
     return (try parse(src)).scheme;
 }
 
-
-fn loadConfig(io: std.Io, gpa: std.mem.Allocator) zt.Config {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (userSchemePath(&buf)) |path| {
-        if (readConfig(io, gpa, path, true)) |s| return s;
-    }
-    if (exeSchemePath(io, &buf)) |path| {
-        if (readConfig(io, gpa, path, true)) |s| return s;
-    }
-    if (builtin.os.tag != .windows) {
-        if (xdgDirConfigs(io, gpa, &buf)) |s| return s;
-        if (readConfig(io, gpa, "/etc/zt/config.toml", true)) |s| return s;
-    }
-    if (readConfig(io, gpa, "config.toml", false)) |s| return s;
-    return .{};
-}
-
-fn readConfig(io: std.Io, gpa: std.mem.Allocator, path: []const u8, absolute: bool) ?zt.Config {
-    const bytes = readFile(io, gpa, path, absolute) catch return null;
+pub fn loadFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ?Config {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch return null;
     defer gpa.free(bytes);
-    return zt.parseConfig(bytes) catch {
+    return parse(bytes) catch {
         std.debug.print("zt: invalid config {s}\n", .{path});
         return .{};
     };
 }
-
-fn userSchemePath(buf: []u8) ?[]u8 {
-    if (builtin.os.tag == .windows) {
-        const appdata = envSpan("APPDATA") orelse return null;
-        return joinScheme(buf, appdata);
-    }
-    if (envSpan("XDG_CONFIG_HOME")) |xdg| return joinScheme(buf, xdg);
-    if (envSpan("HOME")) |home| {
-        return std.fmt.bufPrint(buf, "{s}/.config/zt/config.toml", .{home}) catch null;
-    }
-    return null;
-}
-
-fn exeSchemePath(io: std.Io, buf: []u8) ?[]u8 {
-    const n = std.process.executableDirPath(io, buf) catch return null;
-    const name = "config.toml";
-    if (n + 1 + name.len > buf.len) return null;
-    buf[n] = std.fs.path.sep;
-    @memcpy(buf[n + 1 ..][0..name.len], name);
-    return buf[0 .. n + 1 + name.len];
-}
-
-fn xdgDirConfigs(io: std.Io, gpa: std.mem.Allocator, buf: []u8) ?zt.Config {
-    const dirs = envSpan("XDG_CONFIG_DIRS") orelse "/etc/xdg";
-    var it = std.mem.splitScalar(u8, dirs, ':');
-    while (it.next()) |dir| {
-        if (dir.len == 0) continue;
-        const path = joinScheme(buf, dir) orelse continue;
-        if (readConfig(io, gpa, path, true)) |s| return s;
-    }
-    return null;
-}
-
-fn joinScheme(buf: []u8, dir: []const u8) ?[]u8 {
-    const trimmed = std.mem.trimEnd(u8, dir, &[_]u8{ '/', '\\' });
-    return std.fmt.bufPrint(buf, "{s}{c}zt{c}config.toml", .{
-        trimmed,
-        std.fs.path.sep,
-        std.fs.path.sep,
-    }) catch null;
-}
-
-fn envSpan(key: [*:0]const u8) ?[]const u8 {
-    const p = std.c.getenv(key) orelse return null;
-    const s = std.mem.span(p);
-    return if (s.len == 0) null else s;
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 const Parser = struct {
     src: []const u8,
@@ -356,7 +277,7 @@ fn validTable(name: []const u8) bool {
     return true;
 }
 
-fn parseColor(s: []const u8) error{InvalidToml}!Term.Color {
+fn parseColor(s: []const u8) error{InvalidToml}!Grid.Color {
     var t = s;
     if (t.len > 0 and t[0] == '#') t = t[1..];
     if (t.len == 3) {
@@ -398,7 +319,7 @@ fn ansiIndex(key: []const u8) ?u8 {
     return null;
 }
 
-fn apply(scheme: *Scheme, table: []const u8, key: []const u8, color: Term.Color) void {
+fn apply(scheme: *Scheme, table: []const u8, key: []const u8, color: Grid.Color) void {
     const kind: enum { meta, normal, bright, skip } = blk: {
         if (table.len == 0 or std.mem.eql(u8, table, "colors")) break :blk .meta;
         if (std.mem.eql(u8, table, "normal") or std.mem.eql(u8, table, "colors.normal")) break :blk .normal;
@@ -433,9 +354,9 @@ fn apply(scheme: *Scheme, table: []const u8, key: []const u8, color: Term.Color)
 
 test "empty is default" {
     const cfg = try parse("");
-    try std.testing.expectEqual(Term.Color.default_fg, cfg.scheme.fg);
-    try std.testing.expectEqual(Term.Color.default_bg, cfg.scheme.bg);
-    try std.testing.expectEqual(Term.vga_palette[1].r, cfg.scheme.palette[1].r);
+    try std.testing.expectEqual(Grid.Color.default_fg, cfg.scheme.fg);
+    try std.testing.expectEqual(Grid.Color.default_bg, cfg.scheme.bg);
+    try std.testing.expectEqual(Grid.vga_palette[1].r, cfg.scheme.palette[1].r);
     try std.testing.expectEqual(@as(u32, 30), cfg.hz);
     try std.testing.expectEqual(false, cfg.whitelist);
 }

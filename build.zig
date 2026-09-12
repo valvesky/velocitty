@@ -24,11 +24,13 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run zt");
     run_step.dependOn(&run_cmd.step);
 
-    // Release cross-compilation step
+    // Release cross-compilation step. Only targets the host can actually
+    // compile and link are built (Linux + same-arch X11 today).
     const release_step = b.step("release", "Build optimized zt for all target platforms");
 
     for (targets) |query| {
         const resolved = b.resolveTargetQuery(query);
+        if (!canLinkReleaseTarget(b, resolved)) continue;
         const triple = query.zigTriple(b.allocator) catch @panic("OOM");
 
         const exe_rel = buildExeForTarget(b, resolved, .ReleaseFast);
@@ -39,6 +41,15 @@ pub fn build(b: *std.Build) void {
 
         release_step.dependOn(&install.step);
     }
+}
+
+fn canLinkReleaseTarget(b: *std.Build, target: std.Build.ResolvedTarget) bool {
+    const host = b.graph.host.result;
+    const t = target.result;
+    if (t.os.tag != .linux) return false;
+    if (t.cpu.arch != host.cpu.arch) return false;
+    if (t.abi != host.abi) return false;
+    return true;
 }
 
 fn buildExeForTarget(
@@ -60,14 +71,23 @@ fn buildExeForTarget(
         .root_module = exe_mod,
     });
 
-    if (target.result.os.tag == .linux or target.result.os.tag.isBSD()) {
-        exe.root_module.linkSystemLibrary("X11", .{});
+    if (target.result.os.tag == .linux) {
+        addLinuxX11(b, exe.root_module, target);
     } else if (target.result.os.tag == .windows) {
         exe.root_module.linkSystemLibrary("ws2_32", .{});
         exe.root_module.linkSystemLibrary("mswsock", .{});
     }
 
     return exe;
+}
+
+fn addLinuxX11(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+    const host = b.graph.host.result;
+    if (target.result.cpu.arch == host.cpu.arch) {
+        mod.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
+        mod.addIncludePath(.{ .cwd_relative = "/usr/include" });
+    }
+    mod.linkSystemLibrary("X11", .{});
 }
 
 fn addStbTrueType(mod: *std.Build.Module, b: *std.Build) void {
