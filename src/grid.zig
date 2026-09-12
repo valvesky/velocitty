@@ -138,6 +138,31 @@ pub const Grid = struct {
         return self.cells[off .. off + cols];
     }
 
+    pub inline fn viewRowSliceConst(self: *const Grid, row: u16, cols: u16) []const Cell {
+        const line_idx = (self.head + self.cap - self.scroll + row) % self.cap;
+        const off = self.starts[line_idx];
+        return self.cells[off .. off + cols];
+    }
+
+    pub inline fn viewCellAt(self: *const Grid, row: u16, col: u16) Cell {
+        const line_idx = (self.head + self.cap - self.scroll + row) % self.cap;
+        return self.cells[self.starts[line_idx] + col];
+    }
+
+    /// Full-grid scroll that keeps the outgoing top line in the ring (primary history).
+    pub fn historyScrollUp(self: *Grid, n: u16, cols: u16, rows: u16) void {
+        var k: u16 = 0;
+        while (k < n) : (k += 1) {
+            self.head = (self.head + 1) % self.cap;
+            if (self.used < self.cap) self.used += 1;
+            if (rows != 0) self.clearRange(rows - 1, 0, cols);
+            if (self.scroll != 0) {
+                const max_scroll = self.used -| @as(u32, rows);
+                self.scroll = @min(self.scroll + 1, max_scroll);
+            }
+        }
+    }
+
     pub inline fn blankCell(self: *Grid) Cell {
         return Cell{
             .codepoint = ' ',

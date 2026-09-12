@@ -32,6 +32,14 @@ pub const Event = union(enum) {
         mods: KeyMod,
     };
 
+    pub const MouseWheel = struct {
+        up: bool,
+        x: i32,
+        y: i32,
+        mods: KeyMod,
+        steps: u8 = 1,
+    };
+
     pub const KeyCode = enum {
         a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z,
         num_0, num_1, num_2, num_3, num_4, num_5, num_6, num_7, num_8, num_9,
@@ -44,6 +52,9 @@ pub const Event = union(enum) {
 
     key_press: KeyEvent,
     key_release: KeyEvent,
+    mouse_wheel: MouseWheel,
+    paste_request,
+    paste: []const u8,
     text_input: [32]u8, // UTF-8 encoded text stream from OS IME/Keyboard
     resize: Dimensions,
     focus_gained,
@@ -94,8 +105,8 @@ pub const Window = struct {
         return self.impl.eventFd();
     }
 
-    pub fn getClipboard(self: *Window, gpa: std.mem.Allocator) ?[]const u8 {
-        return self.impl.getClipboard(gpa);
+    pub fn requestPaste(self: *Window) void {
+        self.impl.requestPaste();
     }
 
     pub fn setClipboard(self: *Window, text: []const u8) void {

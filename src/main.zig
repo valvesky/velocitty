@@ -324,6 +324,53 @@ fn blitFrame(dst: *Platform.Framebuffer, src: *const Draw.Frame, bg: u32) void {
     }
 }
 
+fn cellAt(px: i32, cell: u32, max_cells: u16) u16 {
+    if (cell == 0 or px < 0) return 1;
+    const c = @as(u32, @intCast(px)) / cell + 1;
+    return @intCast(@min(c, @as(u32, max_cells)));
+}
+
+fn encodeMouseWheel(
+    term: *const VtState,
+    w: Platform.Event.MouseWheel,
+    ox: u32,
+    oy: u32,
+    cell_w: u32,
+    cell_h: u32,
+    buf: *[64]u8,
+) []const u8 {
+    var btn: u16 = if (w.up) 64 else 65;
+    if (w.mods.shift) btn += 4;
+    if (w.mods.alt) btn += 8;
+    if (w.mods.ctrl) btn += 16;
+
+    const rel_x = w.x - @as(i32, @intCast(ox));
+    const rel_y = w.y - @as(i32, @intCast(oy));
+
+    if (term.flags.mouse_pixels) {
+        const x: u32 = @intCast(@max(1, rel_x + 1));
+        const y: u32 = @intCast(@max(1, rel_y + 1));
+        return std.fmt.bufPrint(buf, "\x1b[<{d};{d};{d}M", .{ btn, x, y }) catch "";
+    }
+
+    const col = cellAt(rel_x, cell_w, term.cols);
+    const row = cellAt(rel_y, cell_h, term.rows);
+    if (term.flags.mouse_sgr) {
+        return std.fmt.bufPrint(buf, "\x1b[<{d};{d};{d}M", .{ btn, col, row }) catch "";
+    }
+    if (term.flags.mouse_urxvt) {
+        return std.fmt.bufPrint(buf, "\x1b[{d};{d};{d}M", .{ btn, col, row }) catch "";
+    }
+    if (col > 223 or row > 223) return "";
+    buf[0] = 0x1b;
+    buf[1] = '[';
+    buf[2] = 'M';
+    buf[3] = @intCast(btn + 32);
+    buf[4] = @intCast(col + 32);
+    buf[5] = @intCast(row + 32);
+    return buf[0..6];
+}
+
 fn encodeKey(key: Platform.Event.KeyCode, mods: Platform.Event.KeyMod, app_cursor: bool) []const u8 {
     _ = mods;
     return switch (key) {
@@ -359,6 +406,32 @@ fn encodeKey(key: Platform.Event.KeyCode, mods: Platform.Event.KeyMod, app_curso
 
 fn textLen(text: [32]u8) usize {
     return std.mem.indexOfScalar(u8, &text, 0) orelse text.len;
+}
+
+fn writePaste(pty: *Platform.Pty, term: *const VtState, allocator: std.mem.Allocator, raw: []const u8) void {
+    var buf = allocator.alloc(u8, raw.len) catch {
+        if (term.flags.bracket_paste) pty.write("\x1b[200~");
+        pty.write(raw);
+        if (term.flags.bracket_paste) pty.write("\x1b[201~");
+        return;
+    };
+    defer allocator.free(buf);
+    var n: usize = 0;
+    for (raw) |b| {
+        if (b == 0) continue;
+        if (b == '\n') {
+            if (n == 0 or buf[n - 1] != '\r') {
+                buf[n] = '\r';
+                n += 1;
+            }
+            continue;
+        }
+        buf[n] = b;
+        n += 1;
+    }
+    if (term.flags.bracket_paste) pty.write("\x1b[200~");
+    if (n != 0) pty.write(buf[0..n]);
+    if (term.flags.bracket_paste) pty.write("\x1b[201~");
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {
@@ -470,6 +543,32 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     const bytes = encodeKey(k.key, k.mods, term.flags.app_cursor);
                     if (bytes.len != 0) pty.write(bytes);
                 },
+                .mouse_wheel => |w| {
+                    const ticks: u8 = @max(1, w.steps);
+                    var t: u8 = 0;
+                    if (term.mouse != .off) {
+                        const fb = window.framebuffer();
+                        const ox: u32 = if (fb.width > frame.width) (fb.width - frame.width) / 2 else 0;
+                        const oy: u32 = if (fb.height > frame.height) (fb.height - frame.height) / 2 else 0;
+                        var buf: [64]u8 = undefined;
+                        const bytes = encodeMouseWheel(&term, w, ox, oy, cell_w, cell_h, &buf);
+                        while (t < ticks) : (t += 1) {
+                            if (bytes.len != 0) pty.write(bytes);
+                        }
+                    } else if (term.which == 1) {
+                        const key: Platform.Event.KeyCode = if (w.up) .arrow_up else .arrow_down;
+                        const bytes = encodeKey(key, w.mods, term.flags.app_cursor);
+                        while (t < ticks) : (t += 1) {
+                            if (bytes.len != 0) pty.write(bytes);
+                        }
+                    } else {
+                        const delta: i32 = if (w.up) @as(i32, ticks) else -@as(i32, ticks);
+                        term.viewScroll(delta);
+                        need_draw = true;
+                    }
+                },
+                .paste_request => window.requestPaste(),
+                .paste => |text| writePaste(&pty, &term, allocator, text),
                 .text_input => |text| {
                     const n = textLen(text);
                     if (n != 0) pty.write(text[0..n]);

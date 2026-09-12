@@ -25,9 +25,9 @@
 - SIGUSR1/SIGUSR2 or Omarchy theme/font file change reloads colors and font in `main.zig` (`fc-match` needs process environ so HOME/fonts.conf apply)
 - `loop.zig` — stub (no xev)
 - `select.zig` — cell-stream selection over `vt.VtState`
-- `kitty.zig` — kitty graphics
-- `platform/` — window / PTY (Linux/X11)
-- `main.zig` — window + PTY + fonts; `circbuffer` → `vt` → `draw` → present; event loop polls X `dpy` fd + PTY at the monitor refresh rate
+- `kitty.zig` — kitty graphics (APC G: stream + file/temp, `a=q` OK replies for icat)
+- `platform/` — window / PTY (Linux/X11 + XInput2); PTY child env `TERM=xterm-kitty`, `KITTY_WINDOW_ID`, `COLORTERM=truecolor`; wheel from Button4/5 and XI2 scroll valuators (XWayland trackpads)
+- `main.zig` — window + PTY + fonts; `circbuffer` → `vt` → `draw` → present; event loop polls X `dpy` fd + PTY at the monitor refresh rate; wheel → mouse report (1000/1002/1003), alt-screen arrows, or primary history view; Ctrl+Shift+V / Shift+Insert / middle-click paste (bracketed if DECSET 2004)
 
 # Rendering tests
 - Cell dumps: `VtState.dumpAlloc` / `dumpCellsAlloc`; fixtures in `tests/vt/*.in` (first line `cols rows`).

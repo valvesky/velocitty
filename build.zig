@@ -88,6 +88,7 @@ fn addLinuxX11(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolved
         mod.addIncludePath(.{ .cwd_relative = "/usr/include" });
     }
     mod.linkSystemLibrary("X11", .{});
+    mod.linkSystemLibrary("Xi", .{});
 }
 
 fn addStbTrueType(mod: *std.Build.Module, b: *std.Build) void {

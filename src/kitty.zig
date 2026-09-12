@@ -133,6 +133,9 @@ pub const Store = struct {
     next_id: u32 = 1,
     stream: Stream = .idle,
     bitmap_used: usize = 0,
+    reply: [128]u8 = undefined,
+    reply_len: usize = 0,
+    dirty: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) Store {
         return .{ .allocator = allocator };
@@ -217,18 +220,29 @@ pub const Store = struct {
     }
 
     /// Returns an updated cursor when the command moves it.
+    /// Reply for icat/query is in `reply`/`reply_len` (APC `i=…;OK`).
     pub fn feed(self: *Store, bytes: []const u8, cursor: Cursor, cols: u16, rows: u16, which: u1) ?Cursor {
+        self.reply_len = 0;
         const cmd = parse(bytes) orelse return null;
+        if (cmd.action == 'q') {
+            self.query(cmd);
+            return null;
+        }
         if (cmd.action == 'd') {
             self.delete(cmd, cursor, which);
+            self.dirty = true;
             return null;
         }
         if (cmd.action == 'p') {
             self.place(cmd, cursor, which);
+            self.dirty = true;
             return self.movedCursor(cmd, cursor, cols, rows);
         }
+        // Animation / compose: icat GIFs send a=f / a=a after the first frame.
+        // Do not reply — leftover APC is echoed by the shell as EINVAL:... 
+        if (cmd.action == 'f' or cmd.action == 'a' or cmd.action == 'c') return null;
         if (cmd.action != 't' and cmd.action != 'T' and cmd.action != 0) return null;
-        if (cmd.transmission != 'd') return null;
+        if (cmd.transmission != 'd' and cmd.transmission != 'f' and cmd.transmission != 't') return null;
 
         if (cmd.more) {
             if (!self.assembling) {
@@ -267,8 +281,42 @@ pub const Store = struct {
         return self.finish(done, cursor, cols, rows, which);
     }
 
+    fn query(self: *Store, cmd: Command) void {
+        switch (cmd.transmission) {
+            'd' => self.ok(cmd),
+            'f', 't' => {
+                if (payloadPathExists(self.allocator, cmd.payload)) self.ok(cmd) else self.fail(cmd, "ENOENT");
+            },
+            else => self.fail(cmd, "EINVAL:unsupported transmission"),
+        }
+    }
+
+    fn ok(self: *Store, cmd: Command) void {
+        self.replyStatus(cmd, "OK", false);
+    }
+
+    fn fail(self: *Store, cmd: Command, msg: []const u8) void {
+        self.replyStatus(cmd, msg, true);
+    }
+
+    fn replyStatus(self: *Store, cmd: Command, msg: []const u8, is_error: bool) void {
+        if (cmd.quiet >= 2) return;
+        if (cmd.quiet == 1 and !is_error) return;
+        const out = if (cmd.id != 0)
+            std.fmt.bufPrint(&self.reply, "\x1b_Gi={d};{s}\x1b\\", .{ cmd.id, msg })
+        else
+            std.fmt.bufPrint(&self.reply, "\x1b_G;{s}\x1b\\", .{msg});
+        self.reply_len = (out catch {
+            self.reply_len = 0;
+            return;
+        }).len;
+    }
+
     fn finish(self: *Store, cmd: Command, cursor: Cursor, cols: u16, rows: u16, which: u1) ?Cursor {
-        const bmp = decode(self.allocator, cmd) catch return null;
+        const bmp = decode(self.allocator, cmd) catch {
+            self.fail(cmd, "EINVAL:could not load image");
+            return null;
+        };
         var id = cmd.id;
         if (id == 0) {
             id = self.next_id;
@@ -282,10 +330,13 @@ pub const Store = struct {
             .rgba = bmp.rgba,
         }) catch {
             self.allocator.free(bmp.rgba);
+            self.fail(cmd, "EINVAL:could not load image");
             return null;
         };
         var placed = cmd;
         placed.id = id;
+        self.dirty = true;
+        self.ok(placed);
         if (cmd.action == 'T') {
             self.place(placed, cursor, which);
             return self.movedCursor(placed, cursor, cols, rows);
@@ -413,7 +464,7 @@ pub const Store = struct {
 
 pub fn decode(allocator: std.mem.Allocator, cmd: Command) error{InvalidImage}!Bitmap {
     if (cmd.payload.len == 0) return error.InvalidImage;
-    const raw = decodeB64(allocator, cmd.payload) catch return error.InvalidImage;
+    const raw = loadPayload(allocator, cmd) catch return error.InvalidImage;
     errdefer allocator.free(raw);
     if (raw.len == 0 or raw.len > max_bytes) return error.InvalidImage;
     if (isEncodedImage(raw) or cmd.format == 100) {
@@ -466,6 +517,67 @@ fn decodeB64(allocator: std.mem.Allocator, src: []const u8) error{InvalidImage}!
     errdefer allocator.free(out);
     dec.decode(out, clean.items) catch return error.InvalidImage;
     return out;
+}
+
+fn loadPayload(allocator: std.mem.Allocator, cmd: Command) error{InvalidImage}![]u8 {
+    switch (cmd.transmission) {
+        'd' => return decodeB64(allocator, cmd.payload),
+        'f', 't' => {
+            const path_raw = decodeB64(allocator, cmd.payload) catch return error.InvalidImage;
+            defer allocator.free(path_raw);
+            const path = std.mem.trim(u8, path_raw, " \t\r\n\x00");
+            const data = readPath(allocator, path) catch return error.InvalidImage;
+            if (cmd.transmission == 't') unlinkPath(path);
+            return data;
+        },
+        else => return error.InvalidImage,
+    }
+}
+
+fn payloadPathExists(allocator: std.mem.Allocator, payload: []const u8) bool {
+    const path_raw = decodeB64(allocator, payload) catch return false;
+    defer allocator.free(path_raw);
+    const path = std.mem.trim(u8, path_raw, " \t\r\n\x00");
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const z = toZ(path, &buf) orelse return false;
+    const rc = std.os.linux.open(z.ptr, .{ .ACCMODE = .RDONLY }, 0);
+    if (std.os.linux.errno(rc) != .SUCCESS) return false;
+    _ = std.os.linux.close(@intCast(rc));
+    return true;
+}
+
+fn toZ(path: []const u8, buf: []u8) ?[:0]u8 {
+    if (path.len == 0 or path.len >= buf.len) return null;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    return buf[0..path.len :0];
+}
+
+fn unlinkPath(path: []const u8) void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const z = toZ(path, &buf) orelse return;
+    _ = std.os.linux.unlink(z.ptr);
+}
+
+fn readPath(allocator: std.mem.Allocator, path: []const u8) error{InvalidImage}![]u8 {
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const z = toZ(path, &pbuf) orelse return error.InvalidImage;
+    const rc = std.os.linux.open(z.ptr, .{ .ACCMODE = .RDONLY }, 0);
+    if (std.os.linux.errno(rc) != .SUCCESS) return error.InvalidImage;
+    const fd: i32 = @intCast(rc);
+    defer _ = std.os.linux.close(fd);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const k = std.os.linux.read(fd, &chunk, chunk.len);
+        if (std.os.linux.errno(k) != .SUCCESS) return error.InvalidImage;
+        if (k == 0) break;
+        out.appendSlice(allocator, chunk[0..k]) catch return error.InvalidImage;
+        if (out.items.len > max_bytes) return error.InvalidImage;
+    }
+    if (out.items.len == 0) return error.InvalidImage;
+    return out.toOwnedSlice(allocator) catch return error.InvalidImage;
 }
 
 fn rgbToRgba(allocator: std.mem.Allocator, rgb: []const u8, w: u32, h: u32) error{InvalidImage}![]u8 {
@@ -592,4 +704,52 @@ test "delete a keeps image data" {
     try std.testing.expectEqual(@as(i32, 1), store.placements.items[0].col);
     _ = store.feed("\x1b_Ga=d,d=A,q=2\x1b\\", .{}, 8, 8, 0);
     try std.testing.expectEqual(@as(usize, 0), store.images.items.len);
+}
+
+test "query direct replies ok" {
+    const gpa = std.testing.allocator;
+    var store = Store.init(gpa);
+    defer store.deinit();
+    _ = store.feed("\x1b_Ga=q,t=d,i=31;AAAA\x1b\\", .{}, 8, 8, 0);
+    try std.testing.expectEqualStrings("\x1b_Gi=31;OK\x1b\\", store.reply[0..store.reply_len]);
+    try std.testing.expect(!store.dirty);
+}
+
+test "query unknown medium errors" {
+    const gpa = std.testing.allocator;
+    var store = Store.init(gpa);
+    defer store.deinit();
+    _ = store.feed("\x1b_Ga=q,t=s,i=2;AAAA\x1b\\", .{}, 8, 8, 0);
+    try std.testing.expect(std.mem.indexOf(u8, store.reply[0..store.reply_len], "EINVAL") != null);
+}
+
+test "file transmit places png" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const raw = try decodeB64(gpa, png_1x1_b64);
+    defer gpa.free(raw);
+    const path = "/tmp/velocitty-kitty-test.png";
+    {
+        const rc = std.os.linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+        try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(rc));
+        const fd: i32 = @intCast(rc);
+        defer _ = std.os.linux.close(fd);
+        const w = std.os.linux.write(fd, raw.ptr, raw.len);
+        try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(w));
+    }
+    defer _ = std.os.linux.unlink(path);
+
+    var b64_buf: [128]u8 = undefined;
+    const n = std.base64.standard.Encoder.calcSize(path.len);
+    _ = std.base64.standard.Encoder.encode(b64_buf[0..n], path);
+
+    var seq_buf: [256]u8 = undefined;
+    const seq = std.fmt.bufPrint(&seq_buf, "\x1b_Ga=T,f=100,t=f,i=9,C=1,c=1,r=1;{s}\x1b\\", .{b64_buf[0..n]}) catch unreachable;
+
+    var store = Store.init(gpa);
+    defer store.deinit();
+    _ = store.feed(seq, .{}, 8, 8, 0);
+    try std.testing.expectEqual(@as(usize, 1), store.images.items.len);
+    try std.testing.expectEqual(@as(usize, 1), store.placements.items.len);
+    try std.testing.expectEqualStrings("\x1b_Gi=9;OK\x1b\\", store.reply[0..store.reply_len]);
 }

@@ -240,11 +240,23 @@ pub const VtState = struct {
     }
 
     pub fn rowCells(self: *const VtState, row: u16) []const Cell {
-        return self.gridConst().rowSliceConst(row, self.cols);
+        return self.gridConst().viewRowSliceConst(row, self.cols);
     }
 
     pub fn cell(self: *const VtState, row: u16, col: u16) Cell {
-        return self.gridConst().cellAt(row, col);
+        return self.gridConst().viewCellAt(row, col);
+    }
+
+    pub fn viewScroll(self: *VtState, delta: i32) void {
+        if (self.which != 0) return;
+        const g = self.grid();
+        const max_scroll = g.used -| @as(u32, self.rows);
+        if (delta > 0) {
+            g.scroll = @min(max_scroll, g.scroll + @as(u32, @intCast(delta)));
+        } else if (delta < 0) {
+            g.scroll -|= @as(u32, @intCast(-delta));
+        }
+        self.markDirtyAll();
     }
 
     pub fn cursor(self: *const VtState) Cursor {
@@ -612,7 +624,11 @@ pub const VtState = struct {
 
     pub fn regionScrollUp(self: *VtState, n: u16) void {
         const g = self.grid();
-        g.scrollUp(g.scroll_top, g.scroll_bottom, n, self.cols);
+        if (self.which == 0 and g.scroll_top == 0 and g.scroll_bottom + 1 == self.rows) {
+            g.historyScrollUp(n, self.cols, self.rows);
+        } else {
+            g.scrollUp(g.scroll_top, g.scroll_bottom, n, self.cols);
+        }
         const extra: u32 = if (self.which == 0) g.cap - self.rows else 0;
         var k: u16 = 0;
         while (k < n) : (k += 1) {
@@ -1186,12 +1202,16 @@ pub const VtState = struct {
 
     fn feedKitty(self: *VtState, bytes: []const u8) void {
         const cur = self.grid().cursor;
-        if (self.kitty.feed(bytes, .{ .row = cur.row, .col = cur.col }, self.cols, self.rows, self.which)) |next| {
-            const g = self.grid();
-            g.cursor.row = next.row;
-            g.cursor.col = next.col;
+        const next = self.kitty.feed(bytes, .{ .row = cur.row, .col = cur.col }, self.cols, self.rows, self.which);
+        if (self.kitty.reply_len != 0) {
+            self.respond(self.kitty.reply[0..self.kitty.reply_len]);
         }
-        self.markDirtyAll();
+        if (next) |c| {
+            const g = self.grid();
+            g.cursor.row = c.row;
+            g.cursor.col = c.col;
+        }
+        if (self.kitty.dirty) self.markDirtyAll();
     }
 
     pub fn dumpAlloc(self: *const VtState, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
