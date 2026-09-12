@@ -185,6 +185,17 @@ pub const VtState = struct {
         self.markDirtyAll();
     }
 
+    /// Replace the palette and remap cells that still hold previous theme colors.
+    pub fn applyScheme(self: *VtState, next: Scheme) void {
+        const prev = self.scheme;
+        self.scheme = next;
+        self.orig = next;
+        self.initTable();
+        remapGrid(&self.grids[0], prev, next);
+        remapGrid(&self.grids[1], prev, next);
+        self.markDirtyAll();
+    }
+
     pub fn feedRuns(self: *VtState, runs: []const Run) void {
         for (runs) |run| {
             const slice = self.storage[run.off .. run.off + run.len];
@@ -263,10 +274,17 @@ pub const VtState = struct {
         const storage = self.storage;
         const scrollback = self.grids[0].cap;
         const scheme = self.scheme;
+        const orig = self.orig;
+        const cell_px_w = self.cell_px_w;
+        const cell_px_h = self.cell_px_h;
         const next = try VtState.init(allocator, cols, rows, scrollback, storage);
         self.deinit();
         self.* = next;
         self.scheme = scheme;
+        self.orig = orig;
+        self.cell_px_w = cell_px_w;
+        self.cell_px_h = cell_px_h;
+        self.initTable();
         self.grids[0].reset(cols, rows, scheme);
         self.grids[1].reset(cols, rows, scheme);
     }
@@ -875,7 +893,7 @@ pub const VtState = struct {
     }
 
     pub fn colorIndex(self: *const VtState, i: u32) Color {
-        return self.table[@min(i, 255)];
+        return indexedColor(self.scheme, @intCast(@min(i, 255)));
     }
 
     pub fn setUnderlineColor(self: *VtState, c: Color) void {
@@ -1231,6 +1249,31 @@ fn paramVal(params: []const CsiSeq.Param, idx: usize, default: u32) u32 {
     if (idx >= params.len) return default;
     const v = params[idx].value;
     return if (v != 0) v else default;
+}
+
+fn colorEq(a: Color, b: Color) bool {
+    return a.r == b.r and a.g == b.g and a.b == b.b and a.a == b.a;
+}
+
+fn remapColor(c: Color, prev: Scheme, next: Scheme) Color {
+    if (colorEq(c, prev.fg)) return next.fg;
+    if (colorEq(c, prev.bg)) return next.bg;
+    if (colorEq(c, prev.cursor)) return next.cursor;
+    for (prev.palette, 0..) |p, i| {
+        if (colorEq(c, p)) return next.palette[i];
+    }
+    return c;
+}
+
+fn remapGrid(g: *Grid, prev: Scheme, next: Scheme) void {
+    for (g.cells) |*cell| {
+        cell.fg = remapColor(cell.fg, prev, next);
+        cell.bg = remapColor(cell.bg, prev, next);
+    }
+    g.fg = remapColor(g.fg, prev, next);
+    g.bg = remapColor(g.bg, prev, next);
+    g.saved_fg = remapColor(g.saved_fg, prev, next);
+    g.saved_bg = remapColor(g.saved_bg, prev, next);
 }
 
 fn makeTable(scheme: Scheme) [256]Color {

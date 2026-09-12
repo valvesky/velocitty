@@ -21,12 +21,12 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
 
-    const run_step = b.step("run", "Run zt");
+    const run_step = b.step("run", "Run velocitty");
     run_step.dependOn(&run_cmd.step);
 
     // Release cross-compilation step. Only targets the host can actually
     // compile and link are built (Linux + same-arch X11 today).
-    const release_step = b.step("release", "Build optimized zt for all target platforms");
+    const release_step = b.step("release", "Build optimized velocitty for all target platforms");
 
     for (targets) |query| {
         const resolved = b.resolveTargetQuery(query);
@@ -67,7 +67,7 @@ fn buildExeForTarget(
     addStbTrueType(exe_mod, b);
 
     const exe = b.addExecutable(.{
-        .name = "zt",
+        .name = "velocitty",
         .root_module = exe_mod,
     });
 

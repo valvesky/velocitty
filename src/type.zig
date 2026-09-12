@@ -149,6 +149,15 @@ pub const Context = struct {
         self.* = undefined;
     }
 
+    /// Drop loaded faces. Font bytes may be freed after this returns.
+    pub fn clearFonts(self: *Context) void {
+        self.faces.clearRetainingCapacity();
+        self.fallbacks.clearRetainingCapacity();
+        self.primary = null;
+        self.resetGlyphCaches();
+        self.ascii_size = 0;
+    }
+
     /// `bytes` must outlive this context. The first added face becomes primary.
     pub fn addFont(self: *Context, bytes: []const u8, options: FaceOptions) Error!FontId {
         const font = try TrueType.Font.open(bytes);

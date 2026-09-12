@@ -102,6 +102,14 @@ pub const Window = struct {
     }
 };
 
+/// Display DPI for font point → pixel conversion. 96 when unknown.
+pub fn screenDpi() f32 {
+    return switch (builtin.os.tag) {
+        .linux, .freebsd, .openbsd => Linux.screenDpi(),
+        else => 96,
+    };
+}
+
 
 /// Pseudo-terminal interface implemented by the platform backends.
 pub const Pty = struct {

@@ -60,39 +60,227 @@ fn loadFontPath(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
     return bytes;
 }
 
-fn loadFonts(io: std.Io, gpa: std.mem.Allocator, out: *std.ArrayList([]u8)) !void {
-    var used: []const u8 = "";
-    for (font_paths) |path| {
-        if (loadFontPath(io, gpa, path)) |bytes| {
-            try out.append(gpa, bytes);
-            used = path;
-            break;
-        } else |_| {}
+fn resolveFamilyFile(io: std.Io, gpa: std.mem.Allocator, family: []const u8) ?[]u8 {
+    const result = std.process.run(gpa, io, .{
+        .argv = &.{ "fc-match", "-f", "%{file}", family },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    }) catch return null;
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code != 0) return null,
+        else => return null,
     }
+    const path = std.mem.trim(u8, result.stdout, " \t\r\n");
+    if (path.len == 0 or path[0] != '/') return null;
+    return gpa.dupe(u8, path) catch null;
+}
+
+fn loadFonts(io: std.Io, gpa: std.mem.Allocator, out: *std.ArrayList([]u8), family: ?[]const u8) !void {
+    var used_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var used_len: usize = 0;
+
+    const append_path = struct {
+        fn go(
+            io_: std.Io,
+            gpa_: std.mem.Allocator,
+            out_: *std.ArrayList([]u8),
+            path: []const u8,
+            used_buf_: []u8,
+            used_len_: *usize,
+        ) bool {
+            const bytes = loadFontPath(io_, gpa_, path) catch return false;
+            out_.append(gpa_, bytes) catch {
+                gpa_.free(bytes);
+                return false;
+            };
+            const n = @min(path.len, used_buf_.len);
+            @memcpy(used_buf_[0..n], path[0..n]);
+            used_len_.* = n;
+            return true;
+        }
+    }.go;
+
+    if (family) |fam| {
+        if (resolveFamilyFile(io, gpa, fam)) |path| {
+            defer gpa.free(path);
+            _ = append_path(io, gpa, out, path, &used_buf, &used_len);
+        }
+    }
+    if (out.items.len == 0) {
+        if (resolveFamilyFile(io, gpa, "monospace")) |path| {
+            defer gpa.free(path);
+            _ = append_path(io, gpa, out, path, &used_buf, &used_len);
+        }
+    }
+    if (out.items.len == 0) {
+        for (font_paths) |path| {
+            if (append_path(io, gpa, out, path, &used_buf, &used_len)) break;
+        }
+    }
+    const used = used_buf[0..used_len];
     for (fallback_paths) |path| {
         if (std.mem.eql(u8, path, used)) continue;
-        if (loadFontPath(io, gpa, path)) |bytes| {
-            try out.append(gpa, bytes);
-        } else |_| {}
+        const bytes = loadFontPath(io, gpa, path) catch continue;
+        out.append(gpa, bytes) catch gpa.free(bytes);
     }
     if (out.items.len == 0) return error.InvalidFont;
 }
 
-fn loadConfig(io: std.Io, gpa: std.mem.Allocator) Scheme.Config {
-    return Scheme.loadFile(io, gpa, "config.toml") orelse .{};
+fn bindFonts(gpa: std.mem.Allocator, type_ctx: *TypeCtx, blobs: []const []u8) !void {
+    type_ctx.clearFonts();
+    var fallbacks: std.ArrayList(@import("type.zig").FontId) = .empty;
+    defer fallbacks.deinit(gpa);
+    for (blobs, 0..) |bytes, i| {
+        const id = try type_ctx.addFont(bytes, .{});
+        if (i != 0) try fallbacks.append(gpa, id);
+    }
+    if (fallbacks.items.len != 0) try type_ctx.setFallbacks(fallbacks.items);
 }
 
-fn blitFrame(dst: *Platform.Framebuffer, src: *const Draw.Frame) void {
-    const w = @min(dst.width, src.width);
-    const h = @min(dst.height, src.height);
-    if (w == 0 or h == 0) return;
-    if (w == dst.width and w == src.width and h == dst.height and h == src.height and dst.stride == src.width) {
+fn pointsToPixels(pt: f32, dpi: f32) f32 {
+    return @max(1, pt * dpi / 72.0);
+}
+
+fn jsonFloatAfter(obj: []const u8, key: []const u8) ?f32 {
+    const at = std.mem.indexOf(u8, obj, key) orelse return null;
+    var p = at + key.len;
+    while (p < obj.len and (obj[p] == ' ' or obj[p] == '\t')) p += 1;
+    const start = p;
+    if (p < obj.len and obj[p] == '-') p += 1;
+    while (p < obj.len and (std.ascii.isDigit(obj[p]) or obj[p] == '.')) p += 1;
+    if (p == start) return null;
+    return std.fmt.parseFloat(f32, obj[start..p]) catch null;
+}
+
+fn parseFocusedScale(json: []const u8) ?f32 {
+    var fallback: ?f32 = null;
+    var i: usize = 0;
+    while (i < json.len) {
+        if (json[i] != '{') {
+            i += 1;
+            continue;
+        }
+        const start = i;
+        var depth: u32 = 0;
+        while (i < json.len) {
+            if (json[i] == '{') depth += 1;
+            if (json[i] == '}') {
+                depth -= 1;
+                if (depth == 0) {
+                    i += 1;
+                    break;
+                }
+            }
+            i += 1;
+        }
+        const obj = json[start..i];
+        const scale = jsonFloatAfter(obj, "\"scale\":") orelse continue;
+        fallback = scale;
+        if (std.mem.indexOf(u8, obj, "\"focused\":true") != null) return scale;
+        if (std.mem.indexOf(u8, obj, "\"focused\": true") != null) return scale;
+    }
+    return fallback;
+}
+
+fn hyprlandScale(io: std.Io, gpa: std.mem.Allocator) ?f32 {
+    const result = std.process.run(gpa, io, .{
+        .argv = &.{ "hyprctl", "monitors", "-j" },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(4096),
+    }) catch return null;
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code != 0) return null,
+        else => return null,
+    }
+    const scale = parseFocusedScale(result.stdout) orelse return null;
+    if (scale < 0.25 or scale > 8) return null;
+    return scale;
+}
+
+fn gdkScale() f32 {
+    const p = std.c.getenv("GDK_SCALE") orelse return 1;
+    const s = std.mem.sliceTo(p, 0);
+    const n = std.fmt.parseFloat(f32, s) catch return 1;
+    if (n < 0.25 or n > 8) return 1;
+    return n;
+}
+
+fn uiScale(io: std.Io, gpa: std.mem.Allocator) f32 {
+    if (hyprlandScale(io, gpa)) |s| return s;
+    return gdkScale();
+}
+
+fn fontPixels(config: Scheme.Config, scale: f32, fallback_dpi: f32) f32 {
+    const pt: f32 = if (config.font_size > 0) config.font_size else 8;
+    const dpi: f32 = if (scale != 1) 96.0 * scale else fallback_dpi;
+    return pointsToPixels(pt, dpi);
+}
+
+fn cellMetrics(type_ctx: *TypeCtx, size_px: f32, cell_w: *u32, cell_h: *u32) void {
+    if (type_ctx.metrics(size_px)) |m| {
+        const h = m.ascender - m.descender + m.line_gap;
+        cell_h.* = @max(1, @as(u32, @intFromFloat(@ceil(h))));
+    } else |_| {}
+    if (type_ctx.glyph('M', size_px)) |g| {
+        cell_w.* = @max(1, @as(u32, @intFromFloat(@ceil(g.advance))));
+    } else |_| {}
+}
+
+fn loadConfig(io: std.Io, gpa: std.mem.Allocator) Scheme.Config {
+    return Scheme.load(io, gpa);
+}
+
+var reload_requested = std.atomic.Value(bool).init(false);
+
+fn installReloadSignal() void {
+    switch (builtin.os.tag) {
+        .linux, .freebsd, .openbsd, .netbsd, .dragonfly => {
+            const act: std.posix.Sigaction = .{
+                .handler = .{ .handler = struct {
+                    fn handle(_: std.posix.SIG) callconv(.c) void {
+                        reload_requested.store(true, .release);
+                    }
+                }.handle },
+                .mask = std.posix.sigemptyset(),
+                .flags = std.posix.SA.RESTART,
+            };
+            std.posix.sigaction(.USR1, &act, null);
+            std.posix.sigaction(.USR2, &act, null);
+        },
+        else => {},
+    }
+}
+
+fn padColor(term: *const VtState) u32 {
+    const c = if (term.flags.reverse) term.scheme.fg else term.scheme.bg;
+    return Draw.Frame.pack(c);
+}
+
+fn blitFrame(dst: *Platform.Framebuffer, src: *const Draw.Frame, bg: u32) void {
+    const ox: u32 = if (dst.width > src.width) (dst.width - src.width) / 2 else 0;
+    const oy: u32 = if (dst.height > src.height) (dst.height - src.height) / 2 else 0;
+    const w = @min(dst.width -| ox, src.width);
+    const h = @min(dst.height -| oy, src.height);
+    if (ox == 0 and oy == 0 and w == dst.width and w == src.width and h == dst.height and h == src.height and dst.stride == src.width) {
         @memcpy(dst.pixels, src.pixels);
         return;
     }
+    if (dst.stride == dst.width) {
+        @memset(dst.pixels, bg);
+    } else {
+        var y: u32 = 0;
+        while (y < dst.height) : (y += 1) {
+            @memset(dst.pixels[y * dst.stride ..][0..dst.width], bg);
+        }
+    }
+    if (w == 0 or h == 0) return;
     var y: u32 = 0;
     while (y < h) : (y += 1) {
-        const d = dst.pixels[y * dst.stride ..][0..w];
+        const d = dst.pixels[(y + oy) * dst.stride + ox ..][0..w];
         const s = src.pixels[y * src.width ..][0..w];
         @memcpy(d, s);
     }
@@ -143,14 +331,18 @@ pub fn main() !void {
     var io = std.Io.Threaded.init(allocator, .{});
     defer io.deinit();
 
-    const config = loadConfig(io.io(), allocator);
-    const hz: u32 = if (config.hz == 0) 30 else config.hz;
+    installReloadSignal();
+
+    var config = loadConfig(io.io(), allocator);
+    var hz: u32 = if (config.hz == 0) 30 else config.hz;
 
     var cols: u16 = 80;
     var rows: u16 = 24;
     var cell_w: u32 = 8;
     var cell_h: u32 = 16;
-    const size_px: f32 = 16;
+    const dpi = Platform.screenDpi();
+    const scale = uiScale(io.io(), allocator);
+    var size_px: f32 = fontPixels(config, scale, dpi);
 
     var type_ctx: TypeCtx = try TypeCtx.init(allocator, .{
         .atlas_height = 1024,
@@ -168,21 +360,9 @@ pub fn main() !void {
     }
 
     var type_ptr: ?*TypeCtx = null;
-    if (loadFonts(io.io(), allocator, &font_blobs)) |_| {
-        var fallbacks: std.ArrayList(@import("type.zig").FontId) = .empty;
-        defer fallbacks.deinit(allocator);
-        for (font_blobs.items, 0..) |bytes, i| {
-            const id = try type_ctx.addFont(bytes, .{});
-            if (i != 0) try fallbacks.append(allocator, id);
-        }
-        if (fallbacks.items.len != 0) try type_ctx.setFallbacks(fallbacks.items);
-        if (type_ctx.metrics(size_px)) |m| {
-            const h = m.ascender - m.descender + m.line_gap;
-            cell_h = @max(1, @as(u32, @intFromFloat(@ceil(h))));
-        } else |_| {}
-        if (type_ctx.glyph('M', size_px)) |g| {
-            cell_w = @max(1, @as(u32, @intFromFloat(@ceil(g.advance))));
-        } else |_| {}
+    if (loadFonts(io.io(), allocator, &font_blobs, config.family())) |_| {
+        bindFonts(allocator, &type_ctx, font_blobs.items) catch {};
+        cellMetrics(&type_ctx, size_px, &cell_w, &cell_h);
         type_ptr = &type_ctx;
     } else |_| {
         Debug.log("no fonts found; drawing without glyphs\n", .{});
@@ -193,9 +373,11 @@ pub fn main() !void {
 
     var term: VtState = try VtState.init(allocator, cols, rows, 1000, circbuffer.storage);
     defer term.deinit();
-    term.scheme = config.scheme;
+    term.applyScheme(config.scheme);
     term.grids[0].reset(cols, rows, config.scheme);
     term.grids[1].reset(cols, rows, config.scheme);
+    term.cell_px_w = @intCast(@min(cell_w, std.math.maxInt(u16)));
+    term.cell_px_h = @intCast(@min(cell_h, std.math.maxInt(u16)));
 
     const win_w = @as(u32, cols) * cell_w;
     const win_h = @as(u32, rows) * cell_h;
@@ -214,6 +396,7 @@ pub fn main() !void {
     defer pty.close();
 
     var running = true;
+    var theme_stamp = Scheme.watchStamp(io.io());
 
     while (running) {
         var ev: Platform.Event = undefined;
@@ -251,6 +434,55 @@ pub fn main() !void {
 
         if (!running) break;
 
+        const stamp = Scheme.watchStamp(io.io());
+        if (stamp != theme_stamp) reload_requested.store(true, .release);
+
+        if (reload_requested.swap(false, .acq_rel)) {
+            config = loadConfig(io.io(), allocator);
+            hz = if (config.hz == 0) 30 else config.hz;
+            size_px = fontPixels(config, scale, dpi);
+            term.applyScheme(config.scheme);
+
+            var new_blobs: std.ArrayList([]u8) = .empty;
+            if (loadFonts(io.io(), allocator, &new_blobs, config.family())) |_| {
+                if (bindFonts(allocator, &type_ctx, new_blobs.items)) |_| {
+                    for (font_blobs.items) |b| allocator.free(b);
+                    font_blobs.deinit(allocator);
+                    font_blobs = new_blobs;
+                    const prev_w = cell_w;
+                    const prev_h = cell_h;
+                    cellMetrics(&type_ctx, size_px, &cell_w, &cell_h);
+                    type_ptr = &type_ctx;
+                    if (cell_w != prev_w or cell_h != prev_h) {
+                        const fb = window.framebuffer();
+                        const next_cols: u16 = @intCast(@max(1, fb.width / cell_w));
+                        const next_rows: u16 = @intCast(@max(1, fb.height / cell_h));
+                        cols = next_cols;
+                        rows = next_rows;
+                        term.resize(cols, rows) catch {};
+                        frame.resize(@as(u32, cols) * cell_w, @as(u32, rows) * cell_h) catch {};
+                        pty.setWinsize(.{
+                            .cols = cols,
+                            .rows = rows,
+                            .px_w = @intCast(fb.width),
+                            .px_h = @intCast(fb.height),
+                        });
+                    }
+                    term.cell_px_w = @intCast(@min(cell_w, std.math.maxInt(u16)));
+                    term.cell_px_h = @intCast(@min(cell_h, std.math.maxInt(u16)));
+                } else |_| {
+                    bindFonts(allocator, &type_ctx, font_blobs.items) catch {};
+                    for (new_blobs.items) |b| allocator.free(b);
+                    new_blobs.deinit(allocator);
+                }
+            } else |_| {
+                for (new_blobs.items) |b| allocator.free(b);
+                new_blobs.deinit(allocator);
+            }
+            frame.invalidate();
+            theme_stamp = Scheme.watchStamp(io.io());
+        }
+
         var hangup = false;
         circbuffer.readPTY(pty.impl.master, hz) catch {
             hangup = true;
@@ -267,7 +499,7 @@ pub fn main() !void {
         frame.render(&term, cell_w, cell_h, type_ptr, size_px);
         term.clearDirty();
         const fb = window.framebuffer();
-        blitFrame(fb, &frame);
+        blitFrame(fb, &frame, padColor(&term));
         window.present();
 
         if (hangup) running = false;

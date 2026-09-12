@@ -13,6 +13,19 @@ const c = @cImport({
     @cInclude("X11/keysym.h");
 });
 
+/// CSS/X11 pixels-per-inch for converting terminal font points to raster pixels.
+pub fn screenDpi() f32 {
+    const display = c.XOpenDisplay(null) orelse return 96;
+    defer _ = c.XCloseDisplay(display);
+    const screen = c.XDefaultScreen(display);
+    const px = c.XDisplayWidth(display, screen);
+    const mm = c.XDisplayWidthMM(display, screen);
+    if (px <= 0 or mm <= 0) return 96;
+    const dpi = @as(f32, @floatFromInt(px)) * 25.4 / @as(f32, @floatFromInt(mm));
+    if (!std.math.isFinite(dpi) or dpi < 24 or dpi > 576) return 96;
+    return dpi;
+}
+
 pub const Window = struct {
     width: u32,
     height: u32,
@@ -50,9 +63,9 @@ pub const Window = struct {
             10,
             width,
             height,
-            1,
+            0,
             c.XBlackPixel(display, screen),
-            c.XWhitePixel(display, screen),
+            c.XBlackPixel(display, screen),
         );
         errdefer _ = c.XDestroyWindow(display, win);
 

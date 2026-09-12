@@ -20,7 +20,8 @@
 - `dcs.zig` — DCS DECRQSS (DECSTBM/SGR/DECSCUSR) + iTerm sync
 - `draw.zig` — CPU framebuffer; line-dirty fill + SIMD glyph blit
 - `type.zig` — TrueType rasterizer, atlas, glyph LRU; `type/eastasian.zig` cell width
-- `scheme.zig` — TOML config (colors, hz, whitelist)
+- `scheme.zig` — TOML config (colors, font, hz, whitelist); loads Omarchy current theme
+- SIGUSR1/SIGUSR2 or Omarchy theme/font file change reloads colors and font in `main.zig`
 - `loop.zig` — stub (no xev)
 - `select.zig` — cell-stream selection over `vt.VtState`
 - `kitty.zig` — kitty graphics

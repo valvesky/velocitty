@@ -1,4 +1,4 @@
-# Velocitty
+# ⚡⚡ Velocitty ⚡⚡
 
 Velocitty is a lightning-fast cross-platform terminal multiplexor.
 
