@@ -56,6 +56,94 @@ pub fn parseScheme(src: []const u8) error{InvalidToml}!Scheme {
     return (try parse(src)).scheme;
 }
 
+
+fn loadConfig(io: std.Io, gpa: std.mem.Allocator) zt.Config {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (userSchemePath(&buf)) |path| {
+        if (readConfig(io, gpa, path, true)) |s| return s;
+    }
+    if (exeSchemePath(io, &buf)) |path| {
+        if (readConfig(io, gpa, path, true)) |s| return s;
+    }
+    if (builtin.os.tag != .windows) {
+        if (xdgDirConfigs(io, gpa, &buf)) |s| return s;
+        if (readConfig(io, gpa, "/etc/zt/config.toml", true)) |s| return s;
+    }
+    if (readConfig(io, gpa, "config.toml", false)) |s| return s;
+    return .{};
+}
+
+fn readConfig(io: std.Io, gpa: std.mem.Allocator, path: []const u8, absolute: bool) ?zt.Config {
+    const bytes = readFile(io, gpa, path, absolute) catch return null;
+    defer gpa.free(bytes);
+    return zt.parseConfig(bytes) catch {
+        std.debug.print("zt: invalid config {s}\n", .{path});
+        return .{};
+    };
+}
+
+fn userSchemePath(buf: []u8) ?[]u8 {
+    if (builtin.os.tag == .windows) {
+        const appdata = envSpan("APPDATA") orelse return null;
+        return joinScheme(buf, appdata);
+    }
+    if (envSpan("XDG_CONFIG_HOME")) |xdg| return joinScheme(buf, xdg);
+    if (envSpan("HOME")) |home| {
+        return std.fmt.bufPrint(buf, "{s}/.config/zt/config.toml", .{home}) catch null;
+    }
+    return null;
+}
+
+fn exeSchemePath(io: std.Io, buf: []u8) ?[]u8 {
+    const n = std.process.executableDirPath(io, buf) catch return null;
+    const name = "config.toml";
+    if (n + 1 + name.len > buf.len) return null;
+    buf[n] = std.fs.path.sep;
+    @memcpy(buf[n + 1 ..][0..name.len], name);
+    return buf[0 .. n + 1 + name.len];
+}
+
+fn xdgDirConfigs(io: std.Io, gpa: std.mem.Allocator, buf: []u8) ?zt.Config {
+    const dirs = envSpan("XDG_CONFIG_DIRS") orelse "/etc/xdg";
+    var it = std.mem.splitScalar(u8, dirs, ':');
+    while (it.next()) |dir| {
+        if (dir.len == 0) continue;
+        const path = joinScheme(buf, dir) orelse continue;
+        if (readConfig(io, gpa, path, true)) |s| return s;
+    }
+    return null;
+}
+
+fn joinScheme(buf: []u8, dir: []const u8) ?[]u8 {
+    const trimmed = std.mem.trimEnd(u8, dir, &[_]u8{ '/', '\\' });
+    return std.fmt.bufPrint(buf, "{s}{c}zt{c}config.toml", .{
+        trimmed,
+        std.fs.path.sep,
+        std.fs.path.sep,
+    }) catch null;
+}
+
+fn envSpan(key: [*:0]const u8) ?[]const u8 {
+    const p = std.c.getenv(key) orelse return null;
+    const s = std.mem.span(p);
+    return if (s.len == 0) null else s;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 const Parser = struct {
     src: []const u8,
     i: usize = 0,

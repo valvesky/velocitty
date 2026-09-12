@@ -142,8 +142,8 @@ pub const Window = struct {
                     }
                 },
                 c.ConfigureNotify => {
-                    const new_w: u32 = @intCast(xev.xconfigure.width);
-                    const new_h: u32 = @intCast(xev.xconfigure.height);
+                    const new_w: u16 = @intCast(xev.xconfigure.width);
+                    const new_h: u16 = @intCast(xev.xconfigure.height);
                     if (new_w != self.width or new_h != self.height) {
                         self.resizeFramebuffer(new_w, new_h) catch {};
                         ev.* = .{ .resize = .{
@@ -391,7 +391,7 @@ pub const Pty = struct {
     master: posix.fd_t,
     child: posix.pid_t,
 
-    pub fn open(self: *Pty, dims: Platform.Pty.Dimensions) !void {
+    pub fn open(self: *Pty, dims: Platform.Dimensions) !void {
         const master_rc = linux.open("/dev/ptmx", .{
             .ACCMODE = .RDWR,
             .NOCTTY = true,
@@ -469,13 +469,13 @@ pub const Pty = struct {
         return buf[0..rc];
     }
 
-    pub fn setWinsize(self: *Pty, dims: Platform.Pty.Dimensions) void {
+    pub fn setWinsize(self: *Pty, dims: Platform.Dimensions) void {
         var ws = toWinsize(dims);
         _ = linux.ioctl(self.master, linux.T.IOCSWINSZ, @intFromPtr(&ws));
     }
 };
 
-inline fn toWinsize(dims: Platform.Pty.Dimensions) posix.winsize {
+inline fn toWinsize(dims: Platform.Dimensions) posix.winsize {
     return .{
         .row = dims.rows,
         .col = dims.cols,

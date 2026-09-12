@@ -94,12 +94,12 @@ pub const Grid = struct {
         allocator.free(self.starts);
     }
 
-    pub inline fn getCell(self: *Grid, row: u16, col: u16, cols: u16) *Cell {
+    pub inline fn getCell(self: *Grid, row: u16, col: u16) *Cell {
         const line_idx = (self.head + row) % self.cap;
         return &self.cells[self.starts[line_idx] + col];
     }
 
-    pub inline fn blankCell(self: const *Grid) Cell {
+    pub inline fn blankCell(self: *Grid) Cell {
         return Cell{
             .codepoint = ' ',
             .attrs = .{},
@@ -109,8 +109,8 @@ pub const Grid = struct {
     }
 
     /// Primary cell mutation primitive
-    pub fn writeCell(self: *Grid, row: u16, col: u16, cols: u16, cp: u21) void {
-        const cell = self.getCell(row, col, cols);
+    pub fn writeCell(self: *Grid, row: u16, col: u16, cp: u21) void {
+        const cell = self.getCell(row, col);
         cell.* = .{
             .codepoint = cp,
             .attrs = self.attrs,
@@ -120,7 +120,7 @@ pub const Grid = struct {
     }
 
     /// Clear cell range [start_col, end_col) on a given row
-    pub fn clearRange(self: *Grid, row: u16, start_col: u16, end_col: u16, cols: u16) void {
+    pub fn clearRange(self: *Grid, row: u16, start_col: u16, end_col: u16) void {
         const line_idx = (self.head + row) % self.cap;
         const row_offset = self.starts[line_idx];
         const blank = self.blankCell();
@@ -170,14 +170,15 @@ pub const Grid = struct {
         while (i <= bottom - count) : (i += 1) {
             const src_idx = (self.head + i + count) % self.cap;
             const dst_idx = (self.head + i) % self.cap;
-            @copyForwards(
+            std.mem.copyForwards(
+                Cell,
                 self.cells[self.starts[dst_idx] .. self.starts[dst_idx] + cols],
                 self.cells[self.starts[src_idx] .. self.starts[src_idx] + cols],
             );
         }
         var clear_row: u16 = bottom - count + 1;
         while (clear_row <= bottom) : (clear_row += 1) {
-            self.clearRange(clear_row, 0, cols, cols);
+            self.clearRange(clear_row, 0, cols);
         }
     }
 
@@ -187,7 +188,8 @@ pub const Grid = struct {
         while (i >= top + count) : (i -= 1) {
             const src_idx = (self.head + i - count) % self.cap;
             const dst_idx = (self.head + i) % self.cap;
-            @copyForwards(
+            std.mem.copyForwards(
+                Cell,
                 self.cells[self.starts[dst_idx] .. self.starts[dst_idx] + cols],
                 self.cells[self.starts[src_idx] .. self.starts[src_idx] + cols],
             );
@@ -195,7 +197,7 @@ pub const Grid = struct {
         }
         var clear_row: u16 = top;
         while (clear_row < top + count) : (clear_row += 1) {
-            self.clearRange(clear_row, 0, cols, cols);
+            self.clearRange(clear_row, 0, cols);
         }
     }
 

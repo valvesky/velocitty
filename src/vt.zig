@@ -61,8 +61,9 @@ pub const VtState = struct {
     line_dirty: []u64,
     scheme: Term.Scheme = .{},
     kitty: Kitty.Store,
+    storage: []u8, // backing buffer to read runs of text from
 
-    pub fn init(allocator: std.mem.Allocator, cols: u16, rows: u16, scrollback: u32) !VtState {
+    pub fn init(allocator: std.mem.Allocator, cols: u16, rows: u16, scrollback: u32, storage: []u8) !VtState {
         const primary = try Term.Grid.init(allocator, cols, rows, scrollback);
         const alt = try Term.Grid.init(allocator, cols, rows, rows);
         const dirty_len = (rows + 63) / 64;
@@ -76,6 +77,7 @@ pub const VtState = struct {
             .grids = .{ primary, alt },
             .line_dirty = line_dirty,
             .kitty = Kitty.Store.init(allocator),
+            .storage = storage,
         };
     }
 
@@ -88,13 +90,32 @@ pub const VtState = struct {
 
     pub fn feedRuns(self: *VtState, runs: []const Run) void {
         for (runs) |run| {
-            self.processRun(run);
+            const slice = self.storage[run.off .. run.off + run.len];
             switch (run.kind) {
-                .text => |cp| self.printCodepoint(cp),
-                .csi => |csi| self.dispatchCsi(csi),
-                .esc => |esc| self.dispatchEsc(esc),
-                .osc => |osc| self.dispatchOsc(osc),
-                .c0  => |c0|  self.dispatchC0(c0),
+                .plain => {
+                    for (slice) |b| {
+                        self.printCodepoint(b);
+                    }
+                },
+                .utf8 => {
+                    var view = std.unicode.Utf8View.init(slice) catch continue;
+                    var iter = view.iterator();
+                    while (iter.nextCodepoint()) |cp| {
+                        self.printCodepoint(cp);
+                    }
+                },
+                .c0 => {
+                    if (slice.len > 0) self.dispatchC0(slice[0]);
+                },
+                .c1 => {
+                    if (slice.len > 0) self.dispatchC1(slice[0]);
+                },
+                .esc => self.dispatchEsc(slice),
+                .csi => |csi| csi.parse(slice);
+                .osc => self.dispatchOsc(slice),
+                .str => {},
+                .esc_kitty => unreachable,
+                .esc_sixel => {}, // Reserved for Sixel graphics decoder
             }
         }
     }
@@ -112,7 +133,7 @@ pub const VtState = struct {
     pub fn cup(self: *VtState, row1: u16, col1: u16) void {
         const g = self.grid();
         var row: u16 = row1 -| 1;
-        var col: u16 = col1 -| 1;
+        const col: u16 = col1 -| 1;
 
         if (self.flags.origin_mode) {
             row = @min(g.scroll_bottom, g.scroll_top +| row);
@@ -169,12 +190,53 @@ pub const VtState = struct {
             g.insertCells(g.cursor.row, g.cursor.col, 1, self.cols);
         }
 
-        g.writeCell(g.cursor.row, g.cursor.col, self.cols, cp);
+        g.writeCell(g.cursor.row, g.cursor.col, cp);
         self.markDirty(g.cursor.row);
         g.cursor.col += 1;
     }
 
-    // --- Erase Operations ---
+    pub fn dispatchC0(self: *VtState, byte: u8) void {
+        const g = self.grid();
+        switch (byte) {
+            0x07 => {},
+            0x08 => self.cub(1),
+            0x09 => {
+                const next_tab = (g.cursor.col & ~@as(u16, 7)) + 8;
+                g.cursor.col = @min(self.cols - 1, next_tab);
+            },
+            0x0A, 0x0B, 0x0C => { // LF, VT, FF (Line Feed)
+                if (g.cursor.row >= g.scroll_bottom) {
+                    g.scrollUp(g.scroll_top, g.scroll_bottom, 1, self.cols);
+                } else {
+                    g.cursor.row += 1;
+                }
+            },
+            0x0D => g.cursor.col = 0, // CR (Carriage Return)
+            0x0E => self.gl = 1, // SO (Shift Out -> G1 charset)
+            0x0F => self.gl = 0, // SI (Shift In -> G0 charset)
+            else => {},
+        }
+    }
+
+    pub fn dispatchC1(self: *VtState, byte: u8) void {
+        switch (byte) {
+            0x84 => self.dispatchC0(0x0A), // IND (Index)
+            0x85 => { // NEL (Next Line)
+                self.grid().cursor.col = 0;
+                self.dispatchC0(0x0A);
+            },
+            0x88 => {}, // HTS (Horizontal Tab Set)
+            0x8D => { // RI (Reverse Index / Scroll Down)
+                const g = self.grid();
+                if (g.cursor.row <= g.scroll_top) {
+                    g.scrollDown(g.scroll_top, g.scroll_bottom, 1, self.cols);
+                } else {
+                    g.cursor.row -= 1;
+                }
+            },
+            else => {},
+        }
+    }
 
     pub fn ed(self: *VtState, mode: u8) void {
         const g = self.grid();

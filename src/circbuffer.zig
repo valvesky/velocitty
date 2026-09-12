@@ -14,18 +14,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const Term = @import("term.zig").Term;
-
 const assert = std.debug.assert;
 const posix = std.posix;
 
-const vec_len = std.simd.suggestVectorLength(u8) orelse 16;
-const Vec = @Vector(vec_len, u8);
-const Mask = std.meta.Int(.unsigned, vec_len);
-
-comptime {
-    assert(vec_len <= 64);
-}
+const SIMD = @import("simd.zig");
 
 pub const Line = packed struct {
     off: u32,
@@ -62,19 +54,19 @@ pub const CircBuffer = struct {
     head: u64 = 0,
     tail: u64 = 0,
     epoch: u64 = 0,
-    lines: std.ArrayListUnmanaged(Line) = .{},
-    runs: std.ArrayListUnmanaged(Run) = .{},
+    lines: std.ArrayListUnmanaged(Line) = .empty,
+    runs: std.ArrayListUnmanaged(Run) = .empty,
 
     /// Create circular buffer
     pub fn create(allocator: std.mem.Allocator, capacity: usize) std.mem.Allocator.Error!CircBuffer {
         assert(capacity > 0);
         assert(std.math.isPowerOfTwo(capacity));
 
-        var lines: std.ArrayListUnmanaged(Line) = . me;
+        var lines: std.ArrayListUnmanaged(Line) = .empty;
         try lines.ensureTotalCapacity(allocator, 256);
         errdefer lines.deinit(allocator);
 
-        var runs: std.ArrayListUnmanaged(Run) = . me;
+        var runs: std.ArrayListUnmanaged(Run) = .empty;
         try runs.ensureTotalCapacity(allocator, 1024);
         errdefer runs.deinit(allocator);
 
@@ -110,15 +102,16 @@ pub const CircBuffer = struct {
         } else {
             self.allocator.free(self.storage);
         }
-        self.allocator.free(self.lines);
+        self.lines.deinit(self.allocator);
+        self.runs.deinit(self.allocator);
         self.* = undefined;
     }
 
     /// Consume everything and return runs.
-    pub fn consumeAndGetRuns(self: *CircBuffer, term: *Term) []Run {
-        self.consumeAndPreparse(term);
-        const lines = self.getLastNLines(term.rows);
-        self.splitLinesIntoRuns(lines);
+    pub fn consumeAndGetRuns(self: *CircBuffer, nlines: usize) []Run {
+        self.consumeAndPreparse();
+        const lines = self.getLastNLines(nlines);
+        self.splitIntoRuns(lines);
         return self.runs.items;
     }
 
@@ -139,7 +132,7 @@ pub const CircBuffer = struct {
     ///
     /// Needs a terminal to apply a few "whitelisted" 
     /// sequences that could effect the final screen.
-    fn consumeAndPreparse(self: CircBuffer, term: Term) void {
+    fn consumeAndPreparse(self: *CircBuffer) void {
 
         assert(self.tail <= self.head);
 
@@ -148,18 +141,18 @@ pub const CircBuffer = struct {
         // ahead of tail.
         if ((self.head - self.tail) > self.capacity) 
             self.tail = self.head - self.capacity;
-        splitIntoLines(self, term);
+        splitIntoLines(self);
         self.tail = self.head;
     }
 
     /// Get last N lines of input. May be less than expected.
     fn getLastNLines(self: CircBuffer, n: usize) []Line {
-        const min = @min(n, self.lines.len);
-        return self.lines[0..min];
+        const min = @min(n, self.lines.items.len);
+        return self.lines.items[0..min];
     }
 
     /// Vectorized loop that splits circular buffer into lines
-    fn splitIntoLines(self: CircBuffer, term: Term) void {
+    fn splitIntoLines(self: *CircBuffer) void {
 
         // NOTE(vasco): again, because this is a mapped
         // circular buffed, we can also read read without
@@ -170,108 +163,59 @@ pub const CircBuffer = struct {
 
         self.lines.clearRetainingCapacity();
 
-        const to_read = self.head - self.tail;
+        const to_read: u32 = @intCast(self.head - self.tail);
         const start   = self.tail & (self.capacity - 1); // same as %
         const end     = start + to_read;
         const slice = self.storage[start..end];
 
-        var i: usize = 0;
-        var last_line: usize = 0; 
+        var i: u32 = 0;
+        var line_start: u32 = 0; 
         var esc: bool = false;
 
-        // NOTE(vasco): Okay, the only thing we need to look
-        // for is ESC and LF. We need to do this vectorized
-        // or else it defeats the point.
-
-        const vec_lf: Vec = @splat(0x0A); // '\n'
-        const vec_esc: Vec = @splat(0x1B); // ESC
-
-        while (i + vec_len <= to_read) {
-            const chunk: Vec = slice[i..][0..vec_len].*;
-            const match_lf = (chunk == vec_lf);
-            const match_esc = (chunk == vec_esc);
-            const matches: @Vector(vec_len, bool) = match_lf | match_esc;
-            const bitmask: u32 = @bitCast(matches);
-
-            if (bitmask != 0) {
-                // Found ESC or LF in this vector block!
-                // @ctz gives the index of the first matching byte lane
-                const match_offset = @ctz(bitmask);
-                const match_index = i + match_offset;
-                const byte = slice[match_index];
-
-                if (byte == 0x0A) {
-                    try self.lines.append(self.allocator, .{ 
-                        .off = match_index,
-                        .len = last_line - match_index,
-                        .esc = esc,
-                    });
-                    esc = false;
-                    last_line = i;
-                } else if (byte == 0x1B) {
-                    esc = true;
-
-                    // TODO(vasco):
-                    // treat whitelisted offscreen escape sequences
-                    // this would make output more correct
-                    // but we can skip it for now
-                    //
-                    // I will have to test to see how many programs
-                    // this would actually effect.
-                    //
-                    // What's more concerning is that you can
-                    // be inside an escape sequence with a binary
-                    // payload containing a newline. That would
-                    // cause potential bugs.
-
-                    term.rows;
-
-                    // NOTE(vasco): Now it gets tricky.
-                    // The ideal scenarios is that we only 
-                    // treat sequences that will update the terminal 
-                    // cursor.
-                    //
-                    // Once we know we just have a payload that may
-                    // or may not be offscreen, we start skipping 
-                    // along with more vectorized parsing.
-                    // i++;
-                    // var esc_slice;
-                    // switch (slice[i]) {
-                    //     '[' => { csi.parse()};
-                    //     ']' => { i = skipSeq(slice) }; // non whitelisted get skipped
-                    // }
-                }
-
-                // Advance past the processed byte
-                i = match_index + 1;
-                continue;
-            }
-
-            i += vec_len;
-        }
-
-        // Scalar loop
         while (i < to_read) {
 
-            const byte = slice[i];
+            // NOTE(vasco): The only thing we need to look
+            // for is ESC and LF. "Offscreen" escape sequences
+            // may change the end result on the screen. They
+            // may also contain newline bytes that aren't meant
+            // to split the screen.
 
-            if (byte == 0x0A) {
-                try self.lines.append(self.allocator, .{ 
-                    .off = i,
-                    .len = last_line - i,
-                    .esc = esc,
-                });
-                esc = false;
-                last_line = i;
-            } else if (byte == 0x1B) {
-                esc = true;
+            i += SIMD.skipEqualEither(slice[i..], 0x0A, 0x1B);
+
+            switch (slice[i]) {
+                0x0A => {
+                    self.pushLine(.{
+                        .off = line_start,
+                        .len = i - line_start,
+                        .esc = esc,
+                    });
+                    esc = true;
+                    i+= 1;
+                    line_start = i;
+                },
+                0x1B => {
+                    esc = true;
+                    i+= 1;
+                    // TODO: some actual parsing
+                    // for the sake of correctness
+                },
+                else => unreachable,
             }
-
-            i += 1;
         }
+
+        // push trailing line
+        if (line_start < to_read) {
+            self.pushLine(.{
+                .off = line_start,
+                .len = to_read - line_start,
+                .esc = esc,
+            });
+        }
+
     }
 
-    fn splitLinesIntoRuns(self: *CircBuffer, lines: []Line) void {
+
+    fn splitIntoRuns(self: *CircBuffer, lines: []Line) void {
 
         // NOTE(vasco): Splitting into Runs should be 
         // pretty simple: scan for <= SPC and >= DEL
@@ -285,124 +229,112 @@ pub const CircBuffer = struct {
 
         self.runs.clearRetainingCapacity();
 
-        const vec_spc: Vec = @splat(0x20); // Controls/SPC <= 0x20
-        const vec_del: Vec = @splat(0x7F); // DEL / High-bit >= 0x7F
+        const start = lines[0].off;
+        const last_line = lines[lines.len - 1];
+        const end = last_line.off + last_line.len;
+        const to_read: u32 = end - start;
+        const slice = self.storage[start..end];
 
-        for (lines) |line| {
-            const slice = self.storage[line.off .. line.off + line.len];
-            var i: usize = 0;
-            var run_start: usize = 0;
+        var i: u32 = 0;
+        var run_start: u32 = 0;
 
-            while (i < slice.len) {
-                // --- Step 1: SIMD Fast-Path (Scan for non-plain ASCII) ---
-                if (!line.esc) {
-                    // If line has no escape sequences, vector scan for any boundary (<= 0x20 or >= 0x7F)
-                    while (i + vec_len <= slice.len) {
-                        const chunk: Vec = slice[i..][0..vec_len].*;
-                        const matches = (chunk <= vec_spc) | (chunk >= vec_del);
-                        const mask: u16 = @bitCast(matches);
+        while (i < to_read) {
+            // NOTE(vasco): fast forward ascii
+            i += SIMD.skipOutRange(slice[i..], 0x21, 0x7E);
 
-                        if (mask != 0) {
-                            i += @ctz(mask); // Jump directly to the first non-plain byte
-                            break;
-                        }
-                        i += vec_len;
-                    }
-                }
+            if (i >= to_read) break;
 
-                if (i >= slice.len) break;
+            const c = slice[i];
 
-                const c = slice[i];
-
-                // --- Step 2: Sequence Classification & Multi-byte Advancement ---
-                if (c > 0x20 and c < 0x7F) {
-                    // Plain Printable ASCII byte
-                    i += 1;
-                    continue;
-                }
-
-                // Flush preceding plain text run if one accumulated
-                if (i > run_start) {
-                    try self.runs.append(self.allocator, .{
-                        .off = line.off + run_start,
-                        .len = i - run_start,
-                        .kind = .plain,
-                    });
-                }
-
-                // Categorize non-plain byte and measure sequence length
-                var kind: Run.Kind = .c0;
-                var seq_len: usize = 1;
-
-                if (c == 0x1B) { // ESC
-                    if (i + 1 < slice.len) {
-                        const next = slice[i + 1];
-                        switch (next) {
-                            '[' => { // CSI
-                                kind = .csi;
-                                seq_len = skipCsi(slice[i..]);
-                            },
-                            ']' => { // OSC
-                                kind = .osc;
-                                seq_len = skipOsc(slice[i..]);
-                            },
-                            'P' => { // DCS (Sixel / Kitty graphics streams)
-                                seq_len = skipDcs(slice[i..]);
-                                if (std.mem.startsWith(u8, slice[i..], "\x1bPq")) {
-                                    kind = .esc_sixel;
-                                } else if (std.mem.startsWith(u8, slice[i..], "\x1bP_G")) {
-                                    kind = .esc_kitty;
-                                } else {
-                                    kind = .str;
-                                }
-                            },
-                            '_', '^', 'X' => { // APC / PM / SOS String sequences
-                                kind = .str;
-                                seq_len = skipStTerminated(slice[i..]);
-                            },
-                            else => {
-                                kind = .esc;
-                                seq_len = 2; // Simple ESC sequence (e.g., ESC M, ESC 7)
-                            },
-                        }
-                    } else {
-                        kind = .esc;
-                        seq_len = 1;
-                    }
-                } else if (c >= 0x80) { // High-bit (UTF-8 lead or C1 control)
-                    const utf8_len = std.unicode.utf8ByteSequenceLength(c) catch 1;
-                    if (utf8_len > 1 and i + utf8_len <= slice.len) {
-                        kind = .utf8;
-                        seq_len = utf8_len;
-                    } else {
-                        kind = .c1;
-                        seq_len = 1;
-                    }
-                } else { // C0 control character (BS, TAB, CR, LF, etc.)
-                    kind = .c0;
-                    seq_len = 1;
-                }
-
-                // Emit control/sequence run
-                try self.runs.append(self.allocator, .{
-                    .off = line.off + i,
-                    .len = seq_len,
-                    .kind = kind,
-                });
-
-                i += seq_len;
-                run_start = i;
-            }
-
-            // Flush remaining trailing plain text
-            if (slice.len > run_start) {
-                try self.runs.append(self.allocator, .{
-                    .off = line.off + run_start,
-                    .len = slice.len - run_start,
+            if (i > run_start) {
+                self.pushRun(.{
+                    .off = start + run_start,
+                    .len = i - run_start,
                     .kind = .plain,
                 });
             }
+
+            var kind: Run.Kind = .c0;
+            var seq_len: u32 = 1;
+
+            if (c == 0x1B) { // ESC sequence family
+                if (i + 1 < to_read) {
+                    const next = slice[i + 1];
+                    switch (next) {
+                        '[' => {
+                            kind = .csi;
+                            seq_len = @intCast(skipCsi(slice[i..]));
+                        },
+                        ']' => {
+                            kind = .osc;
+                            seq_len = @intCast(skipOsc(slice[i..]));
+                        },
+                        'P' => { // DCS (Sixel / Kitty graphics)
+                            seq_len = @intCast(skipDcs(slice[i..]));
+                            if (std.mem.startsWith(u8, slice[i..], "\x1bPq")) {
+                                kind = .esc_sixel;
+                            } else if (std.mem.startsWith(u8, slice[i..], "\x1bP_G")) {
+                                kind = .esc_kitty;
+                            } else {
+                                kind = .str;
+                            }
+                        },
+                        '_', '^', 'X' => { // APC / PM / SOS
+                            kind = .str;
+                            seq_len = @intCast(skipStTerminated(slice[i..]));
+                        },
+                        else => {
+                            kind = .esc;
+                            seq_len = 2; // Simple ESC sequence (e.g., ESC M, ESC 7)
+                        },
+                    }
+                } else {
+                    kind = .esc;
+                    seq_len = 1;
+                }
+            } else if (c >= 0x80) { // High-bit (UTF-8 or C1 control)
+                const utf8_len = std.unicode.utf8ByteSequenceLength(c) catch 1;
+                if (utf8_len > 1 and i + utf8_len <= to_read) {
+                    kind = .utf8;
+                    seq_len = @intCast(utf8_len);
+                } else {
+                    kind = .c1;
+                    seq_len = 1;
+                }
+            } else { // C0 control byte (0x0A '\n', 0x0D '\r', 0x09 '\t', 0x20 ' ', etc.)
+                kind = .c0;
+                seq_len = 1;
+            }
+
+            self.pushRun(.{
+                .off = start + i,
+                .len = seq_len,
+                .kind = kind,
+            });
+
+            i += seq_len;
+            run_start = i;
         }
+
+        if (to_read > run_start) {
+            self.pushRun(.{
+                .off = start + run_start,
+                .len = to_read - run_start,
+                .kind = .plain,
+            });
+        }
+    }
+
+    inline fn pushRun(self: *CircBuffer, run: Run) void {
+        self.runs.append(self.allocator, run) catch {
+            // wow
+        };
+    }
+
+    inline fn pushLine(self: *CircBuffer, line: Line) void {
+        self.lines.append(self.allocator, line) catch {
+            // wow
+        };
     }
 
     fn mapMirror(size: usize) ?[]u8 {
@@ -447,77 +379,49 @@ pub const CircBuffer = struct {
     }
 };
 
-// NOTE(vasco):
-// The skip functions will be useful in the future.
-// No harm in leaving them here because of zig's tree shaking.
-
-fn skipCsi(slice: []const u8) usize {
+inline fn skipCsi(slice: []const u8) usize {
     if (slice.len < 3) return slice.len;
-    var idx: usize = 2; // Skip ESC [
-    while (idx < slice.len) : (idx += 1) {
-        const b = slice[idx];
-        if (b >= 0x40 and b <= 0x7E) return idx + 1; // Final byte terminates CSI
+    const offset = 2 + SIMD.skipInRange(slice[2..], 0x40, 0x7E);
+    if (offset < slice.len) {
+        return offset + 1;
     }
     return slice.len;
 }
 
-fn skipOsc(slice: []const u8) usize {
+inline fn skipOsc(slice: []const u8) usize {
     if (slice.len < 3) return slice.len;
     return skipStTerminated(slice);
 }
 
-fn skipDcs(slice: []const u8) usize {
+inline fn skipDcs(slice: []const u8) usize {
     return skipStTerminated(slice);
 }
 
-fn skipStTerminated(slice: []const u8) usize {
+inline fn skipStTerminated(slice: []const u8) usize {
     var idx: usize = 2;
-    while (idx < slice.len) : (idx += 1) {
-        if (slice[idx] == 0x07) return idx + 1; // BEL termination
-        if (slice[idx] == 0x1B and idx + 1 < slice.len and slice[idx + 1] == '\\') {
-            return idx + 2; // ST (ESC \) termination
+    while (idx < slice.len) {
+        idx += SIMD.skipEqualEither(slice[idx..], 0x07, 0x1B);
+        if (idx >= slice.len) break;
+
+        if (slice[idx] == 0x07) return idx + 1;
+
+        if (slice[idx] == 0x1B) {
+            if (idx + 1 < slice.len and slice[idx + 1] == '\\') {
+                return idx + 2;
+            }
+            idx += 1;
         }
     }
     return slice.len;
 }
 
-/// Bytes in `[0x20, 0x7F)`. Same predicate as the AVX2 printable run in vt.
-fn skipAsciiPrintable(input: []const u8, start: usize) usize {
-    const V = @Vector(vec_len, u8);
-    const space: V = @splat(0x20);
-    const del: V = @splat(0x7F);
-    var i = start;
-    while (i + vec_len <= input.len) : (i += vec_len) {
-        const chunk: V = input[i..][0..vec_len].*;
-        const bad: @Vector(vec_len, u1) =
-            @intFromBool(chunk < space) | @intFromBool(chunk >= del);
-        const bits: Mask = @bitCast(bad);
-        if (bits != 0) return i + @ctz(bits);
-    }
-    while (i < input.len) : (i += 1) {
-        const c = input[i];
-        if (c < 0x20 or c >= 0x7F) return i;
-    }
-    return input.len;
+inline fn skipAsciiPrintable(slice: []const u8) usize {
+    return SIMD.skipOutRange(slice, 0x20, 0x7E);
 }
 
-/// Bytes with the high bit set. Stops at ASCII / C0 / DEL.
-fn skipHighBit(input: []const u8, start: usize) usize {
-    const V = @Vector(vec_len, u8);
-    const hi: V = @splat(0x80);
-    var i = start;
-    while (i + vec_len <= input.len) : (i += vec_len) {
-        const chunk: V = input[i..][0..vec_len].*;
-        const bad: @Vector(vec_len, u1) = @intFromBool(chunk < hi);
-        const bits: Mask = @bitCast(bad);
-        if (bits != 0) return i + @ctz(bits);
-    }
-    while (i < input.len) : (i += 1) {
-        if (input[i] < 0x80) return i;
-    }
-    return input.len;
+inline fn skipHighBit(slice: []const u8) usize {
+    return SIMD.skipToLowerThan(slice, 0x80);
 }
-
 
 test "correct line split" {
 }

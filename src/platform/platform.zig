@@ -12,6 +12,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Linux = @import("linux.zig");
 
+pub const Dimensions = struct {
+    cols: u16,
+    rows: u16,
+    px_w: u16 = 0,
+    px_h: u16 = 0,
+};
+
 pub const Event = union(enum) {
     pub const KeyMod = packed struct {
         shift: bool = false,
@@ -38,7 +45,7 @@ pub const Event = union(enum) {
     key_press: KeyEvent,
     key_release: KeyEvent,
     text_input: [32]u8, // UTF-8 encoded text stream from OS IME/Keyboard
-    resize: struct { cols: u16, rows: u16, px_w: u32, px_h: u32 },
+    resize: Dimensions,
     focus_gained,
     focus_lost,
     quit,
@@ -103,13 +110,6 @@ pub const Pty = struct {
     const PtyImpl = switch (builtin.os.tag) {
         .linux, .freebsd, .openbsd => Linux.Pty,
         else => @compileError("Unsupported operating system for PTY platform layer"),
-    };
-
-    pub const Dimensions = struct {
-        cols: u16,
-        rows: u16,
-        px_w: u16 = 0,
-        px_h: u16 = 0,
     };
 
     pub fn open(dims: Dimensions) !Pty {
