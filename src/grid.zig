@@ -94,9 +94,46 @@ pub const Grid = struct {
         allocator.free(self.starts);
     }
 
+    pub fn reset(self: *Grid, cols: u16, rows: u16, scheme: Scheme) void {
+        @memset(self.cells, Cell{ .fg = scheme.fg, .bg = scheme.bg });
+        for (self.starts, 0..) |*s, i| {
+            s.* = @intCast(i * cols);
+        }
+        self.head = 0;
+        self.used = rows;
+        self.scroll = 0;
+        self.cursor = .{};
+        self.fg = scheme.fg;
+        self.bg = scheme.bg;
+        self.attrs = .{};
+        self.saved_cursor = .{};
+        self.saved_fg = scheme.fg;
+        self.saved_bg = scheme.bg;
+        self.saved_attrs = .{};
+        self.scroll_top = 0;
+        self.scroll_bottom = rows -| 1;
+    }
+
     pub inline fn getCell(self: *Grid, row: u16, col: u16) *Cell {
         const line_idx = (self.head + row) % self.cap;
         return &self.cells[self.starts[line_idx] + col];
+    }
+
+    pub inline fn cellAt(self: *const Grid, row: u16, col: u16) Cell {
+        const line_idx = (self.head + row) % self.cap;
+        return self.cells[self.starts[line_idx] + col];
+    }
+
+    pub inline fn rowSlice(self: *Grid, row: u16, cols: u16) []Cell {
+        const line_idx = (self.head + row) % self.cap;
+        const off = self.starts[line_idx];
+        return self.cells[off .. off + cols];
+    }
+
+    pub inline fn rowSliceConst(self: *const Grid, row: u16, cols: u16) []const Cell {
+        const line_idx = (self.head + row) % self.cap;
+        const off = self.starts[line_idx];
+        return self.cells[off .. off + cols];
     }
 
     pub inline fn blankCell(self: *Grid) Cell {
