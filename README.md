@@ -40,7 +40,6 @@ Velocitty is a lightning-fast cross-platform terminal.
 ## Anti-Features
 - No CTL.
 - No multiplexing.
-- No scrollback (subject to change).
 
 ## Install
 
