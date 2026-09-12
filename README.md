@@ -11,16 +11,16 @@
     <!-- <img src="https://img.shields.io/badge/Windows-0078D4?style=flat-square&logo=windows&logoColor=white" alt="Windows"> -->
     <!-- <img src="https://img.shields.io/badge/macOS-000000?style=flat-square&logo=apple&logoColor=white" alt="macOS"> -->
     <!-- <a href="https://github.com/valvesky/velocitty/commits/master"><img src="https://img.shields.io/github/last-commit/valvesky/velocitty?style=flat-square" alt="Last commit"></a> -->
-    <a href="https://github.com/valvesky/velocitty/stargazers"><img src="https://img.shields.io/github/stars/valvesky/velocitty?style=flat-square" alt="Stars"></a>
-    <br />
-    <br />
-    <a href="#features">Features</a>
-    ·
-    <a href="#install">Install</a>
-    ·
-    <a href="#build">Build</a>
-    ·
-    <a href="#shoutouts">Shoutouts</a>
+    <!-- <a href="https://github.com/valvesky/velocitty/stargazers"><img src="https://img.shields.io/github/stars/valvesky/velocitty?style=flat-square" alt="Stars"></a> -->
+    <!-- <br /> -->
+    <!-- <br /> -->
+    <!-- <a href="#features">Features</a> -->
+    <!-- · -->
+    <!-- <a href="#install">Install</a> -->
+    <!-- · -->
+    <!-- <a href="#build">Build</a> -->
+    <!-- · -->
+    <!-- <a href="#shoutouts">Shoutouts</a> -->
   </p>
 </p>
 
