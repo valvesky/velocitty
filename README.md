@@ -1,11 +1,9 @@
 <!-- LOGO -->
 <h1>
 <p align="center">
-  <img src="docs/velocitty.2x.gif" alt="Logo" width="128">
-  <br>vt
+⚡⚡ Velocitty ⚡⚡
 </h1>
   <p align="center">
-     ⚡⚡ Velocitty ⚡⚡
     <br />
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License: MIT"></a>
     <a href="https://github.com/valvesky/velocitty"><img src="https://img.shields.io/github/languages/top/valvesky/velocitty?style=flat-square" alt="Language"></a>
@@ -26,10 +24,9 @@
   </p>
 </p>
 
-Velocitty is a lightning-fast cross-platform terminal multiplexor.
+Velocitty is a lightning-fast cross-platform terminal.
 
 ## Features
-- Omarchy color pallete change and font change (live reloaded).
 - Lightning fast (literally bottle-necked by the kernel)
 - `cat` large files. 
 - Cross-platform.
@@ -38,6 +35,7 @@ Velocitty is a lightning-fast cross-platform terminal multiplexor.
 - Extensive unicode support.
 - Simple config file.
 - No external dependencies.
+- Omarchy color pallete change and font change (live reloaded).
 
 ## Anti-Features
 - No CTL.
@@ -46,7 +44,8 @@ Velocitty is a lightning-fast cross-platform terminal multiplexor.
 
 ## Install
 
-See [releases]() tab
+See [releases](https://github.com/valvesky/velocitty/releases) tab.
+Unzip then copy to `/usr/bin`
 
 ## Build
 
