@@ -94,3 +94,43 @@ pub const Window = struct {
         return &self.impl.framebuffer;
     }
 };
+
+
+/// Pseudo-terminal interface implemented by the platform backends.
+pub const Pty = struct {
+    impl: PtyImpl,
+
+    const PtyImpl = switch (builtin.os.tag) {
+        .linux, .freebsd, .openbsd => Linux.Pty,
+        else => @compileError("Unsupported operating system for PTY platform layer"),
+    };
+
+    pub const Dimensions = struct {
+        cols: u16,
+        rows: u16,
+        px_w: u16 = 0,
+        px_h: u16 = 0,
+    };
+
+    pub fn open(dims: Dimensions) !Pty {
+        var pty: Pty = undefined;
+        try pty.impl.open(dims);
+        return pty;
+    }
+
+    pub fn close(self: *Pty) void {
+        self.impl.close();
+    }
+
+    pub fn write(self: *Pty, bytes: []const u8) void {
+        self.impl.write(bytes);
+    }
+
+    pub fn read(self: *Pty, buf: []u8) error{Hangup}![]u8 {
+        return self.impl.read(buf);
+    }
+
+    pub fn setWinsize(self: *Pty, dims: Dimensions) void {
+        self.impl.setWinsize(dims);
+    }
+};

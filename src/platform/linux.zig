@@ -1,6 +1,10 @@
 //! linux.zig
+
 const std = @import("std");
-const platform = @import("platform.zig");
+const builtin = @import("builtin");
+const linux = std.os.linux;
+const posix = std.posix;
+const Platform = @import("platform.zig");
 
 const c = @cImport({
     @cInclude("X11/Xlib.h");
@@ -12,7 +16,7 @@ const c = @cImport({
 pub const Window = struct {
     width: u32,
     height: u32,
-    framebuffer: platform.Framebuffer,
+    framebuffer: Platform.Framebuffer,
 
     display: *c.Display,
     window: c.Window,
@@ -125,7 +129,7 @@ pub const Window = struct {
         _ = c.XCloseDisplay(self.display);
     }
 
-    pub fn pollEvent(self: *Window, ev: *platform.Event) bool {
+    pub fn pollEvent(self: *Window, ev: *Platform.Event) bool {
         while (c.XPending(self.display) > 0) {
             var xev: c.XEvent = undefined;
             _ = c.XNextEvent(self.display, &xev);
@@ -300,7 +304,7 @@ pub const Window = struct {
     }
 };
 
-fn getMods(state: c_uint) platform.Event.KeyMod {
+fn getMods(state: c_uint) Platform.Event.KeyMod {
     return .{
         .shift = (state & c.ShiftMask) != 0,
         .ctrl = (state & c.ControlMask) != 0,
@@ -309,7 +313,7 @@ fn getMods(state: c_uint) platform.Event.KeyMod {
     };
 }
 
-fn translateKey(sym: c.KeySym) ?platform.Event.KeyCode {
+fn translateKey(sym: c.KeySym) ?Platform.Event.KeyCode {
     return switch (sym) {
         c.XK_a => .a,
         c.XK_b => .b,
@@ -379,4 +383,119 @@ fn translateKey(sym: c.KeySym) ?platform.Event.KeyCode {
         c.XK_F12 => .f12,
         else => null,
     };
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
+pub const Pty = struct {
+    master: posix.fd_t,
+    child: posix.pid_t,
+
+    pub fn open(self: *Pty, dims: Platform.Pty.Dimensions) !void {
+        const master_rc = linux.open("/dev/ptmx", .{
+            .ACCMODE = .RDWR,
+            .NOCTTY = true,
+            .CLOEXEC = true,
+            .NONBLOCK = true,
+        }, 0);
+        if (linux.errno(master_rc) != .SUCCESS) return error.OpenPty;
+        const master: posix.fd_t = @intCast(master_rc);
+        errdefer _ = linux.close(master);
+
+        var unlock: i32 = 0;
+        if (linux.errno(linux.ioctl(master, linux.T.IOCSPTLCK, @intFromPtr(&unlock))) != .SUCCESS)
+            return error.OpenPty;
+
+        var ptn: u32 = 0;
+        if (linux.errno(linux.ioctl(master, linux.T.IOCGPTN, @intFromPtr(&ptn))) != .SUCCESS)
+            return error.OpenPty;
+
+        var path_buf: [64]u8 = undefined;
+        const slave_path = std.fmt.bufPrintZ(&path_buf, "/dev/pts/{d}", .{ptn}) catch return error.OpenPty;
+        const shell = getShellPath();
+        const ws = toWinsize(dims);
+
+        const pid_rc = linux.fork();
+        if (linux.errno(pid_rc) != .SUCCESS) return error.OpenPty;
+        const pid: posix.pid_t = @intCast(pid_rc);
+
+        if (pid == 0) {
+            // Child Process
+            _ = linux.close(master);
+            _ = linux.setsid();
+
+            const slave_rc = linux.open(slave_path, .{ .ACCMODE = .RDWR }, 0);
+            if (linux.errno(slave_rc) != .SUCCESS) linux.exit(127);
+            const slave: i32 = @intCast(slave_rc);
+
+            _ = linux.ioctl(slave, linux.T.IOCSCTTY, 0);
+
+            var ws_mut = ws;
+            _ = linux.ioctl(slave, linux.T.IOCSWINSZ, @intFromPtr(&ws_mut));
+
+            _ = linux.dup2(slave, 0);
+            _ = linux.dup2(slave, 1);
+            _ = linux.dup2(slave, 2);
+            if (slave > 2) _ = linux.close(slave);
+
+            execShell(shell);
+        }
+
+        // Parent Process
+        var ws_mut = ws;
+        _ = linux.ioctl(master, linux.T.IOCSWINSZ, @intFromPtr(&ws_mut));
+
+        self.master = master;
+        self.child = pid;
+    }
+
+    pub fn close(self: *Pty) void {
+        _ = linux.close(self.master);
+        self.* = undefined;
+    }
+
+    pub fn write(self: *Pty, bytes: []const u8) void {
+        if (bytes.len == 0) return;
+        _ = linux.write(self.master, bytes.ptr, bytes.len);
+    }
+
+    pub fn read(self: *Pty, buf: []u8) error{Hangup}![]u8 {
+        const rc = linux.read(self.master, buf.ptr, buf.len);
+        const err = linux.errno(rc);
+
+        if (err == .AGAIN or err == .INTR) return buf[0..0];
+        if (err != .SUCCESS or rc == 0) return error.Hangup;
+
+        return buf[0..rc];
+    }
+
+    pub fn setWinsize(self: *Pty, dims: Platform.Pty.Dimensions) void {
+        var ws = toWinsize(dims);
+        _ = linux.ioctl(self.master, linux.T.IOCSWINSZ, @intFromPtr(&ws));
+    }
+};
+
+inline fn toWinsize(dims: Platform.Pty.Dimensions) posix.winsize {
+    return .{
+        .row = dims.rows,
+        .col = dims.cols,
+        .xpixel = dims.px_w,
+        .ypixel = dims.px_h,
+    };
+}
+
+fn getShellPath() [*:0]const u8 {
+    if (std.c.getenv("SHELL")) |s| {
+        if (std.mem.span(s).len > 0) return s;
+    }
+    return "/bin/sh";
+}
+
+fn execShell(shell: [*:0]const u8) noreturn {
+    _ = setenv("TERM", "xterm-256color", 1);
+    _ = setenv("COLORTERM", "truecolor", 1);
+    const argv = [_:null]?[*:0]const u8{ shell, null };
+    const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+    _ = std.c.execve(shell, &argv, envp);
+    std.process.exit(127);
 }

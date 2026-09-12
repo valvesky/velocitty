@@ -63,7 +63,7 @@ pub const CircBuffer = struct {
     tail: u64 = 0,
     epoch: u64 = 0,
     lines: std.ArrayListUnmanaged(Line) = .{},
-    runs: std.ArrayListUnmanaged(Line) = .{},
+    runs: std.ArrayListUnmanaged(Run) = .{},
 
     /// Create circular buffer
     pub fn create(allocator: std.mem.Allocator, capacity: usize) std.mem.Allocator.Error!CircBuffer {
@@ -114,6 +114,14 @@ pub const CircBuffer = struct {
         self.* = undefined;
     }
 
+    /// Consume everything and return runs.
+    pub fn consumeAndGetRuns(self: *CircBuffer, term: *Term) []Run {
+        self.consumeAndPreparse(term);
+        const lines = self.getLastNLines(term.rows);
+        self.splitLinesIntoRuns(lines);
+        return self.runs.items;
+    }
+
     /// Read directly from a file descriptor.
     pub fn read(self: *CircBuffer, reader: std.io.AnyReader) !usize {
         assert(self.mapped);
@@ -131,7 +139,7 @@ pub const CircBuffer = struct {
     ///
     /// Needs a terminal to apply a few "whitelisted" 
     /// sequences that could effect the final screen.
-    pub fn consumeAndPreparse(self: CircBuffer, term: Term) void {
+    fn consumeAndPreparse(self: CircBuffer, term: Term) void {
 
         assert(self.tail <= self.head);
 
@@ -145,7 +153,7 @@ pub const CircBuffer = struct {
     }
 
     /// Get last N lines of input. May be less than expected.
-    pub fn getLastNLines(self: CircBuffer, n: usize) []Line {
+    fn getLastNLines(self: CircBuffer, n: usize) []Line {
         const min = @min(n, self.lines.len);
         return self.lines[0..min];
     }
@@ -263,7 +271,7 @@ pub const CircBuffer = struct {
         }
     }
 
-    pub fn splitLinesIntoRuns(self: *CircBuffer) !void {
+    fn splitLinesIntoRuns(self: *CircBuffer, lines: []Line) void {
 
         // NOTE(vasco): Splitting into Runs should be 
         // pretty simple: scan for <= SPC and >= DEL
@@ -280,7 +288,7 @@ pub const CircBuffer = struct {
         const vec_spc: Vec = @splat(0x20); // Controls/SPC <= 0x20
         const vec_del: Vec = @splat(0x7F); // DEL / High-bit >= 0x7F
 
-        for (self.lines.items) |line| {
+        for (lines) |line| {
             const slice = self.storage[line.off .. line.off + line.len];
             var i: usize = 0;
             var run_start: usize = 0;
