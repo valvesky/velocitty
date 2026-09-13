@@ -1,7 +1,8 @@
 <!-- LOGO -->
 <h1>
 <p align="center">
-⚡⚡ Velocitty ⚡⚡
+<img src="icon.png" alt="Logo" width="128">
+<br>Velocitty 
 </h1>
   <p align="center">
     <br />
@@ -27,24 +28,32 @@
 Velocitty is a lightning-fast cross-platform terminal.
 
 ## Features
-- Lightning fast (literally bottle-necked by the kernel)
-- `cat` large files. 
+- Lightning fast (literally bottlenecked by the kernel)
+- `cat` large files.
 - Cross-platform.
 - CPU rendered.
 - Image support (kitty protocol)
 - Extensive unicode support.
 - Simple config file.
 - No external dependencies.
-- Omarchy color pallete change and font change (live reloaded).
+- Omarchy color palette change and font change (live reloaded).
 
 ## Anti-Features
-- No CTL.
+- No kitty style CTL.
 - No multiplexing.
+- No GPU.
 
 ## Install
 
 See [releases](https://github.com/valvesky/velocitty/releases) tab.
 Unzip then copy to `/usr/bin`
+
+## Config
+
+Config file is `~/.config/velocitty/config.toml` and will be overwritten by omarchy color scheme.
+
+See `example.config.toml` for an example config file.
+It's purposefully similar to `alacritty` in many ways.
 
 ## Build
 
@@ -57,7 +66,7 @@ The binary will be in `zig-out/`
 ## Supported Platforms 
 - [x] Linux (Wayland)
 - [ ] Linux (X11)
-- [ ] MacOS
+- [ ] macOS
 - [ ] Windows
 
 ## Shoutouts

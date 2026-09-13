@@ -100,6 +100,10 @@ pub const Window = struct {
         return self.impl.pollEvent(ev);
     }
 
+    pub fn eventsPending(self: *Window) bool {
+        return self.impl.eventsPending();
+    }
+
     /// X connection fd (`ConnectionNumber(dpy)`). Poll with the PTY; do not read it.
     pub fn eventFd(self: *Window) std.posix.fd_t {
         return self.impl.eventFd();

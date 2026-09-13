@@ -4,6 +4,7 @@
 //! [general]
 //! refreshrate = 30
 //! whitelist = false
+//! pad = 14
 //!
 //! foreground = "#aaaaaa"
 //! background = "#000000"
@@ -39,6 +40,7 @@
 //! keys. Omarchy `colors.toml` (`muted`, `bright_foreground`, root ANSI) is
 //! accepted. `hz` is an alias for `refreshrate`.
 //! `whitelist` enables ESC parsing during preparse (off by default).
+//! `pad` / `padding` is inner window margin in pixels (default 14).
 //! Unknown keys are ignored.
 //!
 //! `load` overlays user config then the current Omarchy theme so SIGUSR can
@@ -58,6 +60,8 @@ pub const Config = struct {
     hz: u32 = 30,
     /// Parse whitelisted ESC sequences while splitting lines. Off = NL only.
     whitelist: bool = false,
+    /// Inner window margin in pixels (all sides).
+    pad_px: u32 = 14,
     font_family: [max_font_family]u8 = @splat(0),
     font_family_len: u8 = 0,
     /// Point size (Alacritty/Foot/Ghostty). 0 = unspecified (caller default).
@@ -252,6 +256,8 @@ const Parser = struct {
             config.hz = hz;
         } else if (general and isWhitelistKey(key)) {
             config.whitelist = try self.parseBool();
+        } else if (general and isPadKey(key)) {
+            config.pad_px = try self.parseInteger();
         } else if (settings and isFontSizeKey(key)) {
             const size = try self.parseNumber();
             if (size <= 0) return error.InvalidToml;
@@ -487,6 +493,13 @@ fn isHzKey(key: []const u8) bool {
 
 fn isWhitelistKey(key: []const u8) bool {
     return std.mem.eql(u8, key, "whitelist");
+}
+
+fn isPadKey(key: []const u8) bool {
+    return std.mem.eql(u8, key, "pad") or
+        std.mem.eql(u8, key, "padding") or
+        std.mem.eql(u8, key, "padding.x") or
+        std.mem.eql(u8, key, "padding.y");
 }
 
 fn isFontFamilyKey(key: []const u8) bool {
@@ -782,6 +795,20 @@ test "general refreshrate" {
         \\
     );
     try std.testing.expectEqual(false, wl_off.whitelist);
+
+    const pad = try parse(
+        \\[general]
+        \\pad = 8
+        \\
+    );
+    try std.testing.expectEqual(@as(u32, 8), pad.pad_px);
+
+    const padding = try parse(
+        \\[general]
+        \\padding = 0
+        \\
+    );
+    try std.testing.expectEqual(@as(u32, 0), padding.pad_px);
 }
 
 test "overlay keeps unset fields" {

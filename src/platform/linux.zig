@@ -168,8 +168,12 @@ pub const Window = struct {
         return @intCast(c.XConnectionNumber(self.display));
     }
 
+    /// True if Xlib already has events (fd may be idle). Never sleep on eventFd in that case.
+    pub fn eventsPending(self: *Window) bool {
+        return c.XPending(self.display) > 0;
+    }
+
     pub fn pollEvent(self: *Window, ev: *Platform.Event) bool {
-        var ignored: u32 = 0;
         while (c.XPending(self.display) > 0) {
             var xev: c.XEvent = undefined;
             _ = c.XNextEvent(self.display, &xev);
@@ -265,8 +269,6 @@ pub const Window = struct {
                 },
                 else => {},
             }
-            ignored += 1;
-            if (ignored >= 32) return false;
         }
         return false;
     }

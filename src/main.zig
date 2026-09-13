@@ -223,22 +223,6 @@ fn hyprlandRefreshHz(io: std.Io, gpa: std.mem.Allocator) ?u32 {
     return @max(1, @as(u32, @intFromFloat(@round(hz))));
 }
 
-fn fdReady(fd: std.posix.fd_t) bool {
-    var fds = [_]std.posix.pollfd{
-        .{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 },
-    };
-    const n = std.posix.poll(&fds, 0) catch return false;
-    return n > 0 and (fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0;
-}
-
-fn waitFds(a: std.posix.fd_t, b: std.posix.fd_t, timeout_ms: i32) void {
-    var fds = [_]std.posix.pollfd{
-        .{ .fd = a, .events = std.posix.POLL.IN, .revents = 0 },
-        .{ .fd = b, .events = std.posix.POLL.IN, .revents = 0 },
-    };
-    _ = std.posix.poll(&fds, timeout_ms) catch {};
-}
-
 fn gdkScale() f32 {
     const p = std.c.getenv("GDK_SCALE") orelse return 1;
     const s = std.mem.sliceTo(p, 0);
@@ -291,6 +275,17 @@ fn installReloadSignal() void {
         },
         else => {},
     }
+}
+
+fn gridDims(px_w: u32, px_h: u32, cell_w: u32, cell_h: u32, pad: u32) struct { cols: u16, rows: u16 } {
+    const cw = @max(cell_w, 1);
+    const ch = @max(cell_h, 1);
+    const inner_w = px_w -| (2 * pad);
+    const inner_h = px_h -| (2 * pad);
+    return .{
+        .cols = @intCast(@max(1, inner_w / cw)),
+        .rows = @intCast(@max(1, inner_h / ch)),
+    };
 }
 
 fn padColor(term: *const VtState) u32 {
@@ -408,6 +403,91 @@ fn textLen(text: [32]u8) usize {
     return std.mem.indexOfScalar(u8, &text, 0) orelse text.len;
 }
 
+const EventLoop = struct {
+    window: *Platform.Window,
+    pty: *Platform.Pty,
+    term: *VtState,
+    frame: *Draw.Frame,
+    allocator: std.mem.Allocator,
+    cols: *u16,
+    rows: *u16,
+    cell_w: u32,
+    cell_h: u32,
+    pad_px: u32,
+    running: *bool,
+    need_draw: *bool,
+
+    fn pump(ptr: *anyopaque) void {
+        const self: *EventLoop = @ptrCast(@alignCast(ptr));
+        self.drain();
+    }
+
+    fn drain(self: *EventLoop) void {
+        var ev: Platform.Event = undefined;
+        while (self.window.pollEvent(&ev)) {
+            self.dispatch(ev);
+        }
+    }
+
+    fn dispatch(self: *EventLoop, ev: Platform.Event) void {
+        switch (ev) {
+            .quit => self.running.* = false,
+            .resize => |r| {
+                const next = gridDims(r.px_w, r.px_h, self.cell_w, self.cell_h, self.pad_px);
+                if (next.cols != self.cols.* or next.rows != self.rows.*) {
+                    self.cols.* = next.cols;
+                    self.rows.* = next.rows;
+                    self.term.resize(self.cols.*, self.rows.*) catch {};
+                    self.frame.resize(@as(u32, self.cols.*) * self.cell_w, @as(u32, self.rows.*) * self.cell_h) catch {};
+                    self.pty.setWinsize(.{
+                        .cols = self.cols.*,
+                        .rows = self.rows.*,
+                        .px_w = r.px_w,
+                        .px_h = r.px_h,
+                    });
+                    self.frame.invalidate();
+                }
+                self.need_draw.* = true;
+            },
+            .key_press => |k| {
+                const bytes = encodeKey(k.key, k.mods, self.term.flags.app_cursor);
+                if (bytes.len != 0) self.pty.write(bytes);
+            },
+            .mouse_wheel => |w| {
+                const ticks: u8 = @max(1, w.steps);
+                var t: u8 = 0;
+                if (self.term.mouse != .off) {
+                    const fb = self.window.framebuffer();
+                    const ox: u32 = if (fb.width > self.frame.width) (fb.width - self.frame.width) / 2 else 0;
+                    const oy: u32 = if (fb.height > self.frame.height) (fb.height - self.frame.height) / 2 else 0;
+                    var buf: [64]u8 = undefined;
+                    const bytes = encodeMouseWheel(self.term, w, ox, oy, self.cell_w, self.cell_h, &buf);
+                    while (t < ticks) : (t += 1) {
+                        if (bytes.len != 0) self.pty.write(bytes);
+                    }
+                } else if (self.term.which == 1) {
+                    const key: Platform.Event.KeyCode = if (w.up) .arrow_up else .arrow_down;
+                    const bytes = encodeKey(key, w.mods, self.term.flags.app_cursor);
+                    while (t < ticks) : (t += 1) {
+                        if (bytes.len != 0) self.pty.write(bytes);
+                    }
+                } else {
+                    const delta: i32 = if (w.up) @as(i32, ticks) else -@as(i32, ticks);
+                    self.term.viewScroll(delta);
+                    self.need_draw.* = true;
+                }
+            },
+            .paste_request => self.window.requestPaste(),
+            .paste => |text| writePaste(self.pty, self.term, self.allocator, text),
+            .text_input => |text| {
+                const n = textLen(text);
+                if (n != 0) self.pty.write(text[0..n]);
+            },
+            else => {},
+        }
+    }
+};
+
 fn writePaste(pty: *Platform.Pty, term: *const VtState, allocator: std.mem.Allocator, raw: []const u8) void {
     var buf = allocator.alloc(u8, raw.len) catch {
         if (term.flags.bracket_paste) pty.write("\x1b[200~");
@@ -448,6 +528,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var config = loadConfig(io.io(), allocator);
     const display_hz: u32 = hyprlandRefreshHz(io.io(), allocator) orelse 60;
     var hz: u32 = display_hz;
+    var pad_px: u32 = config.pad_px;
 
     var cols: u16 = 80;
     var rows: u16 = 24;
@@ -492,12 +573,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     term.cell_px_w = @intCast(@min(cell_w, std.math.maxInt(u16)));
     term.cell_px_h = @intCast(@min(cell_h, std.math.maxInt(u16)));
 
-    const win_w = @as(u32, cols) * cell_w;
-    const win_h = @as(u32, rows) * cell_h;
+    const win_w = @as(u32, cols) * cell_w + 2 * pad_px;
+    const win_h = @as(u32, rows) * cell_h + 2 * pad_px;
     var window = try Platform.Window.open(allocator, "Velocitty", win_w, win_h);
     defer window.close();
 
-    var frame = try Draw.Frame.init(allocator, win_w, win_h);
+    var frame = try Draw.Frame.init(allocator, @as(u32, cols) * cell_w, @as(u32, rows) * cell_h);
     defer frame.deinit();
 
     var pty: Platform.Pty = try Platform.Pty.open(.{
@@ -510,72 +591,28 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     const x_fd = window.eventFd();
     const pty_fd = pty.impl.master;
-    const frame_ms: i32 = @intCast(@max(1, 1000 / display_hz));
 
     var running = true;
     var theme_stamp = Scheme.watchStamp(io.io());
     var need_draw = true;
 
+    var eloop = EventLoop{
+        .window = &window,
+        .pty = &pty,
+        .term = &term,
+        .frame = &frame,
+        .allocator = allocator,
+        .cols = &cols,
+        .rows = &rows,
+        .cell_w = cell_w,
+        .cell_h = cell_h,
+        .pad_px = pad_px,
+        .running = &running,
+        .need_draw = &need_draw,
+    };
+
     while (running) {
-        var ev: Platform.Event = undefined;
-        while (window.pollEvent(&ev)) {
-            switch (ev) {
-                .quit => running = false,
-                .resize => |r| {
-                    const next_cols: u16 = @intCast(@max(1, @as(u32, r.px_w) / cell_w));
-                    const next_rows: u16 = @intCast(@max(1, @as(u32, r.px_h) / cell_h));
-                    if (next_cols != cols or next_rows != rows) {
-                        cols = next_cols;
-                        rows = next_rows;
-                        term.resize(cols, rows) catch {};
-                        frame.resize(@as(u32, cols) * cell_w, @as(u32, rows) * cell_h) catch {};
-                        pty.setWinsize(.{
-                            .cols = cols,
-                            .rows = rows,
-                            .px_w = r.px_w,
-                            .px_h = r.px_h,
-                        });
-                        frame.invalidate();
-                        need_draw = true;
-                    }
-                },
-                .key_press => |k| {
-                    const bytes = encodeKey(k.key, k.mods, term.flags.app_cursor);
-                    if (bytes.len != 0) pty.write(bytes);
-                },
-                .mouse_wheel => |w| {
-                    const ticks: u8 = @max(1, w.steps);
-                    var t: u8 = 0;
-                    if (term.mouse != .off) {
-                        const fb = window.framebuffer();
-                        const ox: u32 = if (fb.width > frame.width) (fb.width - frame.width) / 2 else 0;
-                        const oy: u32 = if (fb.height > frame.height) (fb.height - frame.height) / 2 else 0;
-                        var buf: [64]u8 = undefined;
-                        const bytes = encodeMouseWheel(&term, w, ox, oy, cell_w, cell_h, &buf);
-                        while (t < ticks) : (t += 1) {
-                            if (bytes.len != 0) pty.write(bytes);
-                        }
-                    } else if (term.which == 1) {
-                        const key: Platform.Event.KeyCode = if (w.up) .arrow_up else .arrow_down;
-                        const bytes = encodeKey(key, w.mods, term.flags.app_cursor);
-                        while (t < ticks) : (t += 1) {
-                            if (bytes.len != 0) pty.write(bytes);
-                        }
-                    } else {
-                        const delta: i32 = if (w.up) @as(i32, ticks) else -@as(i32, ticks);
-                        term.viewScroll(delta);
-                        need_draw = true;
-                    }
-                },
-                .paste_request => window.requestPaste(),
-                .paste => |text| writePaste(&pty, &term, allocator, text),
-                .text_input => |text| {
-                    const n = textLen(text);
-                    if (n != 0) pty.write(text[0..n]);
-                },
-                else => {},
-            }
-        }
+        eloop.drain();
 
         if (!running) break;
 
@@ -585,6 +622,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (reload_requested.swap(false, .acq_rel)) {
             config = loadConfig(io.io(), allocator);
             hz = display_hz;
+            pad_px = config.pad_px;
             size_px = fontPixels(config, scale, dpi);
             term.applyScheme(config.scheme);
 
@@ -594,25 +632,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     for (font_blobs.items) |b| allocator.free(b);
                     font_blobs.deinit(allocator);
                     font_blobs = new_blobs;
-                    const prev_w = cell_w;
-                    const prev_h = cell_h;
                     cellMetrics(&type_ctx, size_px, &cell_w, &cell_h);
                     type_ptr = &type_ctx;
-                    if (cell_w != prev_w or cell_h != prev_h) {
-                        const fb = window.framebuffer();
-                        const next_cols: u16 = @intCast(@max(1, fb.width / cell_w));
-                        const next_rows: u16 = @intCast(@max(1, fb.height / cell_h));
-                        cols = next_cols;
-                        rows = next_rows;
-                        term.resize(cols, rows) catch {};
-                        frame.resize(@as(u32, cols) * cell_w, @as(u32, rows) * cell_h) catch {};
-                        pty.setWinsize(.{
-                            .cols = cols,
-                            .rows = rows,
-                            .px_w = @intCast(fb.width),
-                            .px_h = @intCast(fb.height),
-                        });
-                    }
                     term.cell_px_w = @intCast(@min(cell_w, std.math.maxInt(u16)));
                     term.cell_px_h = @intCast(@min(cell_h, std.math.maxInt(u16)));
                 } else |_| {
@@ -624,17 +645,38 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 for (new_blobs.items) |b| allocator.free(b);
                 new_blobs.deinit(allocator);
             }
+            {
+                const fb = window.framebuffer();
+                const next = gridDims(fb.width, fb.height, cell_w, cell_h, pad_px);
+                if (next.cols != cols or next.rows != rows) {
+                    cols = next.cols;
+                    rows = next.rows;
+                    term.resize(cols, rows) catch {};
+                    frame.resize(@as(u32, cols) * cell_w, @as(u32, rows) * cell_h) catch {};
+                    pty.setWinsize(.{
+                        .cols = cols,
+                        .rows = rows,
+                        .px_w = @intCast(fb.width),
+                        .px_h = @intCast(fb.height),
+                    });
+                }
+            }
             frame.invalidate();
             theme_stamp = Scheme.watchStamp(io.io());
             need_draw = true;
+            eloop.cell_w = cell_w;
+            eloop.cell_h = cell_h;
+            eloop.pad_px = pad_px;
         }
 
         var hangup = false;
-        if (fdReady(pty_fd)) {
-            circbuffer.readPTY(pty_fd, hz) catch {
-                hangup = true;
-            };
-        }
+        circbuffer.readPTYPump(pty_fd, hz, .{
+            .fd = x_fd,
+            .ctx = @ptrCast(&eloop),
+            .tick = EventLoop.pump,
+        }) catch {
+            hangup = true;
+        };
 
         if (circbuffer.pending()) {
             const runs = circbuffer.consumeAndGetRuns(std.math.maxInt(usize));
@@ -653,8 +695,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
             blitFrame(fb, &frame, padColor(&term));
             window.present();
             need_draw = false;
-        } else {
-            waitFds(x_fd, pty_fd, frame_ms);
         }
 
         if (hangup) running = false;

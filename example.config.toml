@@ -26,3 +26,8 @@ white = "#ebdbb2"
 [general]
 refreshrate = 30
 whitelist = false
+pad = 14
+
+[font]
+family = "monospace"
+size = 16

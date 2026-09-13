@@ -133,7 +133,19 @@ pub const CircBuffer = struct {
     ///
     /// To agents and humans: DO NOT CHANGE THIS COMMENT and do not
     /// break this logic.
+    pub const Pump = struct {
+        fd: posix.fd_t,
+        ctx: *anyopaque,
+        tick: *const fn (*anyopaque) void,
+    };
+
     pub fn readPTY(self: *CircBuffer, pty: posix.fd_t, hz: u32) error{Hangup}!void {
+        return self.readPTYPump(pty, hz, null);
+    }
+
+    /// Same return rules as `readPTY`. `pump` is ticked when its fd wakes during the EAGAIN wait
+    /// so window events are not frozen for 1/hz.
+    pub fn readPTYPump(self: *CircBuffer, pty: posix.fd_t, hz: u32, pump: ?Pump) error{Hangup}!void {
         const rate: u32 = if (hz == 0) 30 else hz;
         const period_ns: i128 = @divTrunc(1_000_000_000, rate);
         const start_ns = nowNs();
@@ -148,7 +160,12 @@ pub const CircBuffer = struct {
                     if (elapsed >= period_ns) return;
                     const remaining_ms = @divTrunc(period_ns - elapsed, 1_000_000);
                     const timeout_ms: i32 = @intCast(@min(@max(remaining_ms, 0), 1000));
-                    waitReadable(pty, timeout_ms);
+                    if (pump) |p| {
+                        waitReadable2(pty, p.fd, timeout_ms);
+                        p.tick(p.ctx);
+                    } else {
+                        waitReadable(pty, timeout_ms);
+                    }
                     continue;
                 },
                 else => return error.Hangup,
@@ -475,6 +492,14 @@ fn nowNs() i128 {
 fn waitReadable(fd: posix.fd_t, timeout_ms: i32) void {
     var fds = [_]posix.pollfd{
         .{ .fd = fd, .events = posix.POLL.IN, .revents = 0 },
+    };
+    _ = posix.poll(&fds, timeout_ms) catch {};
+}
+
+fn waitReadable2(a: posix.fd_t, b: posix.fd_t, timeout_ms: i32) void {
+    var fds = [_]posix.pollfd{
+        .{ .fd = a, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = b, .events = posix.POLL.IN, .revents = 0 },
     };
     _ = posix.poll(&fds, timeout_ms) catch {};
 }

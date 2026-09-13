@@ -24,6 +24,22 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run velocitty");
     run_step.dependOn(&run_cmd.step);
 
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+    });
+    addStbTrueType(bench_mod, b);
+    const bench_exe = b.addExecutable(.{
+        .name = "velocitty-bench",
+        .root_module = bench_mod,
+    });
+    const bench_run = b.addRunArtifact(bench_exe);
+    if (b.args) |args| bench_run.addArgs(args);
+    const bench_step = b.step("bench", "Run firehose/parse/VT microbenchmark (ReleaseFast)");
+    bench_step.dependOn(&bench_run.step);
+
     // Release cross-compilation step. Only targets the host can actually
     // compile and link are built (Linux + same-arch X11 today).
     const release_step = b.step("release", "Build optimized velocitty for all target platforms");
