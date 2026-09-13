@@ -3,6 +3,9 @@
 zig-cache/
 zig-out/
 
+# Release tarballs (`zig build package`)
+/packages/
+
 # Fetched package cache
 zig-pkg/
 

@@ -189,57 +189,77 @@ fn parseFocusedScale(json: []const u8) ?f32 {
     return parseFocusedFloat(json, "\"scale\":");
 }
 
-fn hyprlandScale(io: std.Io, gpa: std.mem.Allocator) ?f32 {
+const HyprMonitor = struct {
+    scale: ?f32 = null,
+    hz: ?u32 = null,
+};
+
+fn hyprlandFocusedMonitor(io: std.Io, gpa: std.mem.Allocator) HyprMonitor {
     const result = std.process.run(gpa, io, .{
         .argv = &.{ "hyprctl", "monitors", "-j" },
         .stdout_limit = .limited(64 * 1024),
         .stderr_limit = .limited(4096),
-    }) catch return null;
+    }) catch return .{};
     defer gpa.free(result.stdout);
     defer gpa.free(result.stderr);
     switch (result.term) {
-        .exited => |code| if (code != 0) return null,
-        else => return null,
+        .exited => |code| if (code != 0) return .{},
+        else => return .{},
     }
-    const scale = parseFocusedScale(result.stdout) orelse return null;
-    if (scale < 0.25 or scale > 8) return null;
-    return scale;
+    var mon: HyprMonitor = .{};
+    if (parseFocusedScale(result.stdout)) |scale| {
+        if (scale >= 0.25 and scale <= 8) mon.scale = scale;
+    }
+    if (parseFocusedFloat(result.stdout, "\"refreshRate\":")) |hz| {
+        if (hz >= 20 and hz <= 500) mon.hz = @max(1, @as(u32, @intFromFloat(@round(hz))));
+    }
+    return mon;
 }
 
-fn hyprlandRefreshHz(io: std.Io, gpa: std.mem.Allocator) ?u32 {
-    const result = std.process.run(gpa, io, .{
-        .argv = &.{ "hyprctl", "monitors", "-j" },
-        .stdout_limit = .limited(64 * 1024),
-        .stderr_limit = .limited(4096),
-    }) catch return null;
-    defer gpa.free(result.stdout);
-    defer gpa.free(result.stderr);
-    switch (result.term) {
-        .exited => |code| if (code != 0) return null,
-        else => return null,
-    }
-    const hz = parseFocusedFloat(result.stdout, "\"refreshRate\":") orelse return null;
-    if (hz < 20 or hz > 500) return null;
-    return @max(1, @as(u32, @intFromFloat(@round(hz))));
-}
-
-fn gdkScale() f32 {
-    const p = std.c.getenv("GDK_SCALE") orelse return 1;
-    const s = std.mem.sliceTo(p, 0);
-    const n = std.fmt.parseFloat(f32, s) catch return 1;
-    if (n < 0.25 or n > 8) return 1;
+fn envScale(name: [:0]const u8) ?f32 {
+    const p = std.c.getenv(name) orelse return null;
+    const n = std.fmt.parseFloat(f32, std.mem.sliceTo(p, 0)) catch return null;
+    if (n < 0.25 or n > 8) return null;
     return n;
 }
 
+fn gdkScale() f32 {
+    return envScale("GDK_SCALE") orelse envScale("QT_SCALE_FACTOR") orelse 1;
+}
+
 fn uiScale(io: std.Io, gpa: std.mem.Allocator) f32 {
-    if (hyprlandScale(io, gpa)) |s| return s;
+    if (hyprlandFocusedMonitor(io, gpa).scale) |s| return s;
     return gdkScale();
 }
 
-fn fontPixels(config: Scheme.Config, scale: f32, fallback_dpi: f32) f32 {
+var scale_cache: f32 = 0;
+var scale_cache_ms: i64 = 0;
+
+fn uiScaleCached(io: std.Io, gpa: std.mem.Allocator, force: bool) f32 {
+    const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds, 1_000_000));
+    if (!force and scale_cache != 0 and now_ms -| scale_cache_ms < 500) return scale_cache;
+    scale_cache = uiScale(io, gpa);
+    scale_cache_ms = now_ms;
+    return scale_cache;
+}
+
+fn scaleChanged(a: f32, b: f32) bool {
+    return @abs(a - b) > 0.01;
+}
+
+/// CSS/Wayland px: 1px = 1/96 in, times the compositor scale. X11 mm-DPI is the
+/// panel's physical density and does not move when the Wayland scale changes
+/// (`xwayland.force_zero_scaling`), so it must not be the font baseline.
+fn fontPixels(config: Scheme.Config, scale: f32) f32 {
     const pt: f32 = if (config.font_size > 0) config.font_size else 8;
-    const dpi: f32 = if (scale != 1) 96.0 * scale else fallback_dpi;
-    return pointsToPixels(pt, dpi);
+    const s = if (std.math.isFinite(scale) and scale >= 0.25) scale else 1;
+    return pointsToPixels(pt, 96.0 * s);
+}
+
+fn scalePx(v: u32, scale: f32) u32 {
+    if (v == 0) return 0;
+    const s = if (std.math.isFinite(scale) and scale > 0) scale else 1;
+    return @max(1, @as(u32, @intFromFloat(@round(@as(f32, @floatFromInt(v)) * s))));
 }
 
 fn cellMetrics(type_ctx: *TypeCtx, size_px: f32, cell_w: *u32, cell_h: *u32) void {
@@ -250,6 +270,55 @@ fn cellMetrics(type_ctx: *TypeCtx, size_px: f32, cell_w: *u32, cell_h: *u32) voi
     if (type_ctx.glyph('M', size_px)) |g| {
         cell_w.* = @max(1, @as(u32, @intFromFloat(@ceil(g.advance))));
     } else |_| {}
+}
+
+fn applyMetrics(
+    type_ptr: ?*TypeCtx,
+    size_px: f32,
+    scale: f32,
+    base_pad: u32,
+    cell_w: *u32,
+    cell_h: *u32,
+    pad_px: *u32,
+) void {
+    cell_w.* = scalePx(8, scale);
+    cell_h.* = scalePx(16, scale);
+    pad_px.* = scalePx(base_pad, scale);
+    if (type_ptr) |ctx| cellMetrics(ctx, size_px, cell_w, cell_h);
+}
+
+fn syncGrid(
+    window: *Platform.Window,
+    term: *VtState,
+    frame: *Draw.Frame,
+    pty: *Platform.Pty,
+    cols: *u16,
+    rows: *u16,
+    cell_w: u32,
+    cell_h: u32,
+    pad_px: u32,
+) void {
+    term.cell_px_w = @intCast(@min(cell_w, std.math.maxInt(u16)));
+    term.cell_px_h = @intCast(@min(cell_h, std.math.maxInt(u16)));
+    const fb = window.framebuffer();
+    const next = gridDims(fb.width, fb.height, cell_w, cell_h, pad_px);
+    const new_fw = @as(u32, next.cols) * cell_w;
+    const new_fh = @as(u32, next.rows) * cell_h;
+    if (next.cols != cols.* or next.rows != rows.*) {
+        cols.* = next.cols;
+        rows.* = next.rows;
+        term.resize(cols.*, rows.*) catch {};
+        pty.setWinsize(.{
+            .cols = cols.*,
+            .rows = rows.*,
+            .px_w = @intCast(fb.width),
+            .px_h = @intCast(fb.height),
+        });
+    }
+    if (frame.width != new_fw or frame.height != new_fh) {
+        frame.resize(new_fw, new_fh) catch {};
+        frame.invalidate();
+    }
 }
 
 fn loadConfig(io: std.Io, gpa: std.mem.Allocator) Scheme.Config {
@@ -416,6 +485,7 @@ const EventLoop = struct {
     pad_px: u32,
     running: *bool,
     need_draw: *bool,
+    need_layout: *bool,
 
     fn pump(ptr: *anyopaque) void {
         const self: *EventLoop = @ptrCast(@alignCast(ptr));
@@ -432,23 +502,11 @@ const EventLoop = struct {
     fn dispatch(self: *EventLoop, ev: Platform.Event) void {
         switch (ev) {
             .quit => self.running.* = false,
-            .resize => |r| {
-                const next = gridDims(r.px_w, r.px_h, self.cell_w, self.cell_h, self.pad_px);
-                if (next.cols != self.cols.* or next.rows != self.rows.*) {
-                    self.cols.* = next.cols;
-                    self.rows.* = next.rows;
-                    self.term.resize(self.cols.*, self.rows.*) catch {};
-                    self.frame.resize(@as(u32, self.cols.*) * self.cell_w, @as(u32, self.rows.*) * self.cell_h) catch {};
-                    self.pty.setWinsize(.{
-                        .cols = self.cols.*,
-                        .rows = self.rows.*,
-                        .px_w = r.px_w,
-                        .px_h = r.px_h,
-                    });
-                    self.frame.invalidate();
-                }
+            .resize => {
+                self.need_layout.* = true;
                 self.need_draw.* = true;
             },
+            .focus_gained => self.need_layout.* = true,
             .key_press => |k| {
                 const bytes = encodeKey(k.key, k.mods, self.term.flags.app_cursor);
                 if (bytes.len != 0) self.pty.write(bytes);
@@ -567,17 +625,19 @@ pub fn main(init: std.process.Init.Minimal) !void {
     installReloadSignal();
 
     var config = loadConfig(io.io(), allocator);
-    const display_hz: u32 = hyprlandRefreshHz(io.io(), allocator) orelse 60;
+    const hypr = hyprlandFocusedMonitor(io.io(), allocator);
+    const display_hz: u32 = hypr.hz orelse 60;
     var hz: u32 = display_hz;
-    var pad_px: u32 = config.pad_px;
+    var scale: f32 = hypr.scale orelse gdkScale();
+    scale_cache = scale;
+    scale_cache_ms = @intCast(@divTrunc(std.Io.Timestamp.now(io.io(), .awake).nanoseconds, 1_000_000));
+    var pad_px: u32 = scalePx(config.pad_px, scale);
 
     var cols: u16 = 80;
     var rows: u16 = 24;
-    var cell_w: u32 = 8;
-    var cell_h: u32 = 16;
-    const dpi = Platform.screenDpi();
-    const scale = uiScale(io.io(), allocator);
-    var size_px: f32 = fontPixels(config, scale, dpi);
+    var cell_w: u32 = scalePx(8, scale);
+    var cell_h: u32 = scalePx(16, scale);
+    var size_px: f32 = fontPixels(config, scale);
 
     var type_ctx: TypeCtx = try TypeCtx.init(allocator, .{
         .atlas_height = 1024,
@@ -636,6 +696,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var running = true;
     var theme_stamp = Scheme.watchStamp(io.io());
     var need_draw = true;
+    var need_layout = true;
 
     var eloop = EventLoop{
         .window = &window,
@@ -650,6 +711,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .pad_px = pad_px,
         .running = &running,
         .need_draw = &need_draw,
+        .need_layout = &need_layout,
     };
 
     while (running) {
@@ -663,8 +725,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (reload_requested.swap(false, .acq_rel)) {
             config = loadConfig(io.io(), allocator);
             hz = display_hz;
-            pad_px = config.pad_px;
-            size_px = fontPixels(config, scale, dpi);
+            scale = uiScaleCached(io.io(), allocator, true);
+            size_px = fontPixels(config, scale);
             term.applyScheme(config.scheme);
 
             var new_blobs: std.ArrayList([]u8) = .empty;
@@ -673,10 +735,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     for (font_blobs.items) |b| allocator.free(b);
                     font_blobs.deinit(allocator);
                     font_blobs = new_blobs;
-                    cellMetrics(&type_ctx, size_px, &cell_w, &cell_h);
                     type_ptr = &type_ctx;
-                    term.cell_px_w = @intCast(@min(cell_w, std.math.maxInt(u16)));
-                    term.cell_px_h = @intCast(@min(cell_h, std.math.maxInt(u16)));
                 } else |_| {
                     bindFonts(allocator, &type_ctx, font_blobs.items) catch {};
                     for (new_blobs.items) |b| allocator.free(b);
@@ -686,28 +745,29 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 for (new_blobs.items) |b| allocator.free(b);
                 new_blobs.deinit(allocator);
             }
-            {
-                const fb = window.framebuffer();
-                const next = gridDims(fb.width, fb.height, cell_w, cell_h, pad_px);
-                if (next.cols != cols or next.rows != rows) {
-                    cols = next.cols;
-                    rows = next.rows;
-                    term.resize(cols, rows) catch {};
-                    frame.resize(@as(u32, cols) * cell_w, @as(u32, rows) * cell_h) catch {};
-                    pty.setWinsize(.{
-                        .cols = cols,
-                        .rows = rows,
-                        .px_w = @intCast(fb.width),
-                        .px_h = @intCast(fb.height),
-                    });
-                }
-            }
+            applyMetrics(type_ptr, size_px, scale, config.pad_px, &cell_w, &cell_h, &pad_px);
+            syncGrid(&window, &term, &frame, &pty, &cols, &rows, cell_w, cell_h, pad_px);
             frame.invalidate();
             theme_stamp = Scheme.watchStamp(io.io());
             need_draw = true;
+            need_layout = false;
             eloop.cell_w = cell_w;
             eloop.cell_h = cell_h;
             eloop.pad_px = pad_px;
+        } else if (need_layout) {
+            const next_scale = uiScaleCached(io.io(), allocator, false);
+            if (scaleChanged(next_scale, scale)) {
+                scale = next_scale;
+                size_px = fontPixels(config, scale);
+                applyMetrics(type_ptr, size_px, scale, config.pad_px, &cell_w, &cell_h, &pad_px);
+                eloop.cell_w = cell_w;
+                eloop.cell_h = cell_h;
+                eloop.pad_px = pad_px;
+                frame.invalidate();
+            }
+            syncGrid(&window, &term, &frame, &pty, &cols, &rows, cell_w, cell_h, pad_px);
+            need_layout = false;
+            need_draw = true;
         }
 
         var hangup = false;

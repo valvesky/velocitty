@@ -45,6 +45,11 @@ pub fn build(b: *std.Build) void {
     // Release cross-compilation step. Only targets the host can actually
     // compile and link are built (Linux + same-arch X11 today).
     const release_step = b.step("release", "Build optimized velocitty for all target platforms");
+    const package_step = b.step("package", "Build release and write tar.gz archives to packages/");
+    package_step.dependOn(release_step);
+
+    const version = @import("build.zig.zon").version;
+    const packages_dir = b.pathFromRoot("packages");
 
     for (targets) |query| {
         const resolved = b.resolveTargetQuery(query);
@@ -58,6 +63,20 @@ pub fn build(b: *std.Build) void {
         });
 
         release_step.dependOn(&install.step);
+
+        const pkg_cmd = b.addSystemCommand(&.{"bash"});
+        pkg_cmd.addFileArg(b.path("scripts/package.sh"));
+        pkg_cmd.addArg(version);
+        pkg_cmd.addArg(triple);
+        pkg_cmd.addArtifactArg(exe_rel);
+        pkg_cmd.addFileArg(b.path("velocitty.desktop"));
+        pkg_cmd.addFileArg(b.path("icon.png"));
+        pkg_cmd.addArg(packages_dir);
+        pkg_cmd.stdio = .inherit;
+        pkg_cmd.has_side_effects = true;
+        pkg_cmd.disable_zig_progress = true;
+        pkg_cmd.setName(b.fmt("package-{s}", .{triple}));
+        package_step.dependOn(&pkg_cmd.step);
     }
 
     // `install` is Zig's prefix step (zig-out by default). This one is the

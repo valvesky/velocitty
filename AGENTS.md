@@ -7,6 +7,7 @@
 
 # Release
 - `zig build release` builds ReleaseFast for host-linkable Linux triples only (same arch/abi, needs X11).
+- `zig build package` runs `release` and writes `packages/velocitty-<version>-<triple>.tar.gz` (binary, desktop, icon).
 
 # Install
 - `zig build` / `zig build install` is Zig's prefix install (default `zig-out/`: binary, `velocitty.desktop`, icon).
@@ -31,7 +32,7 @@
 - `select.zig` — cell-stream selection over `vt.VtState`
 - `kitty.zig` — kitty graphics (APC G: stream + file/temp, `a=q` OK replies for icat)
 - `platform/` — window / PTY (Linux/X11 + XInput2); `XSetClassHint` from `--class`; PTY child is `$SHELL` or `-e` argv (`execvpe`); child env `TERM=xterm-kitty`, `KITTY_WINDOW_ID`, `COLORTERM=truecolor`; wheel from Button4/5 and XI2 scroll valuators (XWayland trackpads)
-- `main.zig` — window + PTY + fonts; `circbuffer` → `vt` → `draw` → present; each tick `readPTY` (EOF or EAGAIN+1/hz) while pumping X so keys are not deferred until after the echo; drain the Xlib queue (no 32-event bail); wheel → mouse report (1000/1002/1003), alt-screen arrows, or primary history view; Ctrl+Shift+V / Shift+Insert / middle-click paste (bracketed if DECSET 2004); inner pad from `[general] pad` (default 14); CLI `-e`/`--` command, `--class=`, `--title=`, `--working-directory=` (xdg-terminal-exec)
+- `main.zig` — window + PTY + fonts; `circbuffer` → `vt` → `draw` → present; each tick `readPTY` (EOF or EAGAIN+1/hz) while pumping X so keys are not deferred until after the echo; drain the Xlib queue (no 32-event bail); wheel → mouse report (1000/1002/1003), alt-screen arrows, or primary history view; Ctrl+Shift+V / Shift+Insert / middle-click paste (bracketed if DECSET 2004); inner pad from `[general] pad` (default 14), scaled by Wayland output scale; font/pad/cells use CSS 96 DPI × Hyprland/`GDK_SCALE` multiplier (not X11 mm-DPI) and re-apply on focus/resize; CLI `-e`/`--` command, `--class=`, `--title=`, `--working-directory=` (xdg-terminal-exec)
 
 # Bench
 - `zig build bench` — `src/bench.zig`, ReleaseFast firehose truncate + last-N vs all-ring parse/VT timings.
