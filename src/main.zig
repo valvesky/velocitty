@@ -514,10 +514,51 @@ fn writePaste(pty: *Platform.Pty, term: *const VtState, allocator: std.mem.Alloc
     if (term.flags.bracket_paste) pty.write("\x1b[201~");
 }
 
+const Cli = struct {
+    title: [:0]const u8 = "Velocitty",
+    class: [:0]const u8 = "velocitty",
+    cwd: ?[:0]const u8 = null,
+    cmd: []const [*:0]const u8 = &.{},
+};
+
+fn takePrefixed(arg: [:0]const u8, prefix: []const u8) ?[:0]const u8 {
+    if (!std.mem.startsWith(u8, arg, prefix)) return null;
+    return arg[prefix.len..];
+}
+
+fn parseCli(argv: []const [*:0]const u8) Cli {
+    var cli: Cli = .{};
+    var i: usize = 1;
+    while (i < argv.len) : (i += 1) {
+        const a = std.mem.span(argv[i]);
+        if (std.mem.eql(u8, a, "-e") or std.mem.eql(u8, a, "--")) {
+            cli.cmd = argv[i + 1 ..];
+            break;
+        } else if (takePrefixed(a, "--class=")) |v| {
+            cli.class = v;
+        } else if (std.mem.eql(u8, a, "--class") and i + 1 < argv.len) {
+            i += 1;
+            cli.class = std.mem.span(argv[i]);
+        } else if (takePrefixed(a, "--title=")) |v| {
+            cli.title = v;
+        } else if (std.mem.eql(u8, a, "--title") and i + 1 < argv.len) {
+            i += 1;
+            cli.title = std.mem.span(argv[i]);
+        } else if (takePrefixed(a, "--working-directory=")) |v| {
+            cli.cwd = v;
+        } else if (std.mem.eql(u8, a, "--working-directory") and i + 1 < argv.len) {
+            i += 1;
+            cli.cwd = std.mem.span(argv[i]);
+        }
+    }
+    return cli;
+}
+
 pub fn main(init: std.process.Init.Minimal) !void {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+    const cli = parseCli(init.args.vector);
 
     // Empty environ makes fc-match ignore Omarchy's fonts.conf (and ~/.local/share/fonts).
     var io = std.Io.Threaded.init(allocator, .{ .environ = init.environ });
@@ -575,7 +616,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     const win_w = @as(u32, cols) * cell_w + 2 * pad_px;
     const win_h = @as(u32, rows) * cell_h + 2 * pad_px;
-    var window = try Platform.Window.open(allocator, "Velocitty", win_w, win_h);
+    var window = try Platform.Window.open(allocator, cli.title, cli.class, win_w, win_h);
     defer window.close();
 
     var frame = try Draw.Frame.init(allocator, @as(u32, cols) * cell_w, @as(u32, rows) * cell_h);
@@ -586,7 +627,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .rows = rows,
         .px_h = @intCast(win_h),
         .px_w = @intCast(win_w),
-    });
+    }, .{ .argv = cli.cmd, .cwd = if (cli.cwd) |d| d.ptr else null });
     defer pty.close();
 
     const x_fd = window.eventFd();

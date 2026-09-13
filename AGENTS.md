@@ -30,8 +30,8 @@
 - `loop.zig` — stub (no xev)
 - `select.zig` — cell-stream selection over `vt.VtState`
 - `kitty.zig` — kitty graphics (APC G: stream + file/temp, `a=q` OK replies for icat)
-- `platform/` — window / PTY (Linux/X11 + XInput2); PTY child env `TERM=xterm-kitty`, `KITTY_WINDOW_ID`, `COLORTERM=truecolor`; wheel from Button4/5 and XI2 scroll valuators (XWayland trackpads)
-- `main.zig` — window + PTY + fonts; `circbuffer` → `vt` → `draw` → present; each tick `readPTY` (EOF or EAGAIN+1/hz) while pumping X so keys are not deferred until after the echo; drain the Xlib queue (no 32-event bail); wheel → mouse report (1000/1002/1003), alt-screen arrows, or primary history view; Ctrl+Shift+V / Shift+Insert / middle-click paste (bracketed if DECSET 2004); inner pad from `[general] pad` (default 14)
+- `platform/` — window / PTY (Linux/X11 + XInput2); `XSetClassHint` from `--class`; PTY child is `$SHELL` or `-e` argv (`execvpe`); child env `TERM=xterm-kitty`, `KITTY_WINDOW_ID`, `COLORTERM=truecolor`; wheel from Button4/5 and XI2 scroll valuators (XWayland trackpads)
+- `main.zig` — window + PTY + fonts; `circbuffer` → `vt` → `draw` → present; each tick `readPTY` (EOF or EAGAIN+1/hz) while pumping X so keys are not deferred until after the echo; drain the Xlib queue (no 32-event bail); wheel → mouse report (1000/1002/1003), alt-screen arrows, or primary history view; Ctrl+Shift+V / Shift+Insert / middle-click paste (bracketed if DECSET 2004); inner pad from `[general] pad` (default 14); CLI `-e`/`--` command, `--class=`, `--title=`, `--working-directory=` (xdg-terminal-exec)
 
 # Bench
 - `zig build bench` — `src/bench.zig`, ReleaseFast firehose truncate + last-N vs all-ring parse/VT timings.

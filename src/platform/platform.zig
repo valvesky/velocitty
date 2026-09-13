@@ -82,9 +82,9 @@ pub const Window = struct {
         else => @compileError("Unsupported operating system for platform layer"),
     };
 
-    pub fn open(allocator: std.mem.Allocator, title: []const u8, width: u32, height: u32) !Window {
+    pub fn open(allocator: std.mem.Allocator, title: [*:0]const u8, class: [*:0]const u8, width: u32, height: u32) !Window {
         var win: Window = undefined;
-        try win.impl.open(allocator, title, width, height);
+        try win.impl.open(allocator, title, class, width, height);
         return win;
     }
 
@@ -131,6 +131,12 @@ pub fn screenDpi() f32 {
 }
 
 
+/// Child process to run in the PTY. Empty `argv` means `$SHELL` (or `/bin/sh`).
+pub const Spawn = struct {
+    argv: []const [*:0]const u8 = &.{},
+    cwd: ?[*:0]const u8 = null,
+};
+
 /// Pseudo-terminal interface implemented by the platform backends.
 pub const Pty = struct {
     impl: PtyImpl,
@@ -140,9 +146,9 @@ pub const Pty = struct {
         else => @compileError("Unsupported operating system for PTY platform layer"),
     };
 
-    pub fn open(dims: Dimensions) !Pty {
+    pub fn open(dims: Dimensions, spawn: Spawn) !Pty {
         var pty: Pty = undefined;
-        try pty.impl.open(dims);
+        try pty.impl.open(dims, spawn);
         return pty;
     }
 

@@ -60,7 +60,7 @@ pub const Window = struct {
 
     gpa: std.mem.Allocator,
 
-    pub fn open(self: *Window, allocator: std.mem.Allocator, title: []const u8, width: u32, height: u32) !void {
+    pub fn open(self: *Window, allocator: std.mem.Allocator, title: [*:0]const u8, class: [*:0]const u8, width: u32, height: u32) !void {
         self.gpa = allocator;
         self.width = width;
         self.height = height;
@@ -100,7 +100,12 @@ pub const Window = struct {
         var protocols = [1]c.Atom{wm_delete};
         _ = c.XSetWMProtocols(display, win, &protocols, 1);
 
-        _ = c.XStoreName(display, win, title.ptr);
+        _ = c.XStoreName(display, win, title);
+        var class_hint = c.XClassHint{
+            .res_name = @constCast(class),
+            .res_class = @constCast(class),
+        };
+        _ = c.XSetClassHint(display, win, &class_hint);
         _ = c.XMapWindow(display, win);
 
         const gc = c.XCreateGC(display, win, 0, null);
@@ -548,12 +553,13 @@ fn translateKey(sym: c.KeySym) ?Platform.Event.KeyCode {
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+extern "c" fn execvpe(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) c_int;
 
 pub const Pty = struct {
     master: posix.fd_t,
     child: posix.pid_t,
 
-    pub fn open(self: *Pty, dims: Platform.Dimensions) !void {
+    pub fn open(self: *Pty, dims: Platform.Dimensions, spawn: Platform.Spawn) !void {
         const master_rc = linux.open("/dev/ptmx", .{
             .ACCMODE = .RDWR,
             .NOCTTY = true,
@@ -574,7 +580,6 @@ pub const Pty = struct {
 
         var path_buf: [64]u8 = undefined;
         const slave_path = std.fmt.bufPrintZ(&path_buf, "/dev/pts/{d}", .{ptn}) catch return error.OpenPty;
-        const shell = getShellPath();
         const ws = toWinsize(dims);
 
         const pid_rc = linux.fork();
@@ -600,7 +605,7 @@ pub const Pty = struct {
             _ = linux.dup2(slave, 2);
             if (slave > 2) _ = linux.close(slave);
 
-            execShell(shell);
+            execChild(spawn);
         }
 
         // Parent Process
@@ -653,7 +658,7 @@ fn getShellPath() [*:0]const u8 {
     return "/bin/sh";
 }
 
-fn execShell(shell: [*:0]const u8) noreturn {
+fn applyChildEnv() void {
     // kitty.zig implements the graphics protocol; advertise it so icat/nvim/etc. use APC G.
     _ = setenv("TERM", "xterm-kitty", 1);
     _ = setenv("COLORTERM", "truecolor", 1);
@@ -662,8 +667,24 @@ fn execShell(shell: [*:0]const u8) noreturn {
     const id = std.fmt.bufPrintZ(&id_buf, "{d}", .{linux.getpid()}) catch "1";
     _ = setenv("KITTY_WINDOW_ID", id, 1);
     _ = unsetenv("KITTY_LISTEN_ON");
-    const argv = [_:null]?[*:0]const u8{ shell, null };
+}
+
+fn execChild(spawn: Platform.Spawn) noreturn {
+    applyChildEnv();
+    if (spawn.cwd) |dir| {
+        if (linux.errno(linux.chdir(dir)) != .SUCCESS) linux.exit(127);
+    }
     const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
-    _ = std.c.execve(shell, &argv, envp);
-    std.process.exit(127);
+    if (spawn.argv.len == 0) {
+        const shell = getShellPath();
+        const argv = [_:null]?[*:0]const u8{ shell, null };
+        _ = std.c.execve(shell, &argv, envp);
+        linux.exit(127);
+    }
+    var buf: [64]?[*:0]const u8 = undefined;
+    if (spawn.argv.len >= buf.len) linux.exit(127);
+    for (spawn.argv, 0..) |a, i| buf[i] = a;
+    buf[spawn.argv.len] = null;
+    _ = execvpe(spawn.argv[0], @ptrCast(&buf), envp);
+    linux.exit(127);
 }
