@@ -45,8 +45,19 @@ Velocitty is a lightning-fast cross-platform terminal.
 
 ## Install
 
+### Releases
+
 See [releases](https://github.com/valvesky/velocitty/releases) tab.
 Unzip then copy to `/usr/bin`
+
+### By Building From Master
+
+Just clone the repo and run:
+```
+git clone https://github.com/valvesky/velocitty
+cd velocitty
+zig build install-usr
+```
 
 ## Config
 
@@ -55,13 +66,6 @@ Config file is `~/.config/velocitty/config.toml` and will be overwritten by omar
 See `example.config.toml` for an example config file.
 It's purposefully similar to `alacritty` in many ways.
 
-## Build
-
-Just clone the repo and run:
-```
-zig build release
-```
-The binary will be in `zig-out/`
 
 ## Supported Platforms 
 - [x] Linux (Wayland)

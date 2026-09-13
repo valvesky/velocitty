@@ -12,9 +12,11 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Main build step
+    // Main build step (optimize from -Doptimize / --release; default Debug).
     const exe = buildExeForTarget(b, target, optimize);
     b.installArtifact(exe);
+    b.installFile("velocitty.desktop", "share/applications/velocitty.desktop");
+    b.installFile("icon.png", "share/icons/hicolor/512x512/apps/velocitty.png");
 
     // Standard run step
     const run_cmd = b.addRunArtifact(exe);
@@ -57,6 +59,24 @@ pub fn build(b: *std.Build) void {
 
         release_step.dependOn(&install.step);
     }
+
+    // `install` is Zig's prefix step (zig-out by default). This one is the
+    // host ReleaseFast copy to /usr so it shows up on PATH and the Omarchy menu.
+    // Privilege: sudo when stdin is a TTY, pkexec (polkit dialog) otherwise.
+    const host_target = b.resolveTargetQuery(.{});
+    const usr_exe = buildExeForTarget(b, host_target, .ReleaseFast);
+    const usr_cmd = b.addSystemCommand(&.{"bash"});
+    usr_cmd.addFileArg(b.path("scripts/install-usr.sh"));
+    usr_cmd.addArtifactArg(usr_exe);
+    usr_cmd.addFileArg(b.path("velocitty.desktop"));
+    usr_cmd.addFileArg(b.path("icon.png"));
+    usr_cmd.stdio = .inherit;
+    usr_cmd.has_side_effects = true;
+    usr_cmd.disable_zig_progress = true;
+    usr_cmd.setName("install-usr");
+
+    const usr_step = b.step("install-usr", "Build ReleaseFast for the host and install to /usr (sudo/pkexec)");
+    usr_step.dependOn(&usr_cmd.step);
 }
 
 fn canLinkReleaseTarget(b: *std.Build, target: std.Build.ResolvedTarget) bool {

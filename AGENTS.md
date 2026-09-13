@@ -8,6 +8,10 @@
 # Release
 - `zig build release` builds ReleaseFast for host-linkable Linux triples only (same arch/abi, needs X11).
 
+# Install
+- `zig build` / `zig build install` is Zig's prefix install (default `zig-out/`: binary, `velocitty.desktop`, icon).
+- `zig build install-usr` builds ReleaseFast for the host and installs `/usr/bin/velocitty`, `/usr/share/applications/velocitty.desktop`, and the hicolor icon so it appears in the Omarchy app menu. Uses `sudo` when stdin is a TTY, otherwise `pkexec`.
+
 # Code Base
 - Read files only when necessary. Use `grep` or `rg` if you only need a specific function.
 - `simd.zig` — SIMD utilities.
