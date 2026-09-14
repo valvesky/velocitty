@@ -5,15 +5,15 @@
 - [ ] Last-column flag (LCF) wrap / BS
 - [ ] HT writing a tab glyph + spaces to the next stop (we only move the cursor)
 
-## CSI — SGR / cells
+## CSI - SGR / cells
 - [ ] Styled underlines drawn (double / curly / dotted / dashed); style is stored, render is single
 - [ ] Underline color (SGR 58/59) on cells; pen only
 - [ ] Reverse video (DECSCNM 5) applied at draw
 - [ ] ED 3 erase scrollback
 - [ ] Grapheme clustering (mode 2027)
 
-## CSI — modes / reports
-- [ ] X10 / hilite / UTF-8 mouse (9, 1001, 1005) — foot also skips these
+## CSI - modes / reports
+- [ ] X10 / hilite / UTF-8 mouse (9, 1001, 1005) - foot also skips these
 - [ ] Mouse reports themselves (modes 1000/1002/1003/1006/1015/1016 are stored only)
 - [ ] Focus in/out (`CSI I` / `CSI O`) when mode 1004 is on
 - [ ] Theme-change reports (2031)

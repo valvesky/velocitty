@@ -282,23 +282,26 @@ pub const VtState = struct {
     pub fn resize(self: *VtState, cols: u16, rows: u16) !void {
         if (cols == 0 or rows == 0) return;
         if (cols == self.cols and rows == self.rows) return;
-        const allocator = self.allocator;
-        const storage = self.storage;
-        const scrollback = self.grids[0].cap;
-        const scheme = self.scheme;
-        const orig = self.orig;
-        const cell_px_w = self.cell_px_w;
-        const cell_px_h = self.cell_px_h;
-        const next = try VtState.init(allocator, cols, rows, scrollback, storage);
-        self.deinit();
-        self.* = next;
-        self.scheme = scheme;
-        self.orig = orig;
-        self.cell_px_w = cell_px_w;
-        self.cell_px_h = cell_px_h;
-        self.initTable();
-        self.grids[0].reset(cols, rows, scheme);
-        self.grids[1].reset(cols, rows, scheme);
+        const old_cols = self.cols;
+        const old_rows = self.rows;
+        try self.grids[0].resize(self.allocator, old_cols, old_rows, cols, rows, self.grids[0].cap);
+        try self.grids[1].resize(self.allocator, old_cols, old_rows, cols, rows, rows);
+
+        const dirty_len = (rows + 63) / 64;
+        if (dirty_len != self.line_dirty.len) {
+            self.line_dirty = try self.allocator.realloc(self.line_dirty, dirty_len);
+        }
+        const tab_len = (@as(usize, cols) + 63) / 64;
+        if (tab_len != self.tabs.len) {
+            self.tabs = try self.allocator.realloc(self.tabs, tab_len);
+            defaultTabs(self.tabs, cols);
+        } else if (cols != old_cols) {
+            defaultTabs(self.tabs, cols);
+        }
+
+        self.cols = cols;
+        self.rows = rows;
+        self.markDirtyAll();
     }
 
     pub inline fn markDirty(self: *VtState, row: u16) void {
@@ -1550,4 +1553,21 @@ test "decaln" {
     Esc.dispatch(&vt, "\x1b#8");
     try std.testing.expectEqual(@as(u21, 'E'), vt.grid().cellAt(0, 0).codepoint);
     try std.testing.expectEqual(@as(u21, 'E'), vt.grid().cellAt(1, 3).codepoint);
+}
+
+test "resize keeps cells" {
+    var dummy: [1]u8 = .{0};
+    var vt = try VtState.init(std.testing.allocator, 4, 2, 8, &dummy);
+    defer vt.deinit();
+    vt.printCodepoint('A');
+    vt.printCodepoint('B');
+    try vt.resize(6, 3);
+    try std.testing.expectEqual(@as(u16, 6), vt.cols);
+    try std.testing.expectEqual(@as(u16, 3), vt.rows);
+    try std.testing.expectEqual(@as(u21, 'A'), vt.grid().cellAt(0, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, 'B'), vt.grid().cellAt(0, 1).codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), vt.grid().cellAt(0, 4).codepoint);
+    try vt.resize(3, 2);
+    try std.testing.expectEqual(@as(u21, 'A'), vt.grid().cellAt(0, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, 'B'), vt.grid().cellAt(0, 1).codepoint);
 }

@@ -57,6 +57,8 @@ pub const Event = union(enum) {
     paste: []const u8,
     text_input: [32]u8, // UTF-8 encoded text stream from OS IME/Keyboard
     resize: Dimensions,
+    /// Window contents were lost (Expose) or need a full present.
+    redraw,
     focus_gained,
     focus_lost,
     quit,

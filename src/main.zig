@@ -321,6 +321,42 @@ fn syncGrid(
     }
 }
 
+fn layoutIfNeeded(
+    need_layout: *bool,
+    need_draw: *bool,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    config: Scheme.Config,
+    scale: *f32,
+    size_px: *f32,
+    type_ptr: ?*TypeCtx,
+    cell_w: *u32,
+    cell_h: *u32,
+    pad_px: *u32,
+    eloop: *EventLoop,
+    window: *Platform.Window,
+    term: *VtState,
+    frame: *Draw.Frame,
+    pty: *Platform.Pty,
+    cols: *u16,
+    rows: *u16,
+) void {
+    if (!need_layout.*) return;
+    const next_scale = uiScaleCached(io, allocator, false);
+    if (scaleChanged(next_scale, scale.*)) {
+        scale.* = next_scale;
+        size_px.* = fontPixels(config, scale.*);
+        applyMetrics(type_ptr, size_px.*, scale.*, config.pad_px, cell_w, cell_h, pad_px);
+        eloop.cell_w = cell_w.*;
+        eloop.cell_h = cell_h.*;
+        eloop.pad_px = pad_px.*;
+        frame.invalidate();
+    }
+    syncGrid(window, term, frame, pty, cols, rows, cell_w.*, cell_h.*, pad_px.*);
+    need_layout.* = false;
+    need_draw.* = true;
+}
+
 fn loadConfig(io: std.Io, gpa: std.mem.Allocator) Scheme.Config {
     return Scheme.load(io, gpa);
 }
@@ -506,6 +542,7 @@ const EventLoop = struct {
                 self.need_layout.* = true;
                 self.need_draw.* = true;
             },
+            .redraw => self.need_draw.* = true,
             .focus_gained => self.need_layout.* = true,
             .key_press => |k| {
                 const bytes = encodeKey(k.key, k.mods, self.term.flags.app_cursor);
@@ -754,21 +791,28 @@ pub fn main(init: std.process.Init.Minimal) !void {
             eloop.cell_w = cell_w;
             eloop.cell_h = cell_h;
             eloop.pad_px = pad_px;
-        } else if (need_layout) {
-            const next_scale = uiScaleCached(io.io(), allocator, false);
-            if (scaleChanged(next_scale, scale)) {
-                scale = next_scale;
-                size_px = fontPixels(config, scale);
-                applyMetrics(type_ptr, size_px, scale, config.pad_px, &cell_w, &cell_h, &pad_px);
-                eloop.cell_w = cell_w;
-                eloop.cell_h = cell_h;
-                eloop.pad_px = pad_px;
-                frame.invalidate();
-            }
-            syncGrid(&window, &term, &frame, &pty, &cols, &rows, cell_w, cell_h, pad_px);
-            need_layout = false;
-            need_draw = true;
         }
+
+        layoutIfNeeded(
+            &need_layout,
+            &need_draw,
+            io.io(),
+            allocator,
+            config,
+            &scale,
+            &size_px,
+            type_ptr,
+            &cell_w,
+            &cell_h,
+            &pad_px,
+            &eloop,
+            &window,
+            &term,
+            &frame,
+            &pty,
+            &cols,
+            &rows,
+        );
 
         var hangup = false;
         circbuffer.readPTYPump(pty_fd, hz, .{
@@ -778,6 +822,27 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }) catch {
             hangup = true;
         };
+
+        layoutIfNeeded(
+            &need_layout,
+            &need_draw,
+            io.io(),
+            allocator,
+            config,
+            &scale,
+            &size_px,
+            type_ptr,
+            &cell_w,
+            &cell_h,
+            &pad_px,
+            &eloop,
+            &window,
+            &term,
+            &frame,
+            &pty,
+            &cols,
+            &rows,
+        );
 
         if (circbuffer.pending()) {
             const runs = circbuffer.consumeAndGetRuns(std.math.maxInt(usize));

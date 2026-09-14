@@ -96,6 +96,70 @@ pub const Grid = struct {
         allocator.free(self.starts);
     }
 
+    /// Compact the ring onto a new cell buffer. Scrollback is kept; extra columns
+    /// and rows are blank. `min_cap` is the smallest ring to allocate (primary
+    /// scrollback, or `new_rows` for the alt screen).
+    pub fn resize(
+        self: *Grid,
+        allocator: std.mem.Allocator,
+        old_cols: u16,
+        old_rows: u16,
+        new_cols: u16,
+        new_rows: u16,
+        min_cap: u32,
+    ) std.mem.Allocator.Error!void {
+        assert(new_cols > 0 and new_rows > 0);
+        const hist = self.used -| @as(u32, old_rows);
+        const keep_screen = @min(@as(u32, old_rows), @as(u32, new_rows));
+        const new_cap = @max(min_cap, hist + new_rows);
+
+        const new_cells = try allocator.alloc(Cell, @as(usize, new_cols) * new_cap);
+        errdefer allocator.free(new_cells);
+        const blank = Cell{ .fg = self.fg, .bg = self.bg, .codepoint = ' ' };
+        @memset(new_cells, blank);
+
+        const new_starts = try allocator.alloc(u32, new_cap);
+        errdefer allocator.free(new_starts);
+        for (new_starts, 0..) |*s, i| s.* = @intCast(i * @as(u32, new_cols));
+
+        const copy_cols = @min(old_cols, new_cols);
+        const oldest = (self.head + self.cap - hist) % self.cap;
+        var n: u32 = 0;
+        while (n < hist + keep_screen) : (n += 1) {
+            const src_idx = (oldest + n) % self.cap;
+            const src_off = self.starts[src_idx];
+            const dst_off = new_starts[n];
+            @memcpy(
+                new_cells[dst_off .. dst_off + copy_cols],
+                self.cells[src_off .. src_off + copy_cols],
+            );
+        }
+
+        allocator.free(self.cells);
+        allocator.free(self.starts);
+        self.cells = new_cells;
+        self.starts = new_starts;
+        self.cap = new_cap;
+        self.head = hist;
+        self.used = hist + new_rows;
+        self.scroll = @min(self.scroll, hist);
+        self.cursor.row = @min(self.cursor.row, new_rows - 1);
+        self.cursor.col = @min(self.cursor.col, new_cols - 1);
+        self.saved_cursor.row = @min(self.saved_cursor.row, new_rows - 1);
+        self.saved_cursor.col = @min(self.saved_cursor.col, new_cols - 1);
+
+        if (self.scroll_top == 0 and self.scroll_bottom + 1 == old_rows) {
+            self.scroll_bottom = new_rows - 1;
+        } else {
+            if (self.scroll_top >= new_rows) self.scroll_top = 0;
+            if (self.scroll_bottom >= new_rows) self.scroll_bottom = new_rows - 1;
+            if (self.scroll_top > self.scroll_bottom) {
+                self.scroll_top = 0;
+                self.scroll_bottom = new_rows - 1;
+            }
+        }
+    }
+
     pub fn reset(self: *Grid, cols: u16, rows: u16, scheme: Scheme) void {
         @memset(self.cells, Cell{ .fg = scheme.fg, .bg = scheme.bg });
         for (self.starts, 0..) |*s, i| {

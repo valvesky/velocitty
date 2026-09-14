@@ -92,6 +92,7 @@ pub const Window = struct {
                 c.KeyReleaseMask |
                 c.ButtonPressMask |
                 c.StructureNotifyMask |
+                c.ExposureMask |
                 c.FocusChangeMask,
         );
 
@@ -204,18 +205,24 @@ pub const Window = struct {
                     }
                 },
                 c.ConfigureNotify => {
-                    const new_w: u16 = @intCast(xev.xconfigure.width);
-                    const new_h: u16 = @intCast(xev.xconfigure.height);
+                    const new_w: u32 = @intCast(xev.xconfigure.width);
+                    const new_h: u32 = @intCast(xev.xconfigure.height);
+                    if (new_w == 0 or new_h == 0) continue;
                     if (new_w != self.width or new_h != self.height) {
                         self.resizeFramebuffer(new_w, new_h) catch {};
                         ev.* = .{ .resize = .{
-                            .cols = @intCast(new_w / 8),
-                            .rows = @intCast(new_h / 16),
-                            .px_w = new_w,
-                            .px_h = new_h,
+                            .cols = @intCast(@max(1, new_w / 8)),
+                            .rows = @intCast(@max(1, new_h / 16)),
+                            .px_w = @intCast(@min(new_w, std.math.maxInt(u16))),
+                            .px_h = @intCast(@min(new_h, std.math.maxInt(u16))),
                         } };
                         return true;
                     }
+                },
+                c.Expose => {
+                    if (xev.xexpose.count != 0) continue;
+                    ev.* = .redraw;
+                    return true;
                 },
                 c.KeyPress => {
                     var buf: [32]u8 = undefined;
@@ -313,33 +320,15 @@ pub const Window = struct {
 
     fn resizeFramebuffer(self: *Window, w: u32, h: u32) !void {
         if (w == 0 or h == 0) return;
-
-        self.gpa.free(self.framebuffer.pixels);
-        self.image.data = null;
-        if (self.image.f.destroy_image) |destroy_fn| {
-            _ = destroy_fn(self.image);
-        }
+        if (w == self.width and h == self.height) return;
 
         const pixels = try self.gpa.alloc(u32, w * h);
-        const screen = c.XDefaultScreen(self.display);
-        const visual = c.XDefaultVisual(self.display, screen);
-        const depth = c.XDefaultDepth(self.display, screen);
-
-        const image_ptr = c.XCreateImage(
-            self.display,
-            visual,
-            @intCast(depth),
-            c.ZPixmap,
-            0,
-            @ptrCast(pixels.ptr),
-            w,
-            h,
-            32,
-            0,
-        );
-
-        self.image = image_ptr orelse return error.ImageCreationFailed;
-
+        @memset(pixels, 0);
+        const old = self.framebuffer.pixels;
+        self.image.data = @ptrCast(pixels.ptr);
+        self.image.width = @intCast(w);
+        self.image.height = @intCast(h);
+        self.image.bytes_per_line = @intCast(w * @sizeOf(u32));
         self.width = w;
         self.height = h;
         self.framebuffer = .{
@@ -348,6 +337,7 @@ pub const Window = struct {
             .height = h,
             .stride = w,
         };
+        self.gpa.free(old);
     }
 };
 
