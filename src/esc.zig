@@ -21,7 +21,7 @@ pub fn dispatch(vt: *Vt, bytes: []const u8) void {
     switch (seq.cmd) {
         'D' => vt.index(),
         'E' => {
-            vt.grid().cursor.col = 0;
+            vt.carriageReturn();
             vt.index();
         },
         'H' => vt.setTab(),

@@ -177,24 +177,24 @@ fn applyAnsi(final: u8, params: []const Param, vt: *Vt) void {
         'D' => vt.cub(n1),
         'E' => {
             vt.cud(n1);
-            vt.grid().cursor.col = 0;
+            vt.carriageReturn();
         },
         'F' => {
             vt.cuu(n1);
-            vt.grid().cursor.col = 0;
+            vt.carriageReturn();
         },
         'g' => vt.tabClear(p0),
-        '`', 'G' => vt.grid().cursor.col = @min(n1 -| 1, vt.cols - 1),
+        '`', 'G' => vt.setCol(n1 -| 1),
         'f', 'H' => vt.cup(n1, sat16(pget(params, 1, 1))),
         'J' => vt.ed(p0),
         'K' => vt.el(p0),
         'L' => {
             vt.il(n1);
-            vt.grid().cursor.col = 0;
+            vt.carriageReturn();
         },
         'M' => {
             vt.dl(n1);
-            vt.grid().cursor.col = 0;
+            vt.carriageReturn();
         },
         'P' => vt.dch(n1),
         '@' => vt.ich(n1),
@@ -352,7 +352,8 @@ fn windowOp(params: []const Param, vt: *Vt) void {
 
 fn respondCursor(vt: *Vt) void {
     const row = vt.cursorReportRow();
-    vt.respondFmt("\x1b[{d};{d}R", .{ row, vt.grid().cursor.col + 1 });
+    const col = @min(vt.grid().cursor.col, vt.cols - 1) + 1;
+    vt.respondFmt("\x1b[{d};{d}R", .{ row, col });
 }
 
 fn copyParams(params: []const Param, buf: *[16]u32) []const u32 {

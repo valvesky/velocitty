@@ -76,9 +76,6 @@ It's purposefully similar to `alacritty` in many ways.
 ## Shoutouts
 - [st](https://st.suckless.org) --- how to suck less
 - [refterm](https://github.com/cmuratori/refterm) --- how to black magic
-- [kitty](https://sw.kovidgoyal.net/kitty/) — how to meow
+- [kitty](https://sw.kovidgoyal.net/kitty/) --- how to meow
 - [ghostty](https://ghostty.org) --- how to render glyph good
 - [foot](https://codeberg.org/dnkl/foot) --- how to vt parsing good
-
----
-

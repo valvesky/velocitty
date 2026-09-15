@@ -333,16 +333,30 @@ pub const VtState = struct {
         self.respond(resp);
     }
 
+    fn doWrap(self: *VtState) void {
+        var g = self.grid();
+        g.wrap_pending = false;
+        g.setRowWrap(g.cursor.row, true);
+        g.cursor.col = 0;
+        self.index();
+    }
+
     pub fn printCodepoint(self: *VtState, cp: u21) void {
         const mapped = self.mapCp(cp);
         var width: u16 = @max(1, EastAsian.cellWidth(mapped));
         var g = self.grid();
 
+        if (g.wrap_pending) {
+            g.wrap_pending = false;
+            if (self.flags.auto_wrap) {
+                self.doWrap();
+                g = self.grid();
+            }
+        }
+
         if (g.cursor.col >= self.cols) {
             if (self.flags.auto_wrap) {
-                g.setRowWrap(g.cursor.row, true);
-                g.cursor.col = 0;
-                self.index();
+                self.doWrap();
                 g = self.grid();
             } else {
                 g.cursor.col = self.cols - 1;
@@ -352,9 +366,7 @@ pub const VtState = struct {
 
         if (width == 2 and g.cursor.col + 1 >= self.cols) {
             if (self.flags.auto_wrap and g.cursor.col != 0) {
-                g.setRowWrap(g.cursor.row, true);
-                g.cursor.col = 0;
-                self.index();
+                self.doWrap();
                 g = self.grid();
             }
             if (g.cursor.col + 1 >= self.cols) width = 1;
@@ -362,6 +374,7 @@ pub const VtState = struct {
 
         if (self.flags.insert_mode) self.ich(width);
         g = self.grid();
+        if (g.cursor.col >= self.cols) g.cursor.col = self.cols - 1;
 
         const attrs = self.paintAttrs();
         const slot = g.getCell(g.cursor.row, g.cursor.col);
@@ -381,6 +394,12 @@ pub const VtState = struct {
         }
         self.markDirty(g.cursor.row);
         g.cursor.col += width;
+        if (g.cursor.col >= self.cols) {
+            g.cursor.col = self.cols - 1;
+            g.wrap_pending = self.flags.auto_wrap;
+        } else {
+            g.wrap_pending = false;
+        }
         self.last_cp = mapped;
     }
 
@@ -422,12 +441,14 @@ pub const VtState = struct {
             row = @min(self.rows - 1, row);
         }
 
+        g.wrap_pending = false;
         g.cursor.row = row;
         g.cursor.col = @min(self.cols - 1, col);
     }
 
     pub fn cuu(self: *VtState, count: u16) void {
         const g = self.grid();
+        g.wrap_pending = false;
         const top = if (self.flags.origin_mode) g.scroll_top else 0;
         const n = @min(count, g.cursor.row -| top);
         g.cursor.row -= n;
@@ -435,6 +456,7 @@ pub const VtState = struct {
 
     pub fn cud(self: *VtState, count: u16) void {
         const g = self.grid();
+        g.wrap_pending = false;
         const bot = if (self.flags.origin_mode) g.scroll_bottom else self.rows - 1;
         const n = @min(count, bot -| g.cursor.row);
         g.cursor.row += n;
@@ -442,12 +464,26 @@ pub const VtState = struct {
 
     pub fn cuf(self: *VtState, count: u16) void {
         const g = self.grid();
+        g.wrap_pending = false;
         g.cursor.col = @min(self.cols - 1, g.cursor.col +| count);
     }
 
     pub fn cub(self: *VtState, count: u16) void {
         const g = self.grid();
+        g.wrap_pending = false;
         g.cursor.col = g.cursor.col -| count;
+    }
+
+    pub fn setCol(self: *VtState, col: u16) void {
+        const g = self.grid();
+        g.wrap_pending = false;
+        g.cursor.col = @min(col, self.cols - 1);
+    }
+
+    pub fn carriageReturn(self: *VtState) void {
+        const g = self.grid();
+        g.wrap_pending = false;
+        g.cursor.col = 0;
     }
 
     pub fn tab(self: *VtState) void {
@@ -460,6 +496,7 @@ pub const VtState = struct {
 
     pub fn tabForward(self: *VtState, count: u16) void {
         const g = self.grid();
+        g.wrap_pending = false;
         var col = g.cursor.col;
         var left = count;
         var c = col + 1;
@@ -475,6 +512,7 @@ pub const VtState = struct {
 
     pub fn tabBackN(self: *VtState, count: u16) void {
         const g = self.grid();
+        g.wrap_pending = false;
         var col = g.cursor.col;
         var left = count;
         if (col == 0) return;
@@ -504,6 +542,10 @@ pub const VtState = struct {
 
     pub fn backspace(self: *VtState) void {
         const g = self.grid();
+        if (g.wrap_pending) {
+            g.wrap_pending = false;
+            return;
+        }
         if (g.cursor.col == 0) {
             if (self.flags.reverse_wrap and self.flags.auto_wrap) {
                 if (g.cursor.row > g.scroll_top) {
@@ -518,12 +560,14 @@ pub const VtState = struct {
 
     pub fn goHome(self: *VtState) void {
         const g = self.grid();
+        g.wrap_pending = false;
         g.cursor.col = 0;
         g.cursor.row = if (self.flags.origin_mode) g.scroll_top else 0;
     }
 
     pub fn index(self: *VtState) void {
         const g = self.grid();
+        g.wrap_pending = false;
         if (g.cursor.row == g.scroll_bottom) {
             self.regionScrollUp(1);
         } else if (g.cursor.row + 1 < self.rows) {
@@ -533,6 +577,7 @@ pub const VtState = struct {
 
     pub fn reverseIndex(self: *VtState) void {
         const g = self.grid();
+        g.wrap_pending = false;
         if (g.cursor.row == g.scroll_top) {
             self.regionScrollDown(1);
         } else if (g.cursor.row > 0) {
@@ -666,7 +711,10 @@ pub const VtState = struct {
         const g = self.grid();
         g.restoreCursor();
         if (g.cursor.row >= self.rows) g.cursor.row = self.rows - 1;
-        if (g.cursor.col >= self.cols) g.cursor.col = self.cols - 1;
+        if (g.cursor.col >= self.cols) {
+            g.cursor.col = self.cols - 1;
+            g.wrap_pending = false;
+        }
     }
 
     pub fn resetPen(self: *VtState) void {
@@ -812,7 +860,9 @@ pub const VtState = struct {
         self.last_cp = ' ';
         self.resetPen();
         const g = self.grid();
+        g.wrap_pending = false;
         g.saved_cursor = .{};
+        g.saved_wrap_pending = false;
         g.saved_fg = self.scheme.fg;
         g.saved_bg = self.scheme.bg;
         g.saved_attrs = .{};
@@ -1584,6 +1634,86 @@ test "print wraps to next line" {
     try std.testing.expectEqual(@as(u21, 'E'), vt.grid().cellAt(1, 0).codepoint);
     try std.testing.expectEqual(@as(u21, 'H'), vt.grid().cellAt(1, 3).codepoint);
     try std.testing.expectEqual(@as(u8, 1), vt.grid().wraps[(vt.grid().head + 0) % vt.grid().cap]);
+}
+
+test "lcf stays on last column until next char" {
+    var dummy: [1]u8 = .{0};
+    var vt = try VtState.init(std.testing.allocator, 4, 3, 8, &dummy);
+    defer vt.deinit();
+    for ("ABCD") |b| vt.printCodepoint(b);
+    try std.testing.expectEqual(@as(u16, 0), vt.grid().cursor.row);
+    try std.testing.expectEqual(@as(u16, 3), vt.grid().cursor.col);
+    try std.testing.expect(vt.grid().wrap_pending);
+    try std.testing.expectEqual(@as(u21, 'A'), vt.grid().cellAt(0, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, 'D'), vt.grid().cellAt(0, 3).codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), vt.grid().cellAt(1, 0).codepoint);
+    vt.printCodepoint('E');
+    try std.testing.expectEqual(@as(u16, 1), vt.grid().cursor.row);
+    try std.testing.expectEqual(@as(u16, 1), vt.grid().cursor.col);
+    try std.testing.expect(!vt.grid().wrap_pending);
+    try std.testing.expectEqual(@as(u21, 'E'), vt.grid().cellAt(1, 0).codepoint);
+    try std.testing.expectEqual(@as(u8, 1), vt.grid().wraps[(vt.grid().head + 0) % vt.grid().cap]);
+}
+
+test "lcf newline does not wrap twice" {
+    var dummy: [1]u8 = .{0};
+    var vt = try VtState.init(std.testing.allocator, 4, 4, 8, &dummy);
+    defer vt.deinit();
+    for ("ABCD") |b| vt.printCodepoint(b);
+    C0.dispatch(&vt, 0x0D);
+    C0.dispatch(&vt, 0x0A);
+    vt.printCodepoint('E');
+    try std.testing.expectEqual(@as(u21, 'A'), vt.grid().cellAt(0, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, 'D'), vt.grid().cellAt(0, 3).codepoint);
+    try std.testing.expectEqual(@as(u21, 'E'), vt.grid().cellAt(1, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), vt.grid().cellAt(2, 0).codepoint);
+    try std.testing.expectEqual(@as(u16, 1), vt.grid().cursor.row);
+    try std.testing.expectEqual(@as(u16, 1), vt.grid().cursor.col);
+}
+
+test "lcf cpr reports last column" {
+    var dummy: [1]u8 = .{0};
+    var vt = try VtState.init(std.testing.allocator, 4, 2, 8, &dummy);
+    defer vt.deinit();
+    for ("ABCD") |b| vt.printCodepoint(b);
+    applyCsi(&vt, "\x1b[6n");
+    try std.testing.expectEqualStrings("\x1b[1;4R", vt.reply.items);
+}
+
+test "wrap at bottom does not duplicate line" {
+    var dummy: [1]u8 = .{0};
+    var vt = try VtState.init(std.testing.allocator, 4, 2, 8, &dummy);
+    defer vt.deinit();
+    for ("AABBCCDDEE") |b| vt.printCodepoint(b);
+    try std.testing.expectEqual(@as(u21, 'C'), vt.grid().cellAt(0, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, 'D'), vt.grid().cellAt(0, 3).codepoint);
+    try std.testing.expectEqual(@as(u21, 'E'), vt.grid().cellAt(1, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, 'E'), vt.grid().cellAt(1, 1).codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), vt.grid().cellAt(1, 2).codepoint);
+}
+
+test "full line crlf at bottom does not duplicate" {
+    var dummy: [1]u8 = .{0};
+    var vt = try VtState.init(std.testing.allocator, 4, 2, 8, &dummy);
+    defer vt.deinit();
+    for ("AABB") |b| vt.printCodepoint(b);
+    C0.dispatch(&vt, 0x0D);
+    C0.dispatch(&vt, 0x0A);
+    for ("CCDD") |b| vt.printCodepoint(b);
+    try std.testing.expectEqual(@as(u21, 'A'), vt.grid().cellAt(0, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, 'B'), vt.grid().cellAt(0, 3).codepoint);
+    try std.testing.expectEqual(@as(u21, 'C'), vt.grid().cellAt(1, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, 'D'), vt.grid().cellAt(1, 3).codepoint);
+}
+
+test "lcf backspace does not leave last column" {
+    var dummy: [1]u8 = .{0};
+    var vt = try VtState.init(std.testing.allocator, 4, 2, 8, &dummy);
+    defer vt.deinit();
+    for ("ABCD") |b| vt.printCodepoint(b);
+    vt.backspace();
+    try std.testing.expectEqual(@as(u16, 3), vt.grid().cursor.col);
+    try std.testing.expect(!vt.grid().wrap_pending);
 }
 
 test "resize reflows wrapped lines" {

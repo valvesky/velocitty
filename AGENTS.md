@@ -18,8 +18,8 @@
 - `simd.zig` — SIMD utilities.
 - `circbuffer.zig` — mirrored firehose buffer; `readPTY` (EOF or EAGAIN + 1/hz); SIMD line split + run split
 - `vt.zig` — minimal-state emulator; `feedRuns` routes C0/C1/ESC/CSI/OSC/DCS/kitty
-- `grid.zig` — cell buffer, cursor, scroll region, insert/delete; primary reflow on column resize (soft-wrap flags)
-- `c0.zig` / `c1.zig` — C0/C1 dispatch (BS reverse-wrap)
+- `grid.zig` — cell buffer, cursor, last-column flag (`wrap_pending`), scroll region, insert/delete; primary reflow on column resize (soft-wrap flags)
+- `c0.zig` / `c1.zig` — C0/C1 dispatch (BS reverse-wrap; LCF delayed DECAWM wrap)
 - `esc.zig` — ESC parse + charset G0–G3 / RIS / HTS / DECALN / SS2/SS3
 - `csi.zig` — CSI parse (`;` params, `:` subparams, packed privates) + apply (foot ctlseqs: SGR, CUP, DECSET, DECRQM, rectangular, kitty kbd, window ops, color stack)
 - `osc.zig` — OSC 0/2 title, 4/10–12/104/110–112 colors, OSC 8 hyperlinks

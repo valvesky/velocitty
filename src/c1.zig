@@ -6,7 +6,7 @@ pub fn dispatch(vt: *Vt, byte: u8) void {
     switch (byte) {
         0x84 => vt.index(), // IND
         0x85 => { // NEL
-            vt.grid().cursor.col = 0;
+            vt.carriageReturn();
             vt.index();
         },
         0x88 => {}, // HTS (fixed 8-col tabs)

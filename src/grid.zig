@@ -64,10 +64,13 @@ pub const Grid = struct {
     used: u32,
     scroll: u32 = 0,
     cursor: Cursor = .{},
+    /// Last-column flag (DECAWM delayed wrap). Cursor stays on the last cell.
+    wrap_pending: bool = false,
     fg: Color = Color.default_fg,
     bg: Color = Color.default_bg,
     attrs: Attrs = .{},
     saved_cursor: Cursor = .{},
+    saved_wrap_pending: bool = false,
     saved_fg: Color = Color.default_fg,
     saved_bg: Color = Color.default_bg,
     saved_attrs: Attrs = .{},
@@ -322,16 +325,20 @@ pub const Grid = struct {
             self.cursor.row = @min(self.cursor.row, new_rows - 1);
             self.cursor.col = @min(self.cursor.col, new_cols - 1);
         }
+        self.wrap_pending = false;
         self.saved_cursor.row = @min(self.saved_cursor.row, new_rows - 1);
         self.saved_cursor.col = @min(self.saved_cursor.col, new_cols - 1);
+        self.saved_wrap_pending = false;
         self.clampScrollRegion(old_rows, new_rows);
     }
 
     fn clampCursors(self: *Grid, new_cols: u16, new_rows: u16, old_rows: u16) void {
         self.cursor.row = @min(self.cursor.row, new_rows - 1);
         self.cursor.col = @min(self.cursor.col, new_cols - 1);
+        self.wrap_pending = false;
         self.saved_cursor.row = @min(self.saved_cursor.row, new_rows - 1);
         self.saved_cursor.col = @min(self.saved_cursor.col, new_cols - 1);
+        self.saved_wrap_pending = false;
         self.clampScrollRegion(old_rows, new_rows);
     }
 
@@ -358,10 +365,12 @@ pub const Grid = struct {
         self.used = rows;
         self.scroll = 0;
         self.cursor = .{};
+        self.wrap_pending = false;
         self.fg = scheme.fg;
         self.bg = scheme.bg;
         self.attrs = .{};
         self.saved_cursor = .{};
+        self.saved_wrap_pending = false;
         self.saved_fg = scheme.fg;
         self.saved_bg = scheme.bg;
         self.saved_attrs = .{};
@@ -527,6 +536,7 @@ pub const Grid = struct {
 
     pub fn saveCursor(self: *Grid) void {
         self.saved_cursor = self.cursor;
+        self.saved_wrap_pending = self.wrap_pending;
         self.saved_fg = self.fg;
         self.saved_bg = self.bg;
         self.saved_attrs = self.attrs;
@@ -534,6 +544,7 @@ pub const Grid = struct {
 
     pub fn restoreCursor(self: *Grid) void {
         self.cursor = self.saved_cursor;
+        self.wrap_pending = self.saved_wrap_pending;
         self.fg = self.saved_fg;
         self.bg = self.saved_bg;
         self.attrs = self.saved_attrs;

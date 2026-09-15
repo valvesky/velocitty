@@ -3,12 +3,13 @@
 - [X] No line wrap.
 - [X] When running a TUI like neovim, resizing breaks formatting. New portions of the screen are not drawn. Are we sending SIGWINCH ?
 - [X] SSH to another terminal break certain applications due to term info. 
+- [X] Line wrap will ocasionally repeat that line that wraps leading to duplicate text.
 
 # Escape Codes
 
 ## C0
 - [ ] BEL (bell action)
-- [ ] Last-column flag (LCF) wrap / BS
+- [X] Last-column flag (LCF) wrap / BS
 - [ ] HT writing a tab glyph + spaces to the next stop (we only move the cursor)
 
 ## CSI - SGR / cells
