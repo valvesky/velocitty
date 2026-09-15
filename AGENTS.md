@@ -18,7 +18,7 @@
 - `simd.zig` — SIMD utilities.
 - `circbuffer.zig` — mirrored firehose buffer; `readPTY` (EOF or EAGAIN + 1/hz); SIMD line split + run split
 - `vt.zig` — minimal-state emulator; `feedRuns` routes C0/C1/ESC/CSI/OSC/DCS/kitty
-- `grid.zig` — cell buffer, cursor, scroll region, insert/delete
+- `grid.zig` — cell buffer, cursor, scroll region, insert/delete; primary reflow on column resize (soft-wrap flags)
 - `c0.zig` / `c1.zig` — C0/C1 dispatch (BS reverse-wrap)
 - `esc.zig` — ESC parse + charset G0–G3 / RIS / HTS / DECALN / SS2/SS3
 - `csi.zig` — CSI parse (`;` params, `:` subparams, packed privates) + apply (foot ctlseqs: SGR, CUP, DECSET, DECRQM, rectangular, kitty kbd, window ops, color stack)
@@ -29,10 +29,10 @@
 - `scheme.zig` — TOML config (colors, font, hz, whitelist, pad); loads Omarchy current theme; font size from Alacritty, family from fontconfig `monospace` (`omarchy font`)
 - SIGUSR1/SIGUSR2 or Omarchy theme/font file change reloads colors and font in `main.zig` (`fc-match` needs process environ so HOME/fonts.conf apply)
 - `loop.zig` — stub (no xev)
-- `select.zig` — cell-stream selection over `vt.VtState`
+- `select.zig` — cell-stream selection over `vt.VtState` (drag, double-click word, triple-click line)
 - `kitty.zig` — kitty graphics (APC G: stream + file/temp, `a=q` OK replies for icat)
-- `platform/` — window / PTY (Linux/X11 + XInput2); `XSetClassHint` from `--class`; PTY child is `$SHELL` or `-e` argv (`execvpe`); child env `TERM=xterm-kitty`, `KITTY_WINDOW_ID`, `COLORTERM=truecolor`; wheel from Button4/5 and XI2 scroll valuators (XWayland trackpads)
-- `main.zig` — window + PTY + fonts; `circbuffer` → `vt` → `draw` → present; each tick `readPTY` (EOF or EAGAIN+1/hz) while pumping X so keys are not deferred until after the echo; drain the Xlib queue (no 32-event bail); wheel → mouse report (1000/1002/1003), alt-screen arrows, or primary history view; Ctrl+Shift+V / Shift+Insert / middle-click paste (bracketed if DECSET 2004); inner pad from `[general] pad` (default 14), scaled by Wayland output scale; font/pad/cells use CSS 96 DPI × Hyprland/`GDK_SCALE` multiplier (not X11 mm-DPI) and re-apply on focus/resize; CLI `-e`/`--` command, `--class=`, `--title=`, `--working-directory=` (xdg-terminal-exec)
+- `platform/` — window / PTY (Linux/X11 + XInput2); `XSetClassHint` from `--class`; PTY child is `$SHELL` or `-e` argv (`execvpe`); child env `TERM=xterm-256color` (SSH-safe), `KITTY_WINDOW_ID`, `COLORTERM=truecolor`; `TIOCSWINSZ` + `SIGWINCH` to the slave fg pgroup; wheel from Button4/5 and XI2 scroll valuators (XWayland trackpads); ICCCM CLIPBOARD + PRIMARY (UTF8_STRING)
+- `main.zig` — window + PTY + fonts; `circbuffer` → `vt` → `draw` → present; each tick `readPTY` (EOF or EAGAIN+1/hz) while pumping X so keys are not deferred until after the echo; drain the Xlib queue (no 32-event bail); wheel → mouse report (1000/1002/1003), alt-screen arrows, or primary history view; left-drag selects (Shift+drag when mouse reporting is on); double-click word / triple-click line; mouse-up copies PRIMARY; Ctrl+Shift+C copies CLIPBOARD; Ctrl+Shift+V / Shift+Insert paste CLIPBOARD, middle-click pastes PRIMARY (bracketed if DECSET 2004); inner pad from `[general] pad` (default 14), scaled by Wayland output scale; font/pad/cells use CSS 96 DPI × Hyprland/`GDK_SCALE` multiplier (not X11 mm-DPI) and re-apply on focus/resize; resize updates the grid, PTY winsize (SIGWINCH), and flushes VT replies (in-band 2048 if enabled); CLI `-e`/`--` command, `--class=`, `--title=`, `--working-directory=` (xdg-terminal-exec)
 
 # Bench
 - `zig build bench` — `src/bench.zig`, ReleaseFast firehose truncate + last-N vs all-ring parse/VT timings.

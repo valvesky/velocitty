@@ -40,6 +40,16 @@ pub const Event = union(enum) {
         steps: u8 = 1,
     };
 
+    pub const Mouse = struct {
+        button: u8 = 0,
+        x: i32 = 0,
+        y: i32 = 0,
+        mods: KeyMod = .{},
+        time: u32 = 0,
+    };
+
+    pub const Clipboard = enum { clipboard, primary };
+
     pub const KeyCode = enum {
         a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z,
         num_0, num_1, num_2, num_3, num_4, num_5, num_6, num_7, num_8, num_9,
@@ -53,7 +63,11 @@ pub const Event = union(enum) {
     key_press: KeyEvent,
     key_release: KeyEvent,
     mouse_wheel: MouseWheel,
-    paste_request,
+    mouse_down: Mouse,
+    mouse_up: Mouse,
+    mouse_move: Mouse,
+    paste_request: Clipboard,
+    copy_request,
     paste: []const u8,
     text_input: [32]u8, // UTF-8 encoded text stream from OS IME/Keyboard
     resize: Dimensions,
@@ -112,11 +126,19 @@ pub const Window = struct {
     }
 
     pub fn requestPaste(self: *Window) void {
-        self.impl.requestPaste();
+        self.impl.requestPasteFrom(.clipboard);
+    }
+
+    pub fn requestPasteFrom(self: *Window, src: Event.Clipboard) void {
+        self.impl.requestPasteFrom(src);
     }
 
     pub fn setClipboard(self: *Window, text: []const u8) void {
         self.impl.setClipboard(text);
+    }
+
+    pub fn setPrimary(self: *Window, text: []const u8) void {
+        self.impl.setPrimary(text);
     }
 
     pub fn framebuffer(self: *Window) *Framebuffer {

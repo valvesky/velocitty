@@ -1,3 +1,9 @@
+# Bugs
+- [X] Resize clears scrollback.
+- [X] No line wrap.
+- [X] When running a TUI like neovim, resizing breaks formatting. New portions of the screen are not drawn. Are we sending SIGWINCH ?
+- [X] SSH to another terminal break certain applications due to term info. 
+
 # Escape Codes
 
 ## C0
