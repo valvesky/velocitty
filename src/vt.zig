@@ -284,8 +284,8 @@ pub const VtState = struct {
         if (cols == self.cols and rows == self.rows) return;
         const old_cols = self.cols;
         const old_rows = self.rows;
-        try self.grids[0].resize(self.allocator, old_cols, old_rows, cols, rows, self.grids[0].cap);
-        try self.grids[1].resize(self.allocator, old_cols, old_rows, cols, rows, rows);
+        try (&self.grids[0]).resize(self.allocator, old_cols, old_rows, cols, rows, self.grids[0].cap, true);
+        try (&self.grids[1]).resize(self.allocator, old_cols, old_rows, cols, rows, rows, false);
 
         const dirty_len = (rows + 63) / 64;
         if (dirty_len != self.line_dirty.len) {
@@ -340,6 +340,7 @@ pub const VtState = struct {
 
         if (g.cursor.col >= self.cols) {
             if (self.flags.auto_wrap) {
+                g.setRowWrap(g.cursor.row, true);
                 g.cursor.col = 0;
                 self.index();
                 g = self.grid();
@@ -351,6 +352,7 @@ pub const VtState = struct {
 
         if (width == 2 and g.cursor.col + 1 >= self.cols) {
             if (self.flags.auto_wrap and g.cursor.col != 0) {
+                g.setRowWrap(g.cursor.row, true);
                 g.cursor.col = 0;
                 self.index();
                 g = self.grid();
@@ -1570,4 +1572,32 @@ test "resize keeps cells" {
     try vt.resize(3, 2);
     try std.testing.expectEqual(@as(u21, 'A'), vt.grid().cellAt(0, 0).codepoint);
     try std.testing.expectEqual(@as(u21, 'B'), vt.grid().cellAt(0, 1).codepoint);
+}
+
+test "print wraps to next line" {
+    var dummy: [1]u8 = .{0};
+    var vt = try VtState.init(std.testing.allocator, 4, 2, 8, &dummy);
+    defer vt.deinit();
+    for ("ABCDEFGH") |b| vt.printCodepoint(b);
+    try std.testing.expectEqual(@as(u21, 'A'), vt.grid().cellAt(0, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, 'D'), vt.grid().cellAt(0, 3).codepoint);
+    try std.testing.expectEqual(@as(u21, 'E'), vt.grid().cellAt(1, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, 'H'), vt.grid().cellAt(1, 3).codepoint);
+    try std.testing.expectEqual(@as(u8, 1), vt.grid().wraps[(vt.grid().head + 0) % vt.grid().cap]);
+}
+
+test "resize reflows wrapped lines" {
+    var dummy: [1]u8 = .{0};
+    var vt = try VtState.init(std.testing.allocator, 8, 2, 16, &dummy);
+    defer vt.deinit();
+    for ("ABCDEFGH") |b| vt.printCodepoint(b);
+    try vt.resize(4, 4);
+    try std.testing.expectEqual(@as(u21, 'A'), vt.grid().cellAt(0, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, 'D'), vt.grid().cellAt(0, 3).codepoint);
+    try std.testing.expectEqual(@as(u21, 'E'), vt.grid().cellAt(1, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, 'H'), vt.grid().cellAt(1, 3).codepoint);
+    try vt.resize(8, 2);
+    try std.testing.expectEqual(@as(u21, 'A'), vt.grid().cellAt(0, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, 'H'), vt.grid().cellAt(0, 7).codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), vt.grid().cellAt(1, 0).codepoint);
 }

@@ -57,6 +57,9 @@ pub const Window = struct {
     xi_axes: [8]XiAxis = undefined,
     xi_axis_n: u8 = 0,
     paste_buf: []u8 = &.{},
+    clip_buf: []u8 = &.{},
+    primary_buf: []u8 = &.{},
+    pointer_grabbed: bool = false,
 
     gpa: std.mem.Allocator,
 
@@ -91,6 +94,8 @@ pub const Window = struct {
             c.KeyPressMask |
                 c.KeyReleaseMask |
                 c.ButtonPressMask |
+                c.ButtonReleaseMask |
+                c.ButtonMotionMask |
                 c.StructureNotifyMask |
                 c.ExposureMask |
                 c.FocusChangeMask,
@@ -153,11 +158,20 @@ pub const Window = struct {
         self.xi_opcode = 0;
         self.xi_axis_n = 0;
         self.paste_buf = &.{};
+        self.clip_buf = &.{};
+        self.primary_buf = &.{};
+        self.pointer_grabbed = false;
         initXi(self);
     }
 
     pub fn close(self: *Window) void {
+        if (self.pointer_grabbed) {
+            _ = c.XUngrabPointer(self.display, c.CurrentTime);
+            self.pointer_grabbed = false;
+        }
         if (self.paste_buf.len != 0) self.gpa.free(self.paste_buf);
+        if (self.clip_buf.len != 0) self.gpa.free(self.clip_buf);
+        if (self.primary_buf.len != 0) self.gpa.free(self.primary_buf);
         if (self.image.data != null) {
             self.gpa.free(self.framebuffer.pixels);
             self.image.data = null;
@@ -198,6 +212,9 @@ pub const Window = struct {
                 c.SelectionNotify => {
                     if (takeSelection(self, xev.xselection.property, ev)) return true;
                 },
+                c.SelectionRequest => {
+                    replySelection(self, &xev.xselectionrequest);
+                },
                 c.ClientMessage => {
                     if (@as(c.Atom, @intCast(xev.xclient.data.l[0])) == self.wm_delete_window) {
                         ev.* = .quit;
@@ -230,7 +247,11 @@ pub const Window = struct {
                     const len = c.XLookupString(&xev.xkey, &buf, buf.len, &keysym, null);
                     const mods = getMods(xev.xkey.state);
                     if (isPasteKey(keysym, mods)) {
-                        ev.* = .paste_request;
+                        ev.* = .{ .paste_request = .clipboard };
+                        return true;
+                    }
+                    if (isCopyKey(keysym, mods)) {
+                        ev.* = .copy_request;
                         return true;
                     }
 
@@ -249,8 +270,13 @@ pub const Window = struct {
                 },
                 c.ButtonPress => {
                     const button = xev.xbutton.button;
+                    if (button == 1) {
+                        grabPointer(self);
+                        ev.* = .{ .mouse_down = mouseFromButton(&xev.xbutton) };
+                        return true;
+                    }
                     if (button == 2) {
-                        ev.* = .paste_request;
+                        ev.* = .{ .paste_request = .primary };
                         return true;
                     }
                     if (button == 4 or button == 5) {
@@ -262,6 +288,24 @@ pub const Window = struct {
                         } };
                         return true;
                     }
+                },
+                c.ButtonRelease => {
+                    if (xev.xbutton.button == 1) {
+                        ungrabPointer(self);
+                        ev.* = .{ .mouse_up = mouseFromButton(&xev.xbutton) };
+                        return true;
+                    }
+                },
+                c.MotionNotify => {
+                    if (xev.xmotion.state & c.Button1Mask == 0) continue;
+                    ev.* = .{ .mouse_move = .{
+                        .button = 1,
+                        .x = xev.xmotion.x,
+                        .y = xev.xmotion.y,
+                        .mods = getMods(xev.xmotion.state),
+                        .time = @truncate(xev.xmotion.time),
+                    } };
+                    return true;
                 },
                 c.KeyRelease => {
                     var keysym: c.KeySym = 0;
@@ -301,10 +345,14 @@ pub const Window = struct {
         _ = c.XFlush(self.display);
     }
 
-    pub fn requestPaste(self: *Window) void {
+    pub fn requestPasteFrom(self: *Window, src: Platform.Event.Clipboard) void {
+        const sel: c.Atom = switch (src) {
+            .clipboard => self.atom_clipboard,
+            .primary => c.XA_PRIMARY,
+        };
         _ = c.XConvertSelection(
             self.display,
-            self.atom_clipboard,
+            sel,
             self.atom_utf8,
             self.atom_selection_prop,
             self.window,
@@ -314,8 +362,17 @@ pub const Window = struct {
     }
 
     pub fn setClipboard(self: *Window, text: []const u8) void {
-        _ = self;
-        _ = text;
+        storeSel(self, &self.clip_buf, text);
+        if (self.clip_buf.len == 0) return;
+        _ = c.XSetSelectionOwner(self.display, self.atom_clipboard, self.window, c.CurrentTime);
+        _ = c.XFlush(self.display);
+    }
+
+    pub fn setPrimary(self: *Window, text: []const u8) void {
+        storeSel(self, &self.primary_buf, text);
+        if (self.primary_buf.len == 0) return;
+        _ = c.XSetSelectionOwner(self.display, c.XA_PRIMARY, self.window, c.CurrentTime);
+        _ = c.XFlush(self.display);
     }
 
     fn resizeFramebuffer(self: *Window, w: u32, h: u32) !void {
@@ -461,6 +518,100 @@ fn wheelFromXi(self: *Window, dev: *c.XIDeviceEvent, ev: *Platform.Event) bool {
     return true;
 }
 
+fn storeSel(self: *Window, slot: *[]u8, text: []const u8) void {
+    if (slot.len != 0) {
+        self.gpa.free(slot.*);
+        slot.* = &.{};
+    }
+    if (text.len == 0) return;
+    slot.* = self.gpa.dupe(u8, text) catch return;
+}
+
+fn grabPointer(self: *Window) void {
+    if (self.pointer_grabbed) return;
+    const rc = c.XGrabPointer(
+        self.display,
+        self.window,
+        c.False,
+        c.ButtonPressMask | c.ButtonReleaseMask | c.ButtonMotionMask,
+        c.GrabModeAsync,
+        c.GrabModeAsync,
+        c.None,
+        c.None,
+        c.CurrentTime,
+    );
+    self.pointer_grabbed = rc == c.GrabSuccess;
+}
+
+fn ungrabPointer(self: *Window) void {
+    if (!self.pointer_grabbed) return;
+    _ = c.XUngrabPointer(self.display, c.CurrentTime);
+    self.pointer_grabbed = false;
+}
+
+fn mouseFromButton(ev: *const c.XButtonEvent) Platform.Event.Mouse {
+    return .{
+        .button = @intCast(ev.button),
+        .x = ev.x,
+        .y = ev.y,
+        .mods = getMods(ev.state),
+        .time = @truncate(ev.time),
+    };
+}
+
+fn replySelection(self: *Window, req: *const c.XSelectionRequestEvent) void {
+    var notify = c.XEvent{
+        .xselection = .{
+            .type = c.SelectionNotify,
+            .serial = 0,
+            .send_event = c.True,
+            .display = req.display,
+            .requestor = req.requestor,
+            .selection = req.selection,
+            .target = req.target,
+            .property = c.None,
+            .time = req.time,
+        },
+    };
+    const text: []const u8 = if (req.selection == self.atom_clipboard)
+        self.clip_buf
+    else if (req.selection == c.XA_PRIMARY)
+        self.primary_buf
+    else
+        &.{};
+    const owned = req.selection == self.atom_clipboard or req.selection == c.XA_PRIMARY;
+    const property: c.Atom = if (req.property != c.None) req.property else req.target;
+    if (req.target == self.atom_targets and owned) {
+        var targets = [_]c.Atom{ self.atom_targets, self.atom_utf8, c.XA_STRING };
+        _ = c.XChangeProperty(
+            req.display,
+            req.requestor,
+            property,
+            c.XA_ATOM,
+            32,
+            c.PropModeReplace,
+            @ptrCast(&targets),
+            targets.len,
+        );
+        notify.xselection.property = property;
+    } else if (owned and (req.target == self.atom_utf8 or req.target == c.XA_STRING)) {
+        const ptr: [*c]const u8 = if (text.len == 0) @ptrFromInt(1) else text.ptr;
+        _ = c.XChangeProperty(
+            req.display,
+            req.requestor,
+            property,
+            req.target,
+            8,
+            c.PropModeReplace,
+            ptr,
+            @intCast(text.len),
+        );
+        notify.xselection.property = property;
+    }
+    _ = c.XSendEvent(req.display, req.requestor, c.False, 0, &notify);
+    _ = c.XFlush(req.display);
+}
+
 fn takeSelection(self: *Window, property: c.Atom, ev: *Platform.Event) bool {
     if (property == c.None) return false;
     var actual_type: c.Atom = undefined;
@@ -497,6 +648,10 @@ fn isPasteKey(sym: c.KeySym, mods: Platform.Event.KeyMod) bool {
     if (mods.shift and !mods.ctrl and !mods.alt and sym == c.XK_Insert) return true;
     if (mods.ctrl and mods.shift and (sym == c.XK_v or sym == c.XK_V)) return true;
     return false;
+}
+
+fn isCopyKey(sym: c.KeySym, mods: Platform.Event.KeyMod) bool {
+    return mods.ctrl and mods.shift and (sym == c.XK_c or sym == c.XK_C);
 }
 
 fn getMods(state: c_uint) Platform.Event.KeyMod {
@@ -629,6 +784,14 @@ pub const Pty = struct {
     pub fn setWinsize(self: *Pty, dims: Platform.Dimensions) void {
         var ws = toWinsize(dims);
         _ = linux.ioctl(self.master, linux.T.IOCSWINSZ, @intFromPtr(&ws));
+        // Kernel SIGWINCH goes to the slave's fg pgroup; send it ourselves too
+        // in case the ioctl is a no-op on an unchanged size or the pgroup moved.
+        var pgrp: linux.pid_t = 0;
+        if (linux.errno(linux.ioctl(self.master, linux.T.IOCGPGRP, @intFromPtr(&pgrp))) == .SUCCESS and pgrp > 1) {
+            _ = linux.kill(-pgrp, linux.SIG.WINCH);
+        } else if (self.child > 1) {
+            _ = linux.kill(self.child, linux.SIG.WINCH);
+        }
     }
 };
 
@@ -649,8 +812,9 @@ fn getShellPath() [*:0]const u8 {
 }
 
 fn applyChildEnv() void {
-    // kitty.zig implements the graphics protocol; advertise it so icat/nvim/etc. use APC G.
-    _ = setenv("TERM", "xterm-kitty", 1);
+    // xterm-256color is in every terminfo db (SSH remotes included). Kitty
+    // graphics still work via KITTY_WINDOW_ID / COLORTERM=truecolor.
+    _ = setenv("TERM", "xterm-256color", 1);
     _ = setenv("COLORTERM", "truecolor", 1);
     _ = setenv("TERM_PROGRAM", "velocitty", 1);
     var id_buf: [32]u8 = undefined;

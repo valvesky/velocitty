@@ -9,6 +9,7 @@ const VtState = @import("vt.zig").VtState;
 const Draw = @import("draw.zig");
 const TypeCtx = @import("type.zig").Context;
 const Scheme = @import("scheme.zig");
+const Select = @import("select.zig");
 
 const font_paths: []const []const u8 = switch (builtin.os.tag) {
     .macos, .ios, .tvos, .watchos, .visionos => &.{
@@ -311,14 +312,24 @@ fn syncGrid(
         pty.setWinsize(.{
             .cols = cols.*,
             .rows = rows.*,
-            .px_w = @intCast(fb.width),
-            .px_h = @intCast(fb.height),
+            .px_w = @intCast(@min(fb.width, std.math.maxInt(u16))),
+            .px_h = @intCast(@min(fb.height, std.math.maxInt(u16))),
         });
+        if (term.flags.size_notifications) {
+            term.respondFmt("\x1b[48;{d};{d};{d};{d}t", .{ rows.*, cols.*, fb.height, fb.width });
+        }
+        frame.invalidate();
     }
     if (frame.width != new_fw or frame.height != new_fh) {
         frame.resize(new_fw, new_fh) catch {};
         frame.invalidate();
     }
+}
+
+fn flushReply(pty: *Platform.Pty, term: *VtState) void {
+    if (term.reply.items.len == 0) return;
+    pty.write(term.reply.items);
+    term.reply.clearRetainingCapacity();
 }
 
 fn layoutIfNeeded(
@@ -522,6 +533,13 @@ const EventLoop = struct {
     running: *bool,
     need_draw: *bool,
     need_layout: *bool,
+    sel: Select.State = .{},
+    dragging: bool = false,
+    drag_moved: bool = false,
+    clicks: u8 = 0,
+    click_time: u32 = 0,
+    click_col: u16 = 0,
+    click_row: u16 = 0,
 
     fn pump(ptr: *anyopaque) void {
         const self: *EventLoop = @ptrCast(@alignCast(ptr));
@@ -539,15 +557,21 @@ const EventLoop = struct {
         switch (ev) {
             .quit => self.running.* = false,
             .resize => {
+                self.clearSel();
                 self.need_layout.* = true;
                 self.need_draw.* = true;
             },
             .redraw => self.need_draw.* = true,
             .focus_gained => self.need_layout.* = true,
             .key_press => |k| {
+                self.clearSel();
                 const bytes = encodeKey(k.key, k.mods, self.term.flags.app_cursor);
                 if (bytes.len != 0) self.pty.write(bytes);
             },
+            .mouse_down => |m| self.onMouseDown(m),
+            .mouse_up => |m| self.onMouseUp(m),
+            .mouse_move => |m| self.onMouseMove(m),
+            .copy_request => self.copyClipboard(),
             .mouse_wheel => |w| {
                 const ticks: u8 = @max(1, w.steps);
                 var t: u8 = 0;
@@ -572,16 +596,107 @@ const EventLoop = struct {
                     self.need_draw.* = true;
                 }
             },
-            .paste_request => self.window.requestPaste(),
+            .paste_request => |src| self.window.requestPasteFrom(src),
             .paste => |text| writePaste(self.pty, self.term, self.allocator, text),
             .text_input => |text| {
                 const n = textLen(text);
-                if (n != 0) self.pty.write(text[0..n]);
+                if (n != 0) {
+                    self.clearSel();
+                    self.pty.write(text[0..n]);
+                }
             },
             else => {},
         }
     }
+
+    fn hit(self: *const EventLoop, x: i32, y: i32) Select.Point {
+        const fb = self.window.framebuffer();
+        const ox: i32 = if (fb.width > self.frame.width) @intCast((fb.width - self.frame.width) / 2) else 0;
+        const oy: i32 = if (fb.height > self.frame.height) @intCast((fb.height - self.frame.height) / 2) else 0;
+        return .{
+            .col = clampCell(x - ox, self.cell_w, self.term.cols),
+            .row = clampCell(y - oy, self.cell_h, self.term.rows),
+        };
+    }
+
+    fn onMouseDown(self: *EventLoop, m: Platform.Event.Mouse) void {
+        if (m.button != 1) return;
+        if (self.term.mouse != .off and !m.mods.shift) return;
+        const p = self.hit(m.x, m.y);
+        const chained = p.col == self.click_col and p.row == self.click_row and m.time -% self.click_time < 500;
+        self.clicks = if (chained) self.clicks % 3 + 1 else 1;
+        self.click_time = m.time;
+        self.click_col = p.col;
+        self.click_row = p.row;
+        const kind: Select.Kind = switch (self.clicks) {
+            2 => .word,
+            3 => .line,
+            else => .cell,
+        };
+        if (m.mods.shift and self.sel.on) {
+            self.sel.drag(self.term, p.col, p.row);
+        } else {
+            self.sel.grab(self.term, p.col, p.row, kind);
+        }
+        self.dragging = true;
+        self.drag_moved = kind != .cell;
+        self.need_draw.* = true;
+    }
+
+    fn onMouseMove(self: *EventLoop, m: Platform.Event.Mouse) void {
+        if (!self.dragging) return;
+        const p = self.hit(m.x, m.y);
+        if (p.col != self.click_col or p.row != self.click_row) self.drag_moved = true;
+        const prev_a = self.sel.a;
+        const prev_b = self.sel.b;
+        self.sel.drag(self.term, p.col, p.row);
+        if (self.sel.a.col == prev_a.col and self.sel.a.row == prev_a.row and
+            self.sel.b.col == prev_b.col and self.sel.b.row == prev_b.row) return;
+        self.need_draw.* = true;
+    }
+
+    fn onMouseUp(self: *EventLoop, m: Platform.Event.Mouse) void {
+        if (m.button != 1 or !self.dragging) return;
+        self.dragging = false;
+        const p = self.hit(m.x, m.y);
+        self.sel.drag(self.term, p.col, p.row);
+        if (!self.drag_moved and self.sel.kind == .cell) {
+            self.clearSel();
+            return;
+        }
+        self.commitPrimary();
+        self.need_draw.* = true;
+    }
+
+    fn clearSel(self: *EventLoop) void {
+        if (!self.sel.on and !self.dragging) return;
+        self.sel.clear();
+        self.dragging = false;
+        self.need_draw.* = true;
+    }
+
+    fn commitPrimary(self: *EventLoop) void {
+        const text = Select.copyAlloc(self.allocator, self.term, self.sel) catch return;
+        defer self.allocator.free(text);
+        if (text.len == 0) return;
+        self.window.setPrimary(text);
+    }
+
+    fn copyClipboard(self: *EventLoop) void {
+        if (!self.sel.on) return;
+        const text = Select.copyAlloc(self.allocator, self.term, self.sel) catch return;
+        defer self.allocator.free(text);
+        if (text.len == 0) return;
+        self.window.setClipboard(text);
+    }
 };
+
+fn clampCell(px: i32, cell: u32, max_cells: u16) u16 {
+    if (max_cells == 0) return 0;
+    if (px < 0) return 0;
+    const c = @as(u32, @intCast(px)) / @max(cell, 1);
+    return @intCast(@min(c, @as(u32, max_cells - 1)));
+}
 
 fn writePaste(pty: *Platform.Pty, term: *const VtState, allocator: std.mem.Allocator, raw: []const u8) void {
     var buf = allocator.alloc(u8, raw.len) catch {
@@ -847,15 +962,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (circbuffer.pending()) {
             const runs = circbuffer.consumeAndGetRuns(std.math.maxInt(usize));
             if (runs.len != 0) term.feedRuns(runs);
-            if (term.reply.items.len != 0) {
-                pty.write(term.reply.items);
-                term.reply.clearRetainingCapacity();
-            }
             need_draw = true;
         }
+        flushReply(&pty, &term);
 
         if (need_draw) {
-            frame.render(&term, cell_w, cell_h, type_ptr, size_px);
+            frame.renderSel(&term, cell_w, cell_h, type_ptr, size_px, eloop.sel);
             term.clearDirty();
             const fb = window.framebuffer();
             blitFrame(fb, &frame, padColor(&term));

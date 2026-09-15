@@ -12,10 +12,14 @@ pub const Point = struct {
     }
 };
 
+pub const Kind = enum { cell, word, line };
+
 pub const State = struct {
     on: bool = false,
     a: Point = .{},
     b: Point = .{},
+    anchor: Point = .{},
+    kind: Kind = .cell,
 
     pub fn clear(self: *State) void {
         self.* = .{};
@@ -23,7 +27,7 @@ pub const State = struct {
 
     pub fn begin(self: *State, col: u16, row: u16) void {
         const p = Point{ .col = col, .row = row };
-        self.* = .{ .on = true, .a = p, .b = p };
+        self.* = .{ .on = true, .a = p, .b = p, .anchor = p, .kind = .cell };
     }
 
     pub fn extend(self: *State, col: u16, row: u16) void {
@@ -32,6 +36,35 @@ pub const State = struct {
             return;
         }
         self.b = .{ .col = col, .row = row };
+    }
+
+    pub fn grab(self: *State, screen: *const Term.Screen, col: u16, row: u16, kind: Kind) void {
+        const span = spanAt(screen, col, row, kind);
+        self.* = .{
+            .on = true,
+            .a = span.a,
+            .b = span.b,
+            .anchor = clampPoint(screen, col, row),
+            .kind = kind,
+        };
+    }
+
+    pub fn drag(self: *State, screen: *const Term.Screen, col: u16, row: u16) void {
+        if (!self.on) {
+            self.grab(screen, col, row, .cell);
+            return;
+        }
+        const head = spanAt(screen, self.anchor.col, self.anchor.row, self.kind);
+        const tail = spanAt(screen, col, row, self.kind);
+        const cols = screen.cols;
+        var lo = minPt(head.a, head.b, cols);
+        lo = minPt(lo, tail.a, cols);
+        lo = minPt(lo, tail.b, cols);
+        var hi = maxPt(head.a, head.b, cols);
+        hi = maxPt(hi, tail.a, cols);
+        hi = maxPt(hi, tail.b, cols);
+        self.a = lo;
+        self.b = hi;
     }
 
     pub fn sameCell(self: State) bool {
@@ -62,6 +95,30 @@ pub const State = struct {
         return b.lo.row < end and b.hi.row >= start;
     }
 };
+
+pub fn spanAt(screen: *const Term.Screen, col: u16, row: u16, kind: Kind) State {
+    const p = clampPoint(screen, col, row);
+    return switch (kind) {
+        .cell => cellAt(p.col, p.row),
+        .word => wordAt(screen, p.col, p.row),
+        .line => lineAt(screen, p.row),
+    };
+}
+
+fn clampPoint(screen: *const Term.Screen, col: u16, row: u16) Point {
+    return .{
+        .col = @min(col, screen.cols -| 1),
+        .row = @min(row, screen.rows -| 1),
+    };
+}
+
+fn minPt(p: Point, q: Point, cols: u16) Point {
+    return if (p.idx(cols) <= q.idx(cols)) p else q;
+}
+
+fn maxPt(p: Point, q: Point, cols: u16) Point {
+    return if (p.idx(cols) >= q.idx(cols)) p else q;
+}
 
 pub fn wordAt(screen: *const Term.Screen, col: u16, row: u16) State {
     const line = screen.rowCells(row);
@@ -143,4 +200,57 @@ fn isWord(cp: u21) bool {
         return std.ascii.isAlphanumeric(c) or c == '_';
     }
     return true;
+}
+
+fn putLine(screen: *Term.Screen, row: u16, text: []const u8) void {
+    const line = screen.grid().rowSlice(row, screen.cols);
+    const n = @min(text.len, line.len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        line[i].codepoint = text[i];
+    }
+}
+
+test "bounds and contains" {
+    var sel: State = .{};
+    sel.begin(2, 1);
+    sel.extend(5, 2);
+    try std.testing.expect(sel.contains(2, 1, 8));
+    try std.testing.expect(sel.contains(0, 2, 8));
+    try std.testing.expect(sel.contains(5, 2, 8));
+    try std.testing.expect(!sel.contains(1, 1, 8));
+    try std.testing.expect(!sel.contains(6, 2, 8));
+    try std.testing.expect(sel.coversRow(1, 8));
+    try std.testing.expect(sel.coversRow(2, 8));
+    try std.testing.expect(!sel.coversRow(0, 8));
+}
+
+test "copyAlloc trims trailing spaces and joins rows" {
+    var vt = try Term.VtState.init(std.testing.allocator, 8, 2, 4, &.{});
+    defer vt.deinit();
+    putLine(&vt, 0, "hello   ");
+    putLine(&vt, 1, "wo rld  ");
+    var sel: State = .{};
+    sel.begin(0, 0);
+    sel.extend(7, 1);
+    const text = try copyAlloc(std.testing.allocator, &vt, sel);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("hello\nwo rld", text);
+}
+
+test "word and line grab" {
+    var vt = try Term.VtState.init(std.testing.allocator, 12, 1, 2, &.{});
+    defer vt.deinit();
+    putLine(&vt, 0, "ab_cd ef!");
+    var sel: State = .{};
+    sel.grab(&vt, 3, 0, .word);
+    try std.testing.expectEqual(@as(u16, 0), sel.a.col);
+    try std.testing.expectEqual(@as(u16, 4), sel.b.col);
+    sel.drag(&vt, 7, 0);
+    const text = try copyAlloc(std.testing.allocator, &vt, sel);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("ab_cd ef", text);
+    sel.grab(&vt, 2, 0, .line);
+    try std.testing.expectEqual(@as(u16, 0), sel.a.col);
+    try std.testing.expectEqual(@as(u16, 11), sel.b.col);
 }
