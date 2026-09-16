@@ -7,6 +7,7 @@ const posix = std.posix;
 const Platform = @import("platform.zig");
 
 const c = @cImport({
+    @cInclude("locale.h");
     @cInclude("X11/Xlib.h");
     @cInclude("X11/Xutil.h");
     @cInclude("X11/Xatom.h");
@@ -14,6 +15,8 @@ const c = @cImport({
     @cInclude("X11/extensions/XInput2.h");
     @cInclude("X11/cursorfont.h");
 });
+
+extern fn zt_create_ic(xim: c.XIM, win: c.Window) c.XIC;
 
 const XiAxis = struct {
     deviceid: i32,
@@ -68,12 +71,20 @@ pub const Window = struct {
     /// together flood the X fd on every pixel.
     all_motion: bool = false,
 
+    xim: c.XIM = null,
+    xic: c.XIC = null,
+
     gpa: std.mem.Allocator,
 
     pub fn open(self: *Window, allocator: std.mem.Allocator, title: [*:0]const u8, class: [*:0]const u8, width: u32, height: u32) !void {
         self.gpa = allocator;
         self.width = width;
         self.height = height;
+
+        // Locale + XIM so dead keys (~, ´, ¸) compose to UTF-8 (ã, é, ç).
+        _ = c.setlocale(c.LC_CTYPE, "");
+        _ = c.XSupportsLocale();
+        _ = c.XSetLocaleModifiers("");
 
         const display = c.XOpenDisplay(null) orelse return error.CannotOpenDisplay;
         errdefer _ = c.XCloseDisplay(display);
@@ -162,10 +173,21 @@ pub const Window = struct {
         self.primary_buf = &.{};
         self.pointer_grabbed = false;
         self.all_motion = false;
+        self.xim = null;
+        self.xic = null;
         initXi(self);
+        initIme(self);
     }
 
     pub fn close(self: *Window) void {
+        if (self.xic != null) {
+            c.XDestroyIC(self.xic);
+            self.xic = null;
+        }
+        if (self.xim != null) {
+            _ = c.XCloseIM(self.xim);
+            self.xim = null;
+        }
         if (self.pointer_grabbed) {
             _ = c.XUngrabPointer(self.display, c.CurrentTime);
             self.pointer_grabbed = false;
@@ -209,6 +231,7 @@ pub const Window = struct {
         while (c.XPending(self.display) > 0) {
             var xev: c.XEvent = undefined;
             _ = c.XNextEvent(self.display, &xev);
+            if (c.XFilterEvent(&xev, c.None) != 0) continue;
 
             switch (xev.type) {
                 c.GenericEvent => {
@@ -256,7 +279,7 @@ pub const Window = struct {
                 c.KeyPress => {
                     var buf: [32]u8 = undefined;
                     var keysym: c.KeySym = 0;
-                    const len = c.XLookupString(&xev.xkey, &buf, buf.len, &keysym, null);
+                    const len = lookupString(self, &xev.xkey, &buf, &keysym);
                     const mods = getMods(xev.xkey.state);
                     if (isPasteKey(keysym, mods)) {
                         ev.* = .{ .paste_request = .clipboard };
@@ -329,10 +352,12 @@ pub const Window = struct {
                     }
                 },
                 c.FocusIn => {
+                    if (self.xic != null) c.XSetICFocus(self.xic);
                     ev.* = .focus_gained;
                     return true;
                 },
                 c.FocusOut => {
+                    if (self.xic != null) c.XUnsetICFocus(self.xic);
                     ev.* = .focus_lost;
                     return true;
                 },
@@ -466,6 +491,37 @@ pub const Window = struct {
         self.gpa.free(old);
     }
 };
+
+fn initIme(self: *Window) void {
+    self.xim = openXim(self.display);
+    if (self.xim == null) return;
+    self.xic = zt_create_ic(self.xim, self.window);
+    if (self.xic == null) {
+        _ = c.XCloseIM(self.xim);
+        self.xim = null;
+    }
+}
+
+fn openXim(display: *c.Display) c.XIM {
+    if (c.XOpenIM(display, null, null, null)) |im| return im;
+    if (c.XSetLocaleModifiers("@im=local") != null) {
+        if (c.XOpenIM(display, null, null, null)) |im| return im;
+    }
+    if (c.XSetLocaleModifiers("@im=none") != null) {
+        if (c.XOpenIM(display, null, null, null)) |im| return im;
+    }
+    return null;
+}
+
+fn lookupString(self: *Window, xkey: *c.XKeyEvent, buf: *[32]u8, keysym: *c.KeySym) c_int {
+    if (self.xic != null) {
+        var status: c.Status = 0;
+        const len = c.Xutf8LookupString(self.xic, xkey, buf, @intCast(buf.len), keysym, &status);
+        return if (len > 0) len else 0;
+    }
+    const len = c.XLookupString(xkey, buf, @intCast(buf.len), keysym, null);
+    return if (len > 0) len else 0;
+}
 
 fn coreInputMask(all_motion: bool) c_long {
     var mask: c_long = c.KeyPressMask |

@@ -159,6 +159,10 @@ fn addLinuxX11(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolved
     };
     mod.linkSystemLibrary("X11", syslib);
     mod.linkSystemLibrary("Xi", syslib);
+    mod.addCSourceFile(.{
+        .file = b.path("src/platform/xim.c"),
+        .flags = &.{ "-std=c99", "-fno-sanitize=undefined" },
+    });
 }
 
 fn addX11LinkStub(
