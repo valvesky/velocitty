@@ -60,3 +60,10 @@ void zt_stb_make_glyph(const void *storage, int glyph, float size_px, unsigned c
     const float scale = stbtt_ScaleForMappingEmToPixels(info, size_px);
     stbtt_MakeGlyphBitmap(info, out, w, h, w, scale, scale, glyph);
 }
+
+int zt_stb_glyph_empty(const void *storage, int glyph) {
+    const stbtt_fontinfo *info = (const stbtt_fontinfo *)storage;
+    int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    if (!stbtt_GetGlyphBox(info, glyph, &x0, &y0, &x1, &y1)) return 1;
+    return x0 >= x1 || y0 >= y1;
+}

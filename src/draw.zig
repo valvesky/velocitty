@@ -492,14 +492,19 @@ fn blitLine(
         ))) {
             if (type_ctx) |ctx| {
                 if (cell.codepoint != ' ') {
-                    var g = ctx.peekGlyph(cell.codepoint, size);
+                    const st = Type.Style{ .bold = cell.attrs.bold, .italic = cell.attrs.italic };
+                    var g = ctx.peekGlyphStyled(cell.codepoint, size, st);
                     if (g == null) {
-                        g = ctx.ensureGlyph(cell.codepoint, size) catch null;
+                        g = ctx.ensureGlyphStyled(cell.codepoint, size, st) catch null;
                     }
                     if (g) |glyph| {
                         const ox: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(x0)) + glyph.bearing_x));
                         const oy: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(y0)) + baseline - glyph.bearing_y));
-                        blitGlyph(self, glyph, ctx.atlas.pixels, ctx.atlas.width, ox, oy, fg, bg, clip);
+                        if (glyph.color) {
+                            blitColorGlyph(self, glyph, ctx.color_atlas.pixels, ctx.color_atlas.width, ox, oy, clip);
+                        } else {
+                            blitGlyph(self, glyph, ctx.atlas.pixels, ctx.atlas.width, ox, oy, fg, bg, clip);
+                        }
                     }
                 }
             } else if (clip.y0 <= @as(i32, @intCast(y0)) and clip.y1 >= @as(i32, @intCast(y0 + cell_h))) {
@@ -762,6 +767,57 @@ fn fillRect(self: *Frame, x0: u32, y0: u32, w: u32, h: u32, color: u32) void {
     while (y < h) : (y += 1) {
         const row = self.pixels[(y0 + y) * self.width + x0 ..][0..w];
         @memset(row, color);
+    }
+}
+
+fn blitColorGlyph(
+    self: *Frame,
+    g: Type.Glyph,
+    atlas: []const u32,
+    atlas_w: u32,
+    origin_x: i32,
+    origin_y: i32,
+    clip: Clip,
+) void {
+    if (g.width == 0 or g.height == 0) return;
+    var x0 = origin_x;
+    var y0 = origin_y;
+    var x1 = origin_x + @as(i32, g.width);
+    var y1 = origin_y + @as(i32, g.height);
+    var src_x: i32 = 0;
+    var src_y: i32 = 0;
+    if (x0 < clip.x0) {
+        src_x += clip.x0 - x0;
+        x0 = clip.x0;
+    }
+    if (y0 < clip.y0) {
+        src_y += clip.y0 - y0;
+        y0 = clip.y0;
+    }
+    if (x1 > clip.x1) x1 = clip.x1;
+    if (y1 > clip.y1) y1 = clip.y1;
+    if (x0 >= x1 or y0 >= y1) return;
+    const dst_w: u32 = @intCast(x1 - x0);
+    const dst_h: u32 = @intCast(y1 - y0);
+    const ax = @as(u32, g.atlas_x) + @as(u32, @intCast(src_x));
+    const ay = @as(u32, g.atlas_y) + @as(u32, @intCast(src_y));
+    const dst_y: u32 = @intCast(y0);
+    const dst_x: u32 = @intCast(x0);
+    var row: u32 = 0;
+    while (row < dst_h) : (row += 1) {
+        const atlas_row = atlas[@as(usize, ay + row) * atlas_w + ax ..][0..dst_w];
+        const pix_row = self.pixels[@as(usize, dst_y + row) * self.width + dst_x ..][0..dst_w];
+        var col: u32 = 0;
+        while (col < dst_w) : (col += 1) {
+            const px = atlas_row[col];
+            const a: u8 = @intCast(px >> 24);
+            if (a == 0) continue;
+            if (a == 255) {
+                pix_row[col] = px | 0xff000000;
+            } else {
+                pix_row[col] = mix(pix_row[col], px | 0xff000000, a);
+            }
+        }
     }
 }
 

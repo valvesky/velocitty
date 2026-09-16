@@ -223,7 +223,7 @@ pub const CircBuffer = struct {
     ///
     /// Needs a terminal to apply a few "whitelisted"
     /// sequences that could effect the final screen.
-    fn consumeAndPreparse(self: *CircBuffer) void {
+    pub fn consumeAndPreparse(self: *CircBuffer) void {
         assert(self.tail <= self.head);
 
         // NOTE(vasco): indices are monotonic and keep growing forever
@@ -254,7 +254,7 @@ pub const CircBuffer = struct {
     }
 
     /// Get last N lines of input. May be less than expected.
-    fn getLastNLines(self: CircBuffer, n: usize) []Line {
+    pub fn getLastNLines(self: CircBuffer, n: usize) []Line {
         const len = self.lines.items.len;
         const min = @min(n, len);
         return self.lines.items[len - min ..];
@@ -322,7 +322,7 @@ pub const CircBuffer = struct {
         }
     }
 
-    fn splitIntoRuns(self: *CircBuffer, lines: []Line) void {
+    pub fn splitIntoRuns(self: *CircBuffer, lines: []Line) void {
 
         // NOTE(vasco): Splitting into Runs should be
         // pretty simple: scan for <= SPC and >= DEL

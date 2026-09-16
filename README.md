@@ -24,6 +24,8 @@
     ·
     <a href="#build">Build</a>
     ·
+    <a href="#config">Config</a>
+    ·
     <a href="#shoutouts">Shoutouts</a>
 </p>
 

@@ -47,7 +47,13 @@ const fallback_paths: []const []const u8 = switch (builtin.os.tag) {
         "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
         "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/gnu-free/FreeSans.otf",
+        "/usr/share/fonts/noto/NotoColorEmoji.ttf",
     },
+};
+
+const FontBlob = struct {
+    bytes: []u8,
+    style: @import("type.zig").Style = .{},
 };
 
 fn loadFontPath(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -79,65 +85,106 @@ fn resolveFamilyFile(io: std.Io, gpa: std.mem.Allocator, family: []const u8) ?[]
     return gpa.dupe(u8, path) catch null;
 }
 
-fn loadFonts(io: std.Io, gpa: std.mem.Allocator, out: *std.ArrayList([]u8), family: ?[]const u8) !void {
-    var used_buf: [std.fs.max_path_bytes]u8 = undefined;
-    var used_len: usize = 0;
+fn loadFonts(io: std.Io, gpa: std.mem.Allocator, out: *std.ArrayList(FontBlob), family: ?[]const u8) !void {
+    var seen: [16][std.fs.max_path_bytes]u8 = undefined;
+    var seen_len: [16]usize = @splat(0);
+    var seen_n: usize = 0;
+
+    const already = struct {
+        fn go(path: []const u8, seen_buf: [][std.fs.max_path_bytes]u8, seen_l: []usize, n: usize) bool {
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                if (std.mem.eql(u8, seen_buf[i][0..seen_l[i]], path)) return true;
+            }
+            return false;
+        }
+    }.go;
+
+    const remember = struct {
+        fn go(path: []const u8, seen_buf: [][std.fs.max_path_bytes]u8, seen_l: []usize, n: *usize) void {
+            if (n.* >= seen_buf.len) return;
+            const i = n.*;
+            const k = @min(path.len, seen_buf[i].len);
+            @memcpy(seen_buf[i][0..k], path[0..k]);
+            seen_l[i] = k;
+            n.* = i + 1;
+        }
+    }.go;
 
     const append_path = struct {
         fn go(
             io_: std.Io,
             gpa_: std.mem.Allocator,
-            out_: *std.ArrayList([]u8),
+            out_: *std.ArrayList(FontBlob),
             path: []const u8,
-            used_buf_: []u8,
-            used_len_: *usize,
+            style: @import("type.zig").Style,
+            seen_buf: [][std.fs.max_path_bytes]u8,
+            seen_l: []usize,
+            n: *usize,
         ) bool {
+            if (already(path, seen_buf, seen_l, n.*)) return false;
             const bytes = loadFontPath(io_, gpa_, path) catch return false;
-            out_.append(gpa_, bytes) catch {
+            out_.append(gpa_, .{ .bytes = bytes, .style = style }) catch {
                 gpa_.free(bytes);
                 return false;
             };
-            const n = @min(path.len, used_buf_.len);
-            @memcpy(used_buf_[0..n], path[0..n]);
-            used_len_.* = n;
+            remember(path, seen_buf, seen_l, n);
             return true;
         }
     }.go;
 
-    if (family) |fam| {
-        if (resolveFamilyFile(io, gpa, fam)) |path| {
-            defer gpa.free(path);
-            _ = append_path(io, gpa, out, path, &used_buf, &used_len);
+    const try_pattern = struct {
+        fn go(
+            io_: std.Io,
+            gpa_: std.mem.Allocator,
+            out_: *std.ArrayList(FontBlob),
+            pattern: []const u8,
+            style: @import("type.zig").Style,
+            seen_buf: [][std.fs.max_path_bytes]u8,
+            seen_l: []usize,
+            n: *usize,
+        ) void {
+            const path = resolveFamilyFile(io_, gpa_, pattern) orelse return;
+            defer gpa_.free(path);
+            _ = append_path(io_, gpa_, out_, path, style, seen_buf, seen_l, n);
         }
-    }
-    if (out.items.len == 0) {
-        if (resolveFamilyFile(io, gpa, "monospace")) |path| {
-            defer gpa.free(path);
-            _ = append_path(io, gpa, out, path, &used_buf, &used_len);
-        }
-    }
+    }.go;
+
+    const fam = family orelse "monospace";
+    try_pattern(io, gpa, out, fam, .{}, &seen, seen_len[0..], &seen_n);
+    var pat_buf: [192]u8 = undefined;
+    if (std.fmt.bufPrint(&pat_buf, "{s}:weight=bold", .{fam})) |p| {
+        try_pattern(io, gpa, out, p, .{ .bold = true }, &seen, seen_len[0..], &seen_n);
+    } else |_| {}
+    if (std.fmt.bufPrint(&pat_buf, "{s}:slant=italic", .{fam})) |p| {
+        try_pattern(io, gpa, out, p, .{ .italic = true }, &seen, seen_len[0..], &seen_n);
+    } else |_| {}
+    if (std.fmt.bufPrint(&pat_buf, "{s}:weight=bold:slant=italic", .{fam})) |p| {
+        try_pattern(io, gpa, out, p, .{ .bold = true, .italic = true }, &seen, seen_len[0..], &seen_n);
+    } else |_| {}
+
     if (out.items.len == 0) {
         for (font_paths) |path| {
-            if (append_path(io, gpa, out, path, &used_buf, &used_len)) break;
+            if (append_path(io, gpa, out, path, .{}, &seen, seen_len[0..], &seen_n)) break;
         }
     }
-    const used = used_buf[0..used_len];
     for (fallback_paths) |path| {
-        if (std.mem.eql(u8, path, used)) continue;
-        const bytes = loadFontPath(io, gpa, path) catch continue;
-        out.append(gpa, bytes) catch gpa.free(bytes);
+        _ = append_path(io, gpa, out, path, .{}, &seen, seen_len[0..], &seen_n);
     }
+    try_pattern(io, gpa, out, "Noto Color Emoji", .{}, &seen, seen_len[0..], &seen_n);
     if (out.items.len == 0) return error.InvalidFont;
 }
 
-fn bindFonts(gpa: std.mem.Allocator, type_ctx: *TypeCtx, blobs: []const []u8) !void {
+fn bindFonts(gpa: std.mem.Allocator, type_ctx: *TypeCtx, blobs: []const FontBlob) !void {
     type_ctx.clearFonts();
     var fallbacks: std.ArrayList(@import("type.zig").FontId) = .empty;
     defer fallbacks.deinit(gpa);
-    for (blobs, 0..) |bytes, i| {
-        const id = try type_ctx.addFont(bytes, .{});
-        if (i != 0) try fallbacks.append(gpa, id);
+    for (blobs, 0..) |blob, i| {
+        const id = type_ctx.addFont(blob.bytes, .{ .style = blob.style }) catch continue;
+        const styled = blob.style.bold or blob.style.italic;
+        if (i != 0 and !styled) try fallbacks.append(gpa, id);
     }
+    if (type_ctx.primary == null) return error.InvalidFont;
     if (fallbacks.items.len != 0) try type_ctx.setFallbacks(fallbacks.items);
 }
 
@@ -918,9 +965,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     });
     defer type_ctx.deinit();
 
-    var font_blobs: std.ArrayList([]u8) = .empty;
+    var font_blobs: std.ArrayList(FontBlob) = .empty;
     defer {
-        for (font_blobs.items) |b| allocator.free(b);
+        for (font_blobs.items) |b| allocator.free(b.bytes);
         font_blobs.deinit(allocator);
     }
 
@@ -1006,20 +1053,20 @@ pub fn main(init: std.process.Init.Minimal) !void {
             size_px = fontPixels(config, scale);
             term.applyScheme(config.scheme);
 
-            var new_blobs: std.ArrayList([]u8) = .empty;
+            var new_blobs: std.ArrayList(FontBlob) = .empty;
             if (loadFonts(io.io(), allocator, &new_blobs, config.family())) |_| {
                 if (bindFonts(allocator, &type_ctx, new_blobs.items)) |_| {
-                    for (font_blobs.items) |b| allocator.free(b);
+                    for (font_blobs.items) |b| allocator.free(b.bytes);
                     font_blobs.deinit(allocator);
                     font_blobs = new_blobs;
                     type_ptr = &type_ctx;
                 } else |_| {
                     bindFonts(allocator, &type_ctx, font_blobs.items) catch {};
-                    for (new_blobs.items) |b| allocator.free(b);
+                    for (new_blobs.items) |b| allocator.free(b.bytes);
                     new_blobs.deinit(allocator);
                 }
             } else |_| {
-                for (new_blobs.items) |b| allocator.free(b);
+                for (new_blobs.items) |b| allocator.free(b.bytes);
                 new_blobs.deinit(allocator);
             }
             applyMetrics(type_ptr, size_px, scale, config.pad_px, &cell_w, &cell_h, &pad_px);

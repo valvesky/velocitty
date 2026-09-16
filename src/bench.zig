@@ -34,25 +34,35 @@ fn out(comptime fmt: []const u8, args: anytype) void {
 
 pub fn main() !void {
     const gpa = std.heap.page_allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    std.debug.print("bench: start\n", .{});
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    std.debug.print("bench: io\n", .{});
 
     log_buf = .init(gpa);
     defer log_buf.deinit();
 
     const stamp = utcStamp(io);
+    std.debug.print("bench: stamp\n", .{});
     const git = try gitRev(gpa, io);
     defer gpa.free(git.hash);
+    std.debug.print("bench: git\n", .{});
 
     var buf = try CircBuffer.create(gpa, ring_cap);
     defer buf.destroy();
+    std.debug.print("bench: circ\n", .{});
 
     var term = try VtState.init(gpa, cols, rows, 1000, buf.storage);
     defer term.deinit();
+    std.debug.print("bench: vt\n", .{});
 
     const payload = try makePayload(gpa, ring_cap, cols);
     defer gpa.free(payload);
+    std.debug.print("bench: payload\n", .{});
 
     ingest(&buf, payload);
+    std.debug.print("bench: ingest\n", .{});
 
     out("utc  {s}\n", .{stamp.iso});
     out("git  {s}{s}\n", .{ git.hash, if (git.dirty) " dirty" else "" });
@@ -73,7 +83,7 @@ pub fn main() !void {
     try benchVt(&buf, &term, payload);
     try benchUnicode(gpa);
 
-    const font_bytes = loadFont(gpa) catch null;
+    const font_bytes = loadFont(io, gpa) catch null;
     defer if (font_bytes) |b| gpa.free(b);
 
     var type_ctx: ?Type.Context = null;
@@ -729,8 +739,7 @@ fn makeCjkPayload(gpa: std.mem.Allocator, nbytes: usize, width: u16) ![]u8 {
     return buf;
 }
 
-fn loadFont(gpa: std.mem.Allocator) ![]u8 {
-    const io = std.Io.Threaded.global_single_threaded.io();
+fn loadFont(io: std.Io, gpa: std.mem.Allocator) ![]u8 {
     for (font_paths) |path| {
         if (loadFontPath(io, gpa, path)) |bytes| return bytes else |_| {}
     }
@@ -847,6 +856,16 @@ fn utcStamp(io: std.Io) Stamp {
     const yd = es.getEpochDay().calculateYearDay();
     const md = yd.calculateMonthDay();
     const ds = es.getDaySeconds();
+    std.debug.print("bench: ns={d} secs={d} y={d} mo={d} d={d} {d}:{d}:{d}\n", .{
+        ts.nanoseconds,
+        secs,
+        yd.year,
+        md.month.numeric(),
+        @as(u8, md.day_index) + 1,
+        ds.getHoursIntoDay(),
+        ds.getMinutesIntoHour(),
+        ds.getSecondsIntoMinute(),
+    });
     var iso: [20]u8 = undefined;
     var file: [16]u8 = undefined;
     _ = std.fmt.bufPrint(&iso, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{

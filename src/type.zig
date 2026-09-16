@@ -19,7 +19,9 @@ const assert = std.debug.assert;
 
 pub const TrueType = @import("type/truetype.zig");
 pub const Atlas = @import("type/atlas.zig").Atlas;
+const AtlasRgba = @import("type/atlas.zig").AtlasRgba;
 pub const Cache = @import("type/cache.zig");
+const EastAsian = @import("type/eastasian.zig");
 
 
 
@@ -75,6 +77,7 @@ pub const Glyph = struct {
     height: u16,
     atlas_x: u16,
     atlas_y: u16,
+    color: bool = false,
 };
 
 pub const Cell = struct {
@@ -116,7 +119,11 @@ pub const Context = struct {
     faces: std.ArrayList(Face),
     fallbacks: std.ArrayList(FontId),
     primary: ?FontId,
+    bold: ?FontId = null,
+    italic: ?FontId = null,
+    bold_italic: ?FontId = null,
     atlas: Atlas,
+    color_atlas: AtlasRgba,
     cache: Cache.Lru(GlyphKey, Glyph),
     ascii: [ascii_n]?Glyph = @splat(null),
     replacement: ?Glyph = null,
@@ -129,6 +136,8 @@ pub const Context = struct {
         assert(options.cache_capacity > 0);
         var atlas = try Atlas.init(allocator, options.atlas_width, options.atlas_height);
         errdefer atlas.deinit();
+        var color_atlas = try AtlasRgba.init(allocator, options.atlas_width, options.atlas_height);
+        errdefer color_atlas.deinit();
         const cache = try Cache.Lru(GlyphKey, Glyph).init(allocator, options.cache_capacity);
         return .{
             .allocator = allocator,
@@ -137,6 +146,7 @@ pub const Context = struct {
             .fallbacks = .empty,
             .primary = null,
             .atlas = atlas,
+            .color_atlas = color_atlas,
             .cache = cache,
         };
     }
@@ -144,6 +154,7 @@ pub const Context = struct {
     pub fn deinit(self: *Context) void {
         self.cache.deinit();
         self.atlas.deinit();
+        self.color_atlas.deinit();
         self.fallbacks.deinit(self.allocator);
         self.faces.deinit(self.allocator);
         self.* = undefined;
@@ -154,6 +165,9 @@ pub const Context = struct {
         self.faces.clearRetainingCapacity();
         self.fallbacks.clearRetainingCapacity();
         self.primary = null;
+        self.bold = null;
+        self.italic = null;
+        self.bold_italic = null;
         self.resetGlyphCaches();
         self.ascii_size = 0;
     }
@@ -162,13 +176,23 @@ pub const Context = struct {
     pub fn addFont(self: *Context, bytes: []const u8, options: FaceOptions) Error!FontId {
         const font = try TrueType.Font.open(bytes);
         const id: FontId = @enumFromInt(@as(u32, @intCast(self.faces.items.len)));
+        var opened = font;
+        if (!self.options.color_emoji) opened.color = null;
+        if (!opened.outline and opened.color == null) return error.InvalidFont;
         try self.faces.append(self.allocator, .{
             .id = id,
-            .font = font,
-            .weight = options.weight orelse .regular,
+            .font = opened,
+            .weight = options.weight orelse (if (options.style.bold) Weight.bold else Weight.regular),
             .style = options.style,
         });
         if (self.primary == null) self.primary = id;
+        if (options.style.bold and options.style.italic) {
+            self.bold_italic = id;
+        } else if (options.style.bold) {
+            self.bold = id;
+        } else if (options.style.italic) {
+            self.italic = id;
+        }
         return id;
     }
 
@@ -196,7 +220,7 @@ pub const Context = struct {
         while (cp <= ascii_hi) : (cp += 1) {
             const slot = cp - ascii_lo;
             if (self.ascii[slot] != null) continue;
-            self.ascii[slot] = try self.rasterize(cp, self.ascii_size);
+            self.ascii[slot] = try self.rasterize(cp, self.ascii_size, .{});
         }
     }
 
@@ -207,6 +231,7 @@ pub const Context = struct {
 
     fn resetGlyphCaches(self: *Context) void {
         self.atlas.clear();
+        self.color_atlas.clear();
         self.cache.clear();
         self.ascii = @splat(null);
         self.replacement = null;
@@ -220,19 +245,24 @@ pub const Context = struct {
 
     /// Hot-path lookup. No stats, no raster, no LRU move.
     pub fn peekGlyph(self: *const Context, codepoint: u21, size_px: f32) ?Glyph {
+        return self.peekGlyphStyled(codepoint, size_px, .{});
+    }
+
+    pub fn peekGlyphStyled(self: *const Context, codepoint: u21, size_px: f32, style: Style) ?Glyph {
         if (size_px <= 0) return null;
         const size_u: u16 = @intFromFloat(@max(1, @round(size_px)));
         if (size_u != self.ascii_size) return null;
-        if (codepoint >= ascii_lo and codepoint <= ascii_hi) {
+        const styled = style.bold or style.italic;
+        if (!styled and codepoint >= ascii_lo and codepoint <= ascii_hi) {
             return self.ascii[codepoint - ascii_lo];
         }
-        if (codepoint == 0xFFFD) return self.replacement;
-        const resolved = self.resolve(codepoint) catch return null;
+        if (!styled and codepoint == 0xFFFD) return self.replacement;
+        const resolved = self.resolve(codepoint, style) catch return null;
         const key: GlyphKey = .{
             .font_id = @intFromEnum(resolved.id),
             .glyph_id = resolved.gid,
             .size_px = size_u,
-            .flags = 0,
+            .flags = styleFlags(style),
         };
         if (self.cache.peek(key)) |g| return g.*;
         return null;
@@ -242,7 +272,15 @@ pub const Context = struct {
         return self.glyph(codepoint, size_px);
     }
 
+    pub fn ensureGlyphStyled(self: *Context, codepoint: u21, size_px: f32, style: Style) Error!Glyph {
+        return self.glyphStyled(codepoint, size_px, style);
+    }
+
     pub fn glyph(self: *Context, codepoint: u21, size_px: f32) Error!Glyph {
+        return self.glyphStyled(codepoint, size_px, .{});
+    }
+
+    pub fn glyphStyled(self: *Context, codepoint: u21, size_px: f32, style: Style) Error!Glyph {
         assert(size_px > 0);
         const size_u: u16 = @intFromFloat(@max(1, @round(size_px)));
         if (size_u != self.ascii_size) {
@@ -251,31 +289,32 @@ pub const Context = struct {
             self.ascii_size = size_u;
             try self.warmAscii();
         }
-        if (codepoint >= ascii_lo and codepoint <= ascii_hi) {
+        const styled = style.bold or style.italic;
+        if (!styled and codepoint >= ascii_lo and codepoint <= ascii_hi) {
             const slot = codepoint - ascii_lo;
             if (self.ascii[slot]) |g| {
                 self.stats.hits += 1;
                 return g;
             }
-            const g = try self.rasterize(codepoint, size_u);
+            const g = try self.rasterize(codepoint, size_u, .{});
             self.ascii[slot] = g;
             return g;
         }
-        if (codepoint == 0xFFFD) {
+        if (!styled and codepoint == 0xFFFD) {
             if (self.replacement) |g| {
                 self.stats.hits += 1;
                 return g;
             }
-            const g = try self.rasterize(codepoint, size_u);
+            const g = try self.rasterize(codepoint, size_u, .{});
             self.replacement = g;
             return g;
         }
-        const resolved = try self.resolve(codepoint);
+        const resolved = try self.resolve(codepoint, style);
         const key: GlyphKey = .{
             .font_id = @intFromEnum(resolved.id),
             .glyph_id = resolved.gid,
             .size_px = size_u,
-            .flags = 0,
+            .flags = styleFlags(style),
         };
         if (self.cache.peek(key)) |g| {
             self.stats.hits += 1;
@@ -286,8 +325,8 @@ pub const Context = struct {
         return g;
     }
 
-    fn rasterize(self: *Context, codepoint: u21, size_u: u16) Error!Glyph {
-        const resolved = try self.resolve(codepoint);
+    fn rasterize(self: *Context, codepoint: u21, size_u: u16, style: Style) Error!Glyph {
+        const resolved = try self.resolve(codepoint, style);
         return self.rasterizeAt(resolved.id, resolved.gid, size_u);
     }
 
@@ -299,10 +338,15 @@ pub const Context = struct {
         const bmp = try face.font.rasterize(self.allocator, gid, size);
         defer self.allocator.free(bmp.pixels);
         const t1 = nowNs();
-        const adv_fu = try face.font.advanceWidth(gid);
-        const m = try face.font.metrics(size);
-        const scale = size / @as(f32, @floatFromInt(m.units_per_em));
-        const g = try self.pack(id, gid, bmp, @as(f32, @floatFromInt(adv_fu)) * scale);
+        const advance: f32 = if (bmp.color)
+            @floatFromInt(bmp.advance)
+        else blk: {
+            const adv_fu = try face.font.advanceWidth(gid);
+            const m = try face.font.metrics(size);
+            const scale = size / @as(f32, @floatFromInt(m.units_per_em));
+            break :blk @as(f32, @floatFromInt(adv_fu)) * scale;
+        };
+        const g = try self.pack(id, gid, bmp, advance);
         const t2 = nowNs();
         self.stats.raster_ns += @intCast(t1 - t0);
         self.stats.atlas_ns += @intCast(t2 - t1);
@@ -327,15 +371,41 @@ pub const Context = struct {
         }
     }
 
-    fn resolve(self: *const Context, codepoint: u21) Error!struct { id: FontId, gid: u16 } {
-        const primary = self.primary orelse return error.InvalidFont;
-        if (try self.faces.items[@intFromEnum(primary)].font.glyphIndex(codepoint)) |g| {
-            if (g != 0) return .{ .id = primary, .gid = g };
+    fn styleFace(self: *const Context, style: Style) ?FontId {
+        if (style.bold and style.italic) {
+            if (self.bold_italic) |id| return id;
+            if (self.italic) |id| return id;
+            if (self.bold) |id| return id;
+        } else if (style.bold) {
+            if (self.bold) |id| return id;
+        } else if (style.italic) {
+            if (self.italic) |id| return id;
         }
-        for (self.fallbacks.items) |id| {
-            if (try self.faces.items[@intFromEnum(id)].font.glyphIndex(codepoint)) |g| {
-                if (g != 0) return .{ .id = id, .gid = g };
+        return null;
+    }
+
+    fn drawableGlyph(self: *const Context, id: FontId, codepoint: u21) Error!?u16 {
+        const face = self.faces.items[@intFromEnum(id)];
+        const g = (try face.font.glyphIndex(codepoint)) orelse return null;
+        if (g == 0) return null;
+        if (!face.font.hasDrawable(g)) return null;
+        return g;
+    }
+
+    fn resolve(self: *const Context, codepoint: u21, style: Style) Error!struct { id: FontId, gid: u16 } {
+        const primary = self.primary orelse return error.InvalidFont;
+        if (self.options.color_emoji and EastAsian.isEmoji(codepoint)) {
+            for (self.fallbacks.items) |id| {
+                if (self.faces.items[@intFromEnum(id)].font.color == null) continue;
+                if (try self.drawableGlyph(id, codepoint)) |g| return .{ .id = id, .gid = g };
             }
+        }
+        if (self.styleFace(style)) |id| {
+            if (try self.drawableGlyph(id, codepoint)) |g| return .{ .id = id, .gid = g };
+        }
+        if (try self.drawableGlyph(primary, codepoint)) |g| return .{ .id = primary, .gid = g };
+        for (self.fallbacks.items) |id| {
+            if (try self.drawableGlyph(id, codepoint)) |g| return .{ .id = id, .gid = g };
         }
         return .{ .id = primary, .gid = 0 };
     }
@@ -352,6 +422,25 @@ pub const Context = struct {
                 .height = 0,
                 .atlas_x = 0,
                 .atlas_y = 0,
+            };
+        }
+        if (bmp.color) {
+            const rect = self.color_atlas.pack(bmp.width, bmp.height) orelse blk: {
+                self.resetGlyphCaches();
+                break :blk self.color_atlas.pack(bmp.width, bmp.height) orelse return error.AtlasFull;
+            };
+            self.color_atlas.blit(rect, bmp.pixels);
+            return .{
+                .font_id = id,
+                .glyph_id = gid,
+                .advance = advance,
+                .bearing_x = @floatFromInt(bmp.bearing_x),
+                .bearing_y = @floatFromInt(bmp.bearing_y),
+                .width = bmp.width,
+                .height = bmp.height,
+                .atlas_x = @intCast(rect.x),
+                .atlas_y = @intCast(rect.y),
+                .color = true,
             };
         }
         const rect = self.atlas.pack(bmp.width, bmp.height) orelse blk: {
@@ -373,6 +462,13 @@ pub const Context = struct {
     }
 };
 
+fn styleFlags(style: Style) u16 {
+    var f: u16 = 0;
+    if (style.bold) f |= 1;
+    if (style.italic) f |= 2;
+    return f;
+}
+
 fn nowNs() i128 {
     return @intCast(std.Io.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .awake).nanoseconds);
 }
@@ -382,6 +478,7 @@ test {
     _ = @import("type/atlas.zig");
     _ = @import("type/cache.zig");
     _ = @import("type/eastasian.zig");
+    _ = @import("type/cbdt.zig");
 }
 
 test "context init and addFont" {
@@ -458,4 +555,67 @@ test "glyph and layout from system font" {
     try ctx.layoutUtf8("A", 16, &cells);
     try std.testing.expectEqual(@as(usize, 1), cells.items.len);
     try std.testing.expectEqual(@as(u21, 'A'), cells.items[0].codepoint);
+}
+
+test "color emoji glyph" {
+    const gpa = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const file = std.Io.Dir.openFileAbsolute(io, "/usr/share/fonts/noto/NotoColorEmoji.ttf", .{}) catch return;
+    defer file.close(io);
+    const n = file.length(io) catch return;
+    const bytes = try gpa.alloc(u8, n);
+    defer gpa.free(bytes);
+    _ = file.readPositionalAll(io, bytes, 0) catch return;
+
+    var ctx = try Context.init(gpa, .{ .atlas_width = 256, .atlas_height = 256, .cache_capacity = 8 });
+    defer ctx.deinit();
+    _ = try ctx.addFont(bytes, .{});
+    const g = try ctx.glyph(0x1F600, 16);
+    try std.testing.expect(g.color);
+    try std.testing.expect(g.width > 4);
+    try std.testing.expect(g.height > 4);
+}
+
+test "bold face is a different glyph" {
+    const gpa = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const regular_path = "/usr/share/fonts/TTF/IosevkaNerdFontMono-Regular.ttf";
+    const bold_path = "/usr/share/fonts/TTF/IosevkaNerdFontMono-Bold.ttf";
+    const italic_path = "/usr/share/fonts/TTF/IosevkaNerdFontMono-Italic.ttf";
+    const reg_file = std.Io.Dir.openFileAbsolute(io, regular_path, .{}) catch return;
+    defer reg_file.close(io);
+    const bold_file = std.Io.Dir.openFileAbsolute(io, bold_path, .{}) catch return;
+    defer bold_file.close(io);
+    const italic_file = std.Io.Dir.openFileAbsolute(io, italic_path, .{}) catch return;
+    defer italic_file.close(io);
+
+    const load = struct {
+        fn go(io_: std.Io, gpa_: std.mem.Allocator, file: std.Io.File) ![]u8 {
+            const n = try file.length(io_);
+            const bytes = try gpa_.alloc(u8, n);
+            errdefer gpa_.free(bytes);
+            _ = try file.readPositionalAll(io_, bytes, 0);
+            return bytes;
+        }
+    }.go;
+
+    const regular = try load(io, gpa, reg_file);
+    defer gpa.free(regular);
+    const bold = try load(io, gpa, bold_file);
+    defer gpa.free(bold);
+    const italic = try load(io, gpa, italic_file);
+    defer gpa.free(italic);
+
+    var ctx = try Context.init(gpa, .{ .atlas_width = 256, .atlas_height = 256, .cache_capacity = 16 });
+    defer ctx.deinit();
+    _ = try ctx.addFont(regular, .{});
+    _ = try ctx.addFont(bold, .{ .style = .{ .bold = true }, .weight = .bold });
+    _ = try ctx.addFont(italic, .{ .style = .{ .italic = true } });
+
+    const a = try ctx.glyphStyled('A', 16, .{});
+    const b = try ctx.glyphStyled('A', 16, .{ .bold = true });
+    const i = try ctx.glyphStyled('A', 16, .{ .italic = true });
+    try std.testing.expect(a.font_id != b.font_id);
+    try std.testing.expect(a.font_id != i.font_id);
+    try std.testing.expect(b.width > 0 and i.width > 0);
 }

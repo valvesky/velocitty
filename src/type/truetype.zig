@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const Cbdt = @import("cbdt.zig");
 
 const c = struct {
     extern fn zt_stb_init(storage: *anyopaque, data: [*]const u8, len: c_int) callconv(.c) c_int;
@@ -11,6 +12,7 @@ const c = struct {
     extern fn zt_stb_advance(storage: *const anyopaque, glyph: c_int) callconv(.c) c_int;
     extern fn zt_stb_glyph_box(storage: *const anyopaque, glyph: c_int, size_px: f32, x0: *c_int, y0: *c_int, x1: *c_int, y1: *c_int) callconv(.c) void;
     extern fn zt_stb_make_glyph(storage: *const anyopaque, glyph: c_int, size_px: f32, out: [*]u8, w: c_int, h: c_int) callconv(.c) void;
+    extern fn zt_stb_glyph_empty(storage: *const anyopaque, glyph: c_int) callconv(.c) c_int;
 };
 
 const info_cap = 256;
@@ -29,6 +31,7 @@ pub const Bitmap = struct {
     bearing_y: i16,
     advance: u16,
     pixels: []u8,
+    color: bool = false,
 };
 
 pub const Metrics = struct {
@@ -41,13 +44,15 @@ pub const Metrics = struct {
 pub const Font = struct {
     bytes: []const u8,
     info: [info_cap]u8 align(8) = undefined,
+    outline: bool = false,
+    color: ?Cbdt.ColorFont = null,
 
     pub fn open(bytes: []const u8) Error!Font {
         if (bytes.len < 12) return error.InvalidFont;
         var font: Font = .{ .bytes = bytes };
-        if (c.zt_stb_init(&font.info, bytes.ptr, @intCast(bytes.len)) == 0) {
-            return error.InvalidFont;
-        }
+        font.outline = c.zt_stb_init(&font.info, bytes.ptr, @intCast(bytes.len)) != 0;
+        font.color = Cbdt.ColorFont.parse(bytes);
+        if (!font.outline and font.color == null) return error.InvalidFont;
         return font;
     }
 
@@ -57,37 +62,92 @@ pub const Font = struct {
 
     pub fn metrics(self: Font, size_px: f32) Error!Metrics {
         assert(size_px > 0);
-        var ascent: c_int = 0;
-        var descent: c_int = 0;
-        var line_gap: c_int = 0;
-        var upem: c_int = 0;
-        c.zt_stb_vmetrics(self.storage(), &ascent, &descent, &line_gap, &upem);
-        if (upem <= 0) return error.InvalidFont;
-        const scale = size_px / @as(f32, @floatFromInt(upem));
+        if (self.outline) {
+            var ascent: c_int = 0;
+            var descent: c_int = 0;
+            var line_gap: c_int = 0;
+            var upem: c_int = 0;
+            c.zt_stb_vmetrics(self.storage(), &ascent, &descent, &line_gap, &upem);
+            if (upem <= 0) return error.InvalidFont;
+            const scale = size_px / @as(f32, @floatFromInt(upem));
+            return .{
+                .ascender = @as(f32, @floatFromInt(ascent)) * scale,
+                .descender = @as(f32, @floatFromInt(descent)) * scale,
+                .line_gap = @as(f32, @floatFromInt(line_gap)) * scale,
+                .units_per_em = @intCast(upem),
+            };
+        }
+        const col = self.color orelse return error.InvalidFont;
+        if (col.units_per_em == 0) return error.InvalidFont;
+        const scale = size_px / @as(f32, @floatFromInt(col.units_per_em));
         return .{
-            .ascender = @as(f32, @floatFromInt(ascent)) * scale,
-            .descender = @as(f32, @floatFromInt(descent)) * scale,
-            .line_gap = @as(f32, @floatFromInt(line_gap)) * scale,
-            .units_per_em = @intCast(upem),
+            .ascender = @as(f32, @floatFromInt(col.ascender)) * scale,
+            .descender = @as(f32, @floatFromInt(col.descender)) * scale,
+            .line_gap = @as(f32, @floatFromInt(col.line_gap)) * scale,
+            .units_per_em = col.units_per_em,
         };
     }
 
     pub fn advanceWidth(self: Font, glyph_id: u16) Error!u16 {
-        const n = c.zt_stb_num_glyphs(self.storage());
-        if (glyph_id >= n) return error.GlyphNotFound;
-        const adv = c.zt_stb_advance(self.storage(), glyph_id);
-        if (adv < 0) return 0;
-        return std.math.cast(u16, adv) orelse std.math.maxInt(u16);
+        if (self.outline) {
+            const n = c.zt_stb_num_glyphs(self.storage());
+            if (glyph_id >= n) return error.GlyphNotFound;
+            const adv = c.zt_stb_advance(self.storage(), glyph_id);
+            if (adv < 0) return 0;
+            return std.math.cast(u16, adv) orelse std.math.maxInt(u16);
+        }
+        const col = self.color orelse return error.GlyphNotFound;
+        if (glyph_id >= col.num_glyphs) return error.GlyphNotFound;
+        return col.advanceWidth(glyph_id);
     }
 
     pub fn glyphIndex(self: Font, codepoint: u21) Error!?u16 {
-        const g = c.zt_stb_find_glyph(self.storage(), @intCast(codepoint));
-        if (g <= 0) return null;
-        return std.math.cast(u16, g) orelse return error.InvalidFont;
+        if (self.color) |col| {
+            if (col.glyphIndex(codepoint)) |g| {
+                if (g != 0) return g;
+            }
+        }
+        if (self.outline) {
+            const g = c.zt_stb_find_glyph(self.storage(), @intCast(codepoint));
+            if (g <= 0) return null;
+            return std.math.cast(u16, g) orelse return error.InvalidFont;
+        }
+        return null;
+    }
+
+    pub fn hasDrawable(self: Font, glyph_id: u16) bool {
+        if (self.color) |col| {
+            if (col.hasBitmap(glyph_id)) return true;
+        }
+        if (self.outline) {
+            return c.zt_stb_glyph_empty(self.storage(), glyph_id) == 0;
+        }
+        return false;
     }
 
     pub fn rasterize(self: Font, allocator: std.mem.Allocator, glyph_id: u16, size_px: f32) Error!Bitmap {
         assert(size_px > 0);
+        if (self.color) |col| {
+            if (try col.rasterize(allocator, glyph_id, size_px)) |bmp| return .{
+                .width = bmp.width,
+                .height = bmp.height,
+                .bearing_x = bmp.bearing_x,
+                .bearing_y = bmp.bearing_y,
+                .advance = bmp.advance,
+                .pixels = bmp.pixels,
+                .color = true,
+            };
+        }
+        if (!self.outline) {
+            return .{
+                .width = 0,
+                .height = 0,
+                .bearing_x = 0,
+                .bearing_y = 0,
+                .advance = 0,
+                .pixels = try allocator.alloc(u8, 0),
+            };
+        }
         const n = c.zt_stb_num_glyphs(self.storage());
         if (glyph_id >= n) return error.GlyphNotFound;
         const m = try self.metrics(size_px);

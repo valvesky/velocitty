@@ -1,0 +1,42 @@
+CJK
+  漢字 日本語 한국어 中文 繁體 简体
+  あいうえお アイウエオ ㄱㄴㄷㄹ
+  全角ＡＢＣ１２３　半角ABC123
+  「引用」『書名』【括号】〈書名〉
+  〇一二三四五六七八九十
+
+Emoji
+  faces: 😀 😃 😄 😁 😆 😅 🤣 😂 🙂 😉 😊 😇
+  hearts: ❤️ 🧡 💛 💚 💙 💜 🖤 🤍 🤎 💔 ❣️ 💕
+  hands: 👍 👎 👋 🤝 ✌️ 🤞 🫶 👏 🙌
+  skin: 👋🏻 👋🏼 👋🏽 👋🏾 👋🏿
+  food: 🍎 🍕 🍣 🍜 🧋 🍵
+  animals: 🐱 🐶 🦊 🐼 🦄 🐙
+  flags: 🇯🇵 🇰🇷 🇨🇳 🇺🇸 🇪🇺 🇺🇳
+  ZWJ: 👨‍👩‍👧‍👦 👩‍💻 🧑‍🚀 🏳️‍🌈 🏳️‍⚧️
+  keycap: 1️⃣ 2️⃣ 3️⃣ #️⃣ *️⃣
+  extra: ✨ 🔥 💯 ⭐ 🌙 ☀️ ⚡ ❄️
+
+Combining / marks
+  café naïve résumé coöperate
+  á ê ï õ ù ñ (combining)
+  x̅ y⃗ ż  (overlines / vectors)
+  हिन्दी (Devanagari)
+  العربية (Arabic RTL)
+  עברית (Hebrew RTL)
+ ไทย (Thai)
+  русский (Cyrillic)
+  Ελληνικά (Greek)
+  ᚠᚢᚦᚨᚱᚲ (Runic)
+
+Symbols
+  math: ∀∃∅∈∉⊂⊃∪∩∞≈≠≤≥±×÷√∑∏∫∂∇
+  arrows: ← → ↑ ↓ ↔ ↕ ⇐ ⇒ ⇔ ➜ ➔
+  box: ┌─┬─┐ │ ├─┼─┤ └─┴─┘ ═ ║ ╔╗╚╝
+  blocks: ░▒▓█▀▄▌▐ ■□▪▫●○◆◇★☆
+  currency: $ € £ ¥ ₹ ₩ ₿ ₽
+  punctuation: … — – • · «» ‹› „“ ” ‘ ’
+  misc: © ® ™ ° µ ¶ § † ‡ ‰
+
+Mixed line
+  Hello 世界 🌍 café — 日本語AB 한국어 🚀 ∑∫∂ 家族👨‍👩‍👧
