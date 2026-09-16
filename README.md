@@ -1,5 +1,4 @@
 <!-- LOGO -->
-<h1>
 <p align="center">
   <pre>
  ▄█    █▄     ▄████████  ▄█        ▄██████▄   ▄████████  ▄█      ███         ███     ▄██   ▄   
@@ -12,7 +11,6 @@
  ▀██████▀    ██████████ █████▄▄██  ▀██████▀  ████████▀  █▀      ▄████▀      ▄████▀    ▀█████▀  
                         ▀                                                                      
 </pre>
-</h1>
   <p align="center">
     <br />
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License: MIT"></a>
