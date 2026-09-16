@@ -1,6 +1,9 @@
 <!-- LOGO -->
-<p align="center">
-  <pre>
+<div align="center">
+<table>
+<tr><td>
+
+```
  ▄█    █▄     ▄████████  ▄█        ▄██████▄   ▄████████  ▄█      ███         ███     ▄██   ▄   
 ███    ███   ███    ███ ███       ███    ███ ███    ███ ███  ▀█████████▄ ▀█████████▄ ███   ██▄ 
 ███    ███   ███    █▀  ███       ███    ███ ███    █▀  ███▌    ▀███▀▀██    ▀███▀▀██ ███▄▄▄███ 
@@ -9,9 +12,12 @@
 ███    ███   ███    █▄  ███       ███    ███ ███    █▄  ███      ███         ███     ███   ███ 
 ███    ███   ███    ███ ███▌    ▄ ███    ███ ███    ███ ███      ███         ███     ███   ███ 
  ▀██████▀    ██████████ █████▄▄██  ▀██████▀  ████████▀  █▀      ▄████▀      ▄████▀    ▀█████▀  
-                        ▀                                                                      
-</pre>
-  <p align="center">
+                        ▀
+```
+
+</td></tr>
+</table>
+<p align="center">
     <br />
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License: MIT"></a>
     <a href="https://github.com/valvesky/velocitty"><img src="https://img.shields.io/github/languages/top/valvesky/velocitty?style=flat-square" alt="Language"></a>
@@ -30,7 +36,7 @@
     <!-- · -->
     <!-- <a href="#shoutouts">Shoutouts</a> -->
   </p>
-</p>
+</div>
 
 Velocitty is a lightning-fast terminal for omarchy.
 
