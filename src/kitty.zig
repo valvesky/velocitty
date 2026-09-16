@@ -449,6 +449,45 @@ pub const Store = struct {
         }
     }
 
+    pub fn placeBitmap(
+        self: *Store,
+        rgba: []u8,
+        width: u32,
+        height: u32,
+        cursor: Cursor,
+        which: u1,
+        columns: u32,
+        rows: u32,
+    ) void {
+        const id = self.next_id;
+        self.next_id +|= 1;
+        if (self.next_id == 0) self.next_id = 1;
+        self.upsertImage(.{ .id = id, .width = width, .height = height, .rgba = rgba }) catch {
+            self.allocator.free(rgba);
+            return;
+        };
+        self.place(.{
+            .id = id,
+            .columns = columns,
+            .rows = rows,
+            .cursor_move = false,
+        }, cursor, which);
+        self.dirty = true;
+    }
+
+    pub fn dropHistory(self: *Store, which: u1) void {
+        var i: usize = self.placements.items.len;
+        while (i > 0) {
+            i -= 1;
+            const p = self.placements.items[i];
+            if (p.screen == which and p.row < 0) {
+                const id = p.image_id;
+                _ = self.placements.orderedRemove(i);
+                if (!self.hasPlacement(id)) self.removeImage(id);
+            }
+        }
+    }
+
     fn movedCursor(self: *const Store, cmd: Command, cursor: Cursor, cols: u16, rows: u16) ?Cursor {
         _ = self;
         if (!cmd.cursor_move) return null;

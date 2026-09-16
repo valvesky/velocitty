@@ -12,6 +12,7 @@ const c = @cImport({
     @cInclude("X11/Xatom.h");
     @cInclude("X11/keysym.h");
     @cInclude("X11/extensions/XInput2.h");
+    @cInclude("X11/cursorfont.h");
 });
 
 const XiAxis = struct {
@@ -60,6 +61,12 @@ pub const Window = struct {
     clip_buf: []u8 = &.{},
     primary_buf: []u8 = &.{},
     pointer_grabbed: bool = false,
+    cursor: c.Cursor = 0,
+    atom_net_name: c.Atom = 0,
+    atom_opacity: c.Atom = 0,
+    /// Core PointerMotionMask (DECSET 1003). Off by default — XI_Motion + this
+    /// together flood the X fd on every pixel.
+    all_motion: bool = false,
 
     gpa: std.mem.Allocator,
 
@@ -87,19 +94,7 @@ pub const Window = struct {
         );
         errdefer _ = c.XDestroyWindow(display, win);
 
-        // Select input events
-        _ = c.XSelectInput(
-            display,
-            win,
-            c.KeyPressMask |
-                c.KeyReleaseMask |
-                c.ButtonPressMask |
-                c.ButtonReleaseMask |
-                c.ButtonMotionMask |
-                c.StructureNotifyMask |
-                c.ExposureMask |
-                c.FocusChangeMask,
-        );
+        _ = c.XSelectInput(display, win, coreInputMask(false));
 
         // Intercept close button clicks
         const wm_delete = c.XInternAtom(display, "WM_DELETE_WINDOW", c.False);
@@ -114,7 +109,9 @@ pub const Window = struct {
         _ = c.XSetClassHint(display, win, &class_hint);
         _ = c.XMapWindow(display, win);
 
-        const gc = c.XCreateGC(display, win, 0, null);
+        var gc_vals: c.XGCValues = std.mem.zeroes(c.XGCValues);
+        gc_vals.graphics_exposures = 0;
+        const gc = c.XCreateGC(display, win, c.GCGraphicsExposures, &gc_vals);
         errdefer _ = c.XFreeGC(display, gc);
 
         // Allocate framebuffer backing store
@@ -147,6 +144,9 @@ pub const Window = struct {
         self.atom_targets = c.XInternAtom(display, "TARGETS", c.False);
         self.atom_utf8 = c.XInternAtom(display, "UTF8_STRING", c.False);
         self.atom_selection_prop = c.XInternAtom(display, "ZT_SELECTION", c.False);
+        self.atom_net_name = c.XInternAtom(display, "_NET_WM_NAME", c.False);
+        self.atom_opacity = c.XInternAtom(display, "_NET_WM_WINDOW_OPACITY", c.False);
+        self.cursor = 0;
 
         self.framebuffer = .{
             .pixels = pixels,
@@ -161,6 +161,7 @@ pub const Window = struct {
         self.clip_buf = &.{};
         self.primary_buf = &.{};
         self.pointer_grabbed = false;
+        self.all_motion = false;
         initXi(self);
     }
 
@@ -168,6 +169,10 @@ pub const Window = struct {
         if (self.pointer_grabbed) {
             _ = c.XUngrabPointer(self.display, c.CurrentTime);
             self.pointer_grabbed = false;
+        }
+        if (self.cursor != 0) {
+            _ = c.XFreeCursor(self.display, self.cursor);
+            self.cursor = 0;
         }
         if (self.paste_buf.len != 0) self.gpa.free(self.paste_buf);
         if (self.clip_buf.len != 0) self.gpa.free(self.clip_buf);
@@ -191,6 +196,13 @@ pub const Window = struct {
     /// True if Xlib already has events (fd may be idle). Never sleep on eventFd in that case.
     pub fn eventsPending(self: *Window) bool {
         return c.XPending(self.display) > 0;
+    }
+
+    /// Core motion without a button (DECSET 1003). Button-drag uses ButtonMotionMask.
+    pub fn setAllMotion(self: *Window, on: bool) void {
+        if (self.all_motion == on) return;
+        self.all_motion = on;
+        _ = c.XSelectInput(self.display, self.window, coreInputMask(on));
     }
 
     pub fn pollEvent(self: *Window, ev: *Platform.Event) bool {
@@ -270,15 +282,6 @@ pub const Window = struct {
                 },
                 c.ButtonPress => {
                     const button = xev.xbutton.button;
-                    if (button == 1) {
-                        grabPointer(self);
-                        ev.* = .{ .mouse_down = mouseFromButton(&xev.xbutton) };
-                        return true;
-                    }
-                    if (button == 2) {
-                        ev.* = .{ .paste_request = .primary };
-                        return true;
-                    }
                     if (button == 4 or button == 5) {
                         ev.* = .{ .mouse_wheel = .{
                             .up = button == 4,
@@ -288,18 +291,28 @@ pub const Window = struct {
                         } };
                         return true;
                     }
+                    if (button >= 1 and button <= 3) {
+                        if (button == 1) grabPointer(self);
+                        ev.* = .{ .mouse_down = mouseFromButton(&xev.xbutton) };
+                        return true;
+                    }
                 },
                 c.ButtonRelease => {
-                    if (xev.xbutton.button == 1) {
-                        ungrabPointer(self);
+                    const button = xev.xbutton.button;
+                    if (button == 1) ungrabPointer(self);
+                    if (button >= 1 and button <= 3) {
                         ev.* = .{ .mouse_up = mouseFromButton(&xev.xbutton) };
                         return true;
                     }
                 },
                 c.MotionNotify => {
-                    if (xev.xmotion.state & c.Button1Mask == 0) continue;
+                    while (c.XCheckTypedWindowEvent(self.display, self.window, c.MotionNotify, &xev) != 0) {}
+                    var btn: u8 = 0;
+                    if (xev.xmotion.state & c.Button1Mask != 0) btn = 1;
+                    if (xev.xmotion.state & c.Button2Mask != 0) btn = 2;
+                    if (xev.xmotion.state & c.Button3Mask != 0) btn = 3;
                     ev.* = .{ .mouse_move = .{
-                        .button = 1,
+                        .button = btn,
                         .x = xev.xmotion.x,
                         .y = xev.xmotion.y,
                         .mods = getMods(xev.xmotion.state),
@@ -375,6 +388,62 @@ pub const Window = struct {
         _ = c.XFlush(self.display);
     }
 
+    pub fn setTitle(self: *Window, title: [:0]const u8) void {
+        _ = c.XStoreName(self.display, self.window, title);
+        _ = c.XChangeProperty(
+            self.display,
+            self.window,
+            self.atom_net_name,
+            self.atom_utf8,
+            8,
+            c.PropModeReplace,
+            title,
+            @intCast(title.len),
+        );
+        _ = c.XFlush(self.display);
+    }
+
+    pub fn setClass(self: *Window, class: [:0]const u8) void {
+        var hint = c.XClassHint{
+            .res_name = @constCast(class),
+            .res_class = @constCast(class),
+        };
+        _ = c.XSetClassHint(self.display, self.window, &hint);
+        _ = c.XFlush(self.display);
+    }
+
+    pub fn setOpacity(self: *Window, alpha: u8) void {
+        var val: c_ulong = @as(c_ulong, alpha) *% 0x01010101;
+        _ = c.XChangeProperty(
+            self.display,
+            self.window,
+            self.atom_opacity,
+            c.XA_CARDINAL,
+            32,
+            c.PropModeReplace,
+            @ptrCast(&val),
+            1,
+        );
+        _ = c.XFlush(self.display);
+    }
+
+    pub fn setPointer(self: *Window, shape: u8) void {
+        const glyph: c_uint = switch (shape) {
+            1 => c.XC_xterm,
+            2 => c.XC_hand2,
+            3 => c.XC_watch,
+            4 => c.XC_crosshair,
+            5 => c.XC_X_cursor,
+            6 => c.XC_question_arrow,
+            else => c.XC_left_ptr,
+        };
+        const cur = c.XCreateFontCursor(self.display, glyph);
+        _ = c.XDefineCursor(self.display, self.window, cur);
+        if (self.cursor != 0) _ = c.XFreeCursor(self.display, self.cursor);
+        self.cursor = cur;
+        _ = c.XFlush(self.display);
+    }
+
     fn resizeFramebuffer(self: *Window, w: u32, h: u32) !void {
         if (w == 0 or h == 0) return;
         if (w == self.width and h == self.height) return;
@@ -397,6 +466,19 @@ pub const Window = struct {
         self.gpa.free(old);
     }
 };
+
+fn coreInputMask(all_motion: bool) c_long {
+    var mask: c_long = c.KeyPressMask |
+        c.KeyReleaseMask |
+        c.ButtonPressMask |
+        c.ButtonReleaseMask |
+        c.ButtonMotionMask |
+        c.StructureNotifyMask |
+        c.ExposureMask |
+        c.FocusChangeMask;
+    if (all_motion) mask |= c.PointerMotionMask;
+    return mask;
+}
 
 fn xiMaskIsSet(mask: [*]const u8, mask_len: c_int, bit: i32) bool {
     if (bit < 0) return false;
@@ -422,15 +504,6 @@ fn initXi(self: *Window) void {
     if (c.XIQueryVersion(self.display, &major, &minor) != c.Success) return;
     self.xi_opcode = opcode;
 
-    var mask = [_]u8{0} ** 4;
-    xiSetMask(&mask, c.XI_Motion);
-    var evmask = c.XIEventMask{
-        .deviceid = c.XIAllMasterDevices,
-        .mask_len = mask.len,
-        .mask = &mask,
-    };
-    _ = c.XISelectEvents(self.display, self.window, &evmask, 1);
-
     var ndevices: c_int = 0;
     const info = c.XIQueryDevice(self.display, c.XIAllDevices, &ndevices);
     if (info == null) return;
@@ -438,14 +511,21 @@ fn initXi(self: *Window) void {
 
     var n: u8 = 0;
     var i: c_int = 0;
+    var select_ids: [8]i32 = undefined;
+    var nselect: u8 = 0;
     while (i < ndevices) : (i += 1) {
         const dev = info[@intCast(i)];
+        // Master-pointer XI_Motion is every pixel. Only listen on scroll slaves
+        // (XWayland trackpads) so a resting cursor does not keep the X fd hot.
+        if (dev.use != c.XISlavePointer and dev.use != c.XIFloatingSlave) continue;
+        var has_vert = false;
         var j: c_int = 0;
         while (j < dev.num_classes) : (j += 1) {
             const class = dev.classes[@intCast(j)] orelse continue;
             if (class.*.type != c.XIScrollClass) continue;
             const scroll: *c.XIScrollClassInfo = @ptrCast(@alignCast(class));
             if (scroll.scroll_type != c.XIScrollTypeVertical) continue;
+            has_vert = true;
             if (n >= self.xi_axes.len) break;
             var inc = scroll.increment;
             if (inc == 0 or !std.math.isFinite(inc)) inc = 1;
@@ -456,8 +536,26 @@ fn initXi(self: *Window) void {
             };
             n += 1;
         }
+        if (has_vert and nselect < select_ids.len) {
+            select_ids[nselect] = dev.deviceid;
+            nselect += 1;
+        }
     }
     self.xi_axis_n = n;
+
+    if (nselect == 0) return;
+    var mask = [_]u8{0} ** 4;
+    xiSetMask(&mask, c.XI_Motion);
+    var evmasks: [8]c.XIEventMask = undefined;
+    var m: u8 = 0;
+    while (m < nselect) : (m += 1) {
+        evmasks[m] = .{
+            .deviceid = select_ids[m],
+            .mask_len = mask.len,
+            .mask = &mask,
+        };
+    }
+    _ = c.XISelectEvents(self.display, self.window, &evmasks, @intCast(nselect));
 }
 
 fn wheelFromXi(self: *Window, dev: *c.XIDeviceEvent, ev: *Platform.Event) bool {

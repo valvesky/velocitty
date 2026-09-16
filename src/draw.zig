@@ -6,6 +6,7 @@ const Term = @import("vt.zig");
 const Type = @import("type.zig");
 const Box = @import("draw/box.zig");
 const Select = @import("select.zig");
+const Debug = @import("debug.zig");
 
 const vec_len = std.simd.suggestVectorLength(u32) orelse 4;
 
@@ -145,7 +146,8 @@ pub const Frame = struct {
 
         const use_bits = have_prev and screen.scrollOffset() == 0 and scroll == 0;
         var paint_buf: [512]bool = @splat(false);
-        const paint_all = rows > paint_buf.len;
+        const overlay_on = Debug.live and screen.debug_overlay.any();
+        const paint_all = rows > paint_buf.len or overlay_on;
         var r: u16 = 0;
         while (r < rows) : (r += 1) {
             const cursor_row = mustPaintCursorRow(r, self.prev_cursor, self.prev_cursor_on, cur, cur_on) or
@@ -207,7 +209,7 @@ pub const Frame = struct {
                 if (gr < 0 or gr >= rows) continue;
                 const rr: u16 = @intCast(gr);
                 const line = screen.rowCells(rr);
-                blitLine(self, line, rr, 0, @intCast(line.len), cell_w, cell_h, type_ctx, size, baseline, clip, sel);
+                blitLine(self, screen, line, rr, 0, @intCast(line.len), cell_w, cell_h, type_ctx, size, baseline, clip, sel);
             }
             var rr: u16 = run.start;
             while (rr < run.end) : (rr += 1) {
@@ -222,6 +224,12 @@ pub const Frame = struct {
         }
         if (screen.scrollOffset() == 0) {
             blitKitty(self, screen, cell_w, cell_h);
+        }
+        if (overlay_on) {
+            paintDebugOverlay(self, screen, cell_w, cell_h, cur);
+            self.dirty_full = true;
+            self.dirty_y = 0;
+            self.dirty_h = self.height;
         }
         self.last_fill_ns = fill_ns;
         self.last_glyph_ns = glyph_ns;
@@ -286,7 +294,7 @@ fn fillRun(
     } else {
         var rr: u16 = start;
         while (rr < end) : (rr += 1) {
-            paintBg(self, screen.rowCells(rr), rr, cell_w, cell_h, sel, screen.cols);
+            paintBg(self, screen, screen.rowCells(rr), rr, cell_w, cell_h, sel, screen.cols);
         }
     }
     var rr: u16 = start;
@@ -297,11 +305,12 @@ fn runUniformBg(screen: *const Term.Screen, start: u16, end: u16) ?u32 {
     if (start >= end) return null;
     const first = screen.rowCells(start);
     if (first.len == 0) return null;
-    const bg = packColor(effectiveBg(first[0]));
+    const rev = screen.flags.reverse;
+    const bg = packColor(effectiveBg(first[0], rev));
     var r = start;
     while (r < end) : (r += 1) {
         for (screen.rowCells(r)) |cell| {
-            if (packColor(effectiveBg(cell)) != bg) return null;
+            if (packColor(effectiveBg(cell, rev)) != bg) return null;
         }
     }
     return bg;
@@ -385,14 +394,15 @@ fn markDirtyStrip(self: *Frame, row: u16, cell_h: u32) void {
     self.dirty_h = y1 - y0;
 }
 
-fn effectiveBg(cell: Term.Cell) Term.Color {
-    return if (cell.attrs.inverse) cell.fg else cell.bg;
+fn effectiveBg(cell: Term.Cell, reverse: bool) Term.Color {
+    const inv = cell.attrs.inverse != reverse;
+    return if (inv) cell.fg else cell.bg;
 }
 
-fn effectiveFg(cell: Term.Cell) Term.Color {
+fn effectiveFg(cell: Term.Cell, reverse: bool) Term.Color {
     var fg = cell.fg;
     var bg = cell.bg;
-    if (cell.attrs.inverse) {
+    if (cell.attrs.inverse != reverse) {
         const tmp = fg;
         fg = bg;
         bg = tmp;
@@ -403,30 +413,36 @@ fn effectiveFg(cell: Term.Cell) Term.Color {
     return fg;
 }
 
-fn paintBg(self: *Frame, line: []const Term.Cell, row: u16, cell_w: u32, cell_h: u32, sel: Select.State, cols: u16) void {
-    paintBgSpan(self, line, row, 0, @intCast(line.len), cell_w, cell_h, sel, cols);
+fn paintBg(self: *Frame, screen: *const Term.Screen, line: []const Term.Cell, row: u16, cell_w: u32, cell_h: u32, sel: Select.State, cols: u16) void {
+    paintBgSpan(self, screen, line, row, 0, @intCast(line.len), cell_w, cell_h, sel, cols);
 }
 
-fn paintBgSpan(self: *Frame, line: []const Term.Cell, row: u16, col0: u16, col1: u16, cell_w: u32, cell_h: u32, sel: Select.State, cols: u16) void {
+fn paintBgSpan(self: *Frame, screen: *const Term.Screen, line: []const Term.Cell, row: u16, col0: u16, col1: u16, cell_w: u32, cell_h: u32, sel: Select.State, cols: u16) void {
     const y0 = @as(u32, row) * cell_h;
     const last: u16 = @intCast(@min(@as(usize, col1), line.len));
     var c = col0;
     while (c < last) {
-        const bg = packColor(paintColors(line[c], sel.contains(c, row, cols)).bg);
+        const bg = packColor(paintColors(screen, line[c], sel.contains(c, row, cols)).bg);
         var n: u16 = 1;
-        while (c + n < last and packColor(paintColors(line[c + n], sel.contains(c + n, row, cols)).bg) == bg) : (n += 1) {}
+        while (c + n < last and packColor(paintColors(screen, line[c + n], sel.contains(c + n, row, cols)).bg) == bg) : (n += 1) {}
         fillRect(self, @as(u32, c) * cell_w, y0, @as(u32, n) * cell_w, cell_h, bg);
         c += n;
     }
 }
 
-fn paintColors(cell: Term.Cell, selected: bool) struct { fg: Term.Color, bg: Term.Color } {
-    var fg = effectiveFg(cell);
-    var bg = effectiveBg(cell);
+fn paintColors(screen: *const Term.Screen, cell: Term.Cell, selected: bool) struct { fg: Term.Color, bg: Term.Color } {
+    const rev = screen.flags.reverse;
+    var fg = effectiveFg(cell, rev);
+    var bg = effectiveBg(cell, rev);
     if (selected) {
-        const tmp = fg;
-        fg = bg;
-        bg = tmp;
+        if (screen.have_sel_fg or screen.have_sel_bg) {
+            if (screen.have_sel_fg) fg = screen.sel_fg;
+            if (screen.have_sel_bg) bg = screen.sel_bg;
+        } else {
+            const tmp = fg;
+            fg = bg;
+            bg = tmp;
+        }
     }
     return .{ .fg = fg, .bg = bg };
 }
@@ -437,6 +453,7 @@ fn packColor(color: Term.Color) u32 {
 
 fn blitLine(
     self: *Frame,
+    screen: *const Term.Screen,
     line: []const Term.Cell,
     row: u16,
     col0: u16,
@@ -454,8 +471,8 @@ fn blitLine(
     var c = col0;
     while (c < last) : (c += 1) {
         const cell = line[c];
-        if (cell.attrs.hidden or cell.codepoint == 0) continue;
-        const painted = paintColors(cell, sel.contains(c, row, @intCast(line.len)));
+        if (cell.attrs.hidden or cell.codepoint < 0x20 or cell.codepoint == 0x7F) continue;
+        const painted = paintColors(screen, cell, sel.contains(c, row, @intCast(line.len)));
         const fg = packColor(painted.fg);
         const bg = packColor(painted.bg);
         const x0 = @as(u32, c) * cell_w;
@@ -499,12 +516,49 @@ fn blitLine(
             }
         }
         if ((cell.attrs.underline or cell.attrs.link) and clip.y0 <= @as(i32, @intCast(y0)) and clip.y1 >= @as(i32, @intCast(y0 + cell_h))) {
-            const uy = y0 + cell_h -| 2;
-            var x: u32 = 0;
-            while (x < cell_w) : (x += 1) {
-                self.pixels[uy * self.width + (x0 + x)] = fg;
-            }
+            const ul = if (cell.attrs.ul_color)
+                packColor(.{ .r = cell.ul.r, .g = cell.ul.g, .b = cell.ul.b, .a = 255 })
+            else
+                fg;
+            const style: u3 = if (cell.attrs.underline_style != 0) cell.attrs.underline_style else 1;
+            drawUnderline(self, x0, y0, cell_w, cell_h, ul, style);
         }
+    }
+}
+
+fn drawUnderline(self: *Frame, x0: u32, y0: u32, cell_w: u32, cell_h: u32, color: u32, style: u3) void {
+    const y_base = y0 + cell_h -| 2;
+    var x: u32 = 0;
+    switch (style) {
+        2 => { // double
+            const y2 = y0 + cell_h -| 4;
+            while (x < cell_w) : (x += 1) {
+                self.pixels[y_base * self.width + (x0 + x)] = color;
+                if (y2 >= y0) self.pixels[y2 * self.width + (x0 + x)] = color;
+            }
+        },
+        3 => { // curly
+            while (x < cell_w) : (x += 1) {
+                const wave: u32 = if ((x / 2) % 2 == 0) 0 else 1;
+                const uy = y_base -| wave;
+                self.pixels[uy * self.width + (x0 + x)] = color;
+            }
+        },
+        4 => { // dotted
+            while (x < cell_w) : (x += 1) {
+                if (x % 2 == 0) self.pixels[y_base * self.width + (x0 + x)] = color;
+            }
+        },
+        5 => { // dashed
+            while (x < cell_w) : (x += 1) {
+                if (x % 6 < 4) self.pixels[y_base * self.width + (x0 + x)] = color;
+            }
+        },
+        else => {
+            while (x < cell_w) : (x += 1) {
+                self.pixels[y_base * self.width + (x0 + x)] = color;
+            }
+        },
     }
 }
 
@@ -572,6 +626,93 @@ fn blitRgba(
                 );
             }
         }
+    }
+}
+
+fn paintDebugOverlay(self: *Frame, screen: *const Term.Screen, cell_w: u32, cell_h: u32, cur: Term.Cursor) void {
+    if (!Debug.live) return;
+    const ov = screen.debug_overlay;
+    if (!ov.any()) return;
+    const g = screen.gridConst();
+    const w = self.width;
+    const h = self.height;
+    const pix = self.pixels;
+    const cols = screen.cols;
+    const rows = screen.rows;
+    const cw: i32 = @intCast(cell_w);
+    const ch: i32 = @intCast(cell_h);
+
+    var dirty_n: u16 = 0;
+    var r: u16 = 0;
+    while (r < rows) : (r += 1) {
+        const y0: i32 = @as(i32, r) * ch;
+        const y1 = y0 + ch;
+        if (screen.lineDirty(r)) dirty_n += 1;
+        if (ov.dirty and screen.lineDirty(r)) {
+            const bar = @max(1, @min(2, cw));
+            Debug.fill(pix, w, h, 0, y0, bar, ch, Debug.col_dirty);
+        }
+        if (ov.wrap and g.viewRowWrapped(r)) {
+            const bar = @max(1, @min(2, cw));
+            Debug.fill(pix, w, h, @as(i32, cols) * cw - bar, y0, bar, ch, Debug.col_wrap);
+        }
+        if (ov.grid) {
+            Debug.hline(pix, w, h, 0, @intCast(w), y1 - 1, Debug.col_grid);
+        }
+        if (ov.wide) {
+            const line = screen.rowCells(r);
+            var c: u16 = 0;
+            while (c < cols) : (c += 1) {
+                const trail = line[c].codepoint == 0;
+                const lead = c + 1 < cols and line[c].codepoint != 0 and line[c].codepoint != ' ' and line[c + 1].codepoint == 0;
+                if (!trail and !lead) continue;
+                const x0: i32 = @as(i32, c) * cw;
+                Debug.hline(pix, w, h, x0, x0 + cw, y0, Debug.col_wide);
+                if (ch > 1) Debug.hline(pix, w, h, x0, x0 + cw, y0 + 1, Debug.col_wide);
+            }
+        }
+    }
+    if (ov.grid) {
+        var c: u16 = 1;
+        while (c < cols) : (c += 1) {
+            Debug.vline(pix, w, h, @as(i32, c) * cw, 0, @intCast(h), Debug.col_grid);
+        }
+    }
+    if (ov.region) {
+        const top: i32 = @as(i32, g.scroll_top) * ch;
+        const bot: i32 = (@as(i32, g.scroll_bottom) + 1) * ch;
+        Debug.hline(pix, w, h, 0, @intCast(w), top, Debug.col_region);
+        Debug.hline(pix, w, h, 0, @intCast(w), bot - 1, Debug.col_region);
+    }
+    if (ov.cursor) {
+        Debug.rect(pix, w, h, @as(i32, cur.col) * cw, @as(i32, cur.row) * ch, cw, ch, Debug.col_cursor);
+    }
+    if (ov.lcf and g.wrap_pending) {
+        Debug.rect(pix, w, h, @as(i32, cur.col) * cw, @as(i32, cur.row) * ch, cw, ch, Debug.col_lcf);
+    }
+    if (ov.hud and h >= 8 and w >= 24) {
+        var buf: [120]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "{d},{d}{s}{s}{s}{s}{s} {s} s{d} {d}-{d} D{d} o{d}{s}{s}", .{
+            cur.row,
+            cur.col,
+            if (g.wrap_pending) " LCF" else "",
+            if (screen.flags.auto_wrap) " W" else "",
+            if (screen.flags.insert_mode) " I" else "",
+            if (screen.which == 1) " ALT" else "",
+            if (screen.flags.reverse) " REV" else "",
+            @tagName(screen.mouse),
+            screen.scrollOffset(),
+            g.scroll_top,
+            g.scroll_bottom,
+            dirty_n,
+            screen.debug_osc_id,
+            if (screen.flags.sync_output) " SYNC" else "",
+            if (screen.notify_pending) " NTF" else "",
+        }) catch buf[0..0];
+        const tw = Debug.textWidth(text);
+        const pad: i32 = 2;
+        Debug.fill(pix, w, h, 1, 1, tw + pad * 2, 5 + pad * 2, Debug.col_hud_bg);
+        Debug.text(pix, w, h, 1 + pad, 1 + pad, text, Debug.col_hud_fg);
     }
 }
 
@@ -761,4 +902,24 @@ fn mixVec(bg: @Vector(vec_len, u32), fg: @Vector(vec_len, u32), cover: @Vector(v
     const g = (t * fg_ + u * bg_) * k >> sh;
     const b = (t * fb + u * bb) * k >> sh;
     return (ba << s24) | (r << s16) | (g << s8) | b;
+}
+
+test "debug overlay paints grid" {
+    if (!Debug.live) return;
+    const gpa = std.testing.allocator;
+    var dummy: [1]u8 = .{0};
+    var vt = try Term.VtState.init(gpa, 4, 2, 2, &dummy);
+    defer vt.deinit();
+    vt.debug_overlay = .{ .grid = true };
+    var frame = try Frame.init(gpa, 4 * 8, 2 * 8);
+    defer frame.deinit();
+    frame.render(&vt, 8, 8, null, 8);
+    var found = false;
+    for (frame.pixels) |px| {
+        if (px == Debug.col_grid) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
 }

@@ -1,6 +1,7 @@
 //! OSC (ESC ]) — titles, colors, OSC 8 hyperlinks. Other OSCs are ignored.
 
 const std = @import("std");
+const Debug = @import("debug.zig");
 const Vt = @import("vt.zig").VtState;
 const Color = @import("vt.zig").Color;
 
@@ -20,19 +21,33 @@ pub fn dispatch(vt: *Vt, bytes: []const u8) void {
     if (!have) return;
     if (i < bytes.len and bytes[i] == ';') i += 1;
     const payload = stripSt(bytes[i..]);
+    vt.debug_osc_id = id;
 
     switch (id) {
         0, 2 => vt.setTitle(payload),
-        1, 22, 30 => {},
+        1, 30 => {},
         4 => osc4(vt, payload, bytes),
-        7 => {}, // cwd
+        7 => osc7(vt, payload),
         8 => osc8(vt, payload),
-        9, 99, 777, 555, 176, 133 => {},
+        9 => osc9(vt, payload),
+        99 => osc99(vt, payload),
+        777 => osc777(vt, payload),
+        556 => {
+            Debug.applyOsc(&vt.debug_overlay, payload);
+            vt.markDirtyAll();
+        },
+        176 => osc176(vt, payload),
+        133 => {
+            if (payload.len > 0) vt.shell_mark = payload[0];
+        },
         10 => oscColor(vt, payload, bytes, .fg, 10),
         11 => oscColor(vt, payload, bytes, .bg, 11),
         12 => oscColor(vt, payload, bytes, .cursor, 12),
-        17, 19 => {}, // selection colors
-        52 => {}, // clipboard
+        17 => oscSel(vt, payload, bytes, .bg, 17),
+        19 => oscSel(vt, payload, bytes, .fg, 19),
+        22 => osc22(vt, payload),
+        52 => osc52(vt, payload),
+        66 => osc66(vt, payload),
         104 => osc104(vt, payload),
         110 => {
             vt.scheme.fg = vt.orig.fg;
@@ -43,7 +58,15 @@ pub fn dispatch(vt: *Vt, bytes: []const u8) void {
             vt.markDirtyAll();
         },
         112 => vt.scheme.cursor = vt.orig.cursor,
-        117, 119, 105 => {},
+        117 => {
+            vt.have_sel_bg = false;
+            vt.markDirtyAll();
+        },
+        119 => {
+            vt.have_sel_fg = false;
+            vt.markDirtyAll();
+        },
+        105 => {},
         else => {},
     }
 }
@@ -69,6 +92,191 @@ fn osc8(vt: *Vt, payload: []const u8) void {
     }
     const uri = payload[i + 1 ..];
     vt.flags.osc8 = uri.len > 0;
+}
+
+fn osc7(vt: *Vt, payload: []const u8) void {
+    var path = payload;
+    if (std.mem.startsWith(u8, path, "file://")) {
+        path = path["file://".len..];
+        if (std.mem.indexOfScalar(u8, path, '/')) |slash| path = path[slash..];
+    }
+    vt.cwd.clearRetainingCapacity();
+    vt.cwd.appendSlice(vt.allocator, path) catch {};
+}
+
+fn osc176(vt: *Vt, payload: []const u8) void {
+    vt.app_id.clearRetainingCapacity();
+    vt.app_id.appendSlice(vt.allocator, payload) catch {};
+    vt.app_id_dirty = true;
+}
+
+fn oscNotify(vt: *Vt, title: []const u8, body: []const u8) void {
+    Debug.log("notify title={s} body={s}", .{ title, body });
+    vt.notify_title.clearRetainingCapacity();
+    vt.notify_body.clearRetainingCapacity();
+    vt.notify_title.appendSlice(vt.allocator, title) catch {};
+    vt.notify_body.appendSlice(vt.allocator, body) catch {};
+    vt.notify_pending = true;
+}
+
+/// iTerm2 Growl: OSC 9 ; message. ConEmu/WT progress is OSC 9;4;... and cwd is OSC 9;9;path.
+fn osc9(vt: *Vt, payload: []const u8) void {
+    if (payload.len >= 2 and payload[0] == '4' and payload[1] == ';') {
+        Debug.log("osc 9 progress {s}", .{payload});
+        return;
+    }
+    if (payload.len >= 2 and payload[0] == '9' and payload[1] == ';') {
+        osc7(vt, payload[2..]);
+        return;
+    }
+    if (payload.len == 0) return;
+    oscNotify(vt, "", payload);
+}
+
+fn osc99(vt: *Vt, payload: []const u8) void {
+    if (payload.len == 0) return;
+    const semi = std.mem.lastIndexOfScalar(u8, payload, ';');
+    const params = if (semi) |n| payload[0..n] else payload;
+    const text = if (semi) |n| payload[n + 1 ..] else payload;
+    if (std.mem.indexOfScalar(u8, params, '=') != null) {
+        if (kittyNotifyClose(params) or text.len == 0) return;
+        if (kittyNotifyTitle(params)) oscNotify(vt, text, "") else oscNotify(vt, "", text);
+        return;
+    }
+    if (semi) |n| {
+        oscNotify(vt, payload[0..n], payload[n + 1 ..]);
+    } else {
+        oscNotify(vt, "", payload);
+    }
+}
+
+fn kittyNotifyClose(params: []const u8) bool {
+    var it = std.mem.splitScalar(u8, params, ':');
+    while (it.next()) |kv| {
+        if (kv.len >= 3 and kv[0] == 'd' and kv[1] == '=' and kv[2] == '2') return true;
+    }
+    return false;
+}
+
+fn kittyNotifyTitle(params: []const u8) bool {
+    var it = std.mem.splitScalar(u8, params, ':');
+    while (it.next()) |kv| {
+        if (std.mem.eql(u8, kv, "p=title")) return true;
+    }
+    return false;
+}
+
+fn osc777(vt: *Vt, payload: []const u8) void {
+    if (!std.mem.startsWith(u8, payload, "notify;")) return;
+    const rest = payload["notify;".len..];
+    if (std.mem.indexOfScalar(u8, rest, ';')) |n| {
+        oscNotify(vt, rest[0..n], rest[n + 1 ..]);
+    } else {
+        oscNotify(vt, "", rest);
+    }
+}
+
+fn osc22(vt: *Vt, payload: []const u8) void {
+    const name = std.mem.trim(u8, payload, " \t");
+    vt.pointer = pointerId(name);
+    vt.pointer_dirty = true;
+}
+
+fn pointerId(name: []const u8) u8 {
+    if (name.len == 0) return 0;
+    if (eqlAny(name, &.{ "default", "arrow", "left_ptr" })) return 0;
+    if (eqlAny(name, &.{ "text", "xterm", "ibeam", "IBeam" })) return 1;
+    if (eqlAny(name, &.{ "pointer", "hand", "hand2", "pointing_hand" })) return 2;
+    if (eqlAny(name, &.{ "wait", "watch", "progress" })) return 3;
+    if (eqlAny(name, &.{ "crosshair", "cross" })) return 4;
+    if (eqlAny(name, &.{ "not-allowed", "pirate", "X_cursor" })) return 5;
+    if (eqlAny(name, &.{ "help", "question_arrow" })) return 6;
+    return 0;
+}
+
+fn eqlAny(name: []const u8, opts: []const []const u8) bool {
+    for (opts) |o| if (std.mem.eql(u8, name, o)) return true;
+    return false;
+}
+
+fn osc52(vt: *Vt, payload: []const u8) void {
+    const semi = std.mem.indexOfScalar(u8, payload, ';') orelse return;
+    const which = payload[0..semi];
+    const data = payload[semi + 1 ..];
+    if (data.len == 1 and data[0] == '?') return; // query: ignored
+    var kind: u8 = 0;
+    if (which.len == 0 or std.mem.indexOfScalar(u8, which, 'c') != null) kind |= 1;
+    if (std.mem.indexOfScalar(u8, which, 'p') != null or std.mem.indexOfScalar(u8, which, 's') != null) kind |= 2;
+    if (kind == 0) kind = 1;
+    const dec = decodeB64(vt.allocator, data) orelse return;
+    vt.clip.clearRetainingCapacity();
+    vt.clip.appendSlice(vt.allocator, dec) catch {};
+    vt.allocator.free(dec);
+    vt.clip_kind = kind;
+}
+
+fn decodeB64(allocator: std.mem.Allocator, src: []const u8) ?[]u8 {
+    var n: usize = 0;
+    for (src) |ch| {
+        if (ch != ' ' and ch != '\n' and ch != '\r' and ch != '\t') n += 1;
+    }
+    if (n == 0) return null;
+    const clean = allocator.alloc(u8, n + 3) catch return null;
+    defer allocator.free(clean);
+    var i: usize = 0;
+    for (src) |ch| {
+        if (ch == ' ' or ch == '\n' or ch == '\r' or ch == '\t') continue;
+        clean[i] = ch;
+        i += 1;
+    }
+    while (i % 4 != 0) : (i += 1) clean[i] = '=';
+    const dec = std.base64.standard.Decoder;
+    const out_n = dec.calcSizeForSlice(clean[0..i]) catch return null;
+    const out = allocator.alloc(u8, out_n) catch return null;
+    dec.decode(out, clean[0..i]) catch {
+        allocator.free(out);
+        return null;
+    };
+    return out;
+}
+
+fn osc66(vt: *Vt, payload: []const u8) void {
+    const semi = std.mem.indexOfScalar(u8, payload, ';') orelse return;
+    const text = payload[semi + 1 ..];
+    if (text.len == 0) return;
+    if (std.unicode.Utf8View.init(text)) |view| {
+        var it = view.iterator();
+        while (it.nextCodepoint()) |cp| vt.printCodepoint(cp);
+    } else |_| {
+        for (text) |b| vt.printCodepoint(b);
+    }
+}
+
+fn oscSel(vt: *Vt, payload: []const u8, raw: []const u8, which: Which, id: u16) void {
+    if (payload.len == 1 and payload[0] == '?') {
+        const c = switch (which) {
+            .fg => if (vt.have_sel_fg) vt.sel_fg else vt.scheme.fg,
+            .bg => if (vt.have_sel_bg) vt.sel_bg else vt.scheme.bg,
+            .cursor => vt.scheme.cursor,
+        };
+        vt.respondFmt("\x1b]{d};rgb:{x:0>2}{x:0>2}/{x:0>2}{x:0>2}/{x:0>2}{x:0>2}{s}", .{
+            id, c.r, c.r, c.g, c.g, c.b, c.b, terminator(raw),
+        });
+        return;
+    }
+    const c = parseColorSpec(payload) orelse return;
+    switch (which) {
+        .fg => {
+            vt.sel_fg = c;
+            vt.have_sel_fg = true;
+        },
+        .bg => {
+            vt.sel_bg = c;
+            vt.have_sel_bg = true;
+        },
+        .cursor => {},
+    }
+    vt.markDirtyAll();
 }
 
 fn osc4(vt: *Vt, payload: []const u8, raw: []const u8) void {
@@ -149,6 +357,20 @@ fn oscColor(vt: *Vt, payload: []const u8, raw: []const u8, which: Which, id: u16
 
 fn parseColorSpec(s: []const u8) ?Color {
     var t = std.mem.trim(u8, s, " \t");
+    if (std.mem.startsWith(u8, t, "rgba:")) {
+        t = t[5..];
+        var it = std.mem.splitScalar(u8, t, '/');
+        const rs = it.next() orelse return null;
+        const gs = it.next() orelse return null;
+        const bs = it.next() orelse return null;
+        const as = it.next() orelse return null;
+        return .{
+            .r = hexComp(rs) orelse return null,
+            .g = hexComp(gs) orelse return null,
+            .b = hexComp(bs) orelse return null,
+            .a = hexComp(as) orelse return null,
+        };
+    }
     if (std.mem.startsWith(u8, t, "rgb:")) {
         t = t[4..];
         var it = std.mem.splitScalar(u8, t, '/');
@@ -172,6 +394,12 @@ fn parseColorSpec(s: []const u8) ?Color {
             .r = hexByte(t[0..2]) orelse return null,
             .g = hexByte(t[2..4]) orelse return null,
             .b = hexByte(t[4..6]) orelse return null,
+        },
+        8 => Color{
+            .r = hexByte(t[0..2]) orelse return null,
+            .g = hexByte(t[2..4]) orelse return null,
+            .b = hexByte(t[4..6]) orelse return null,
+            .a = hexByte(t[6..8]) orelse return null,
         },
         12 => Color{
             .r = hexByte(t[0..2]) orelse return null,

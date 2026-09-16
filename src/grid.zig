@@ -39,17 +39,26 @@ pub const Attrs = packed struct {
     strikethrough: bool = false,
     blink: bool = false,
     link: bool = false,
+    /// Underline uses `Cell.ul` instead of fg.
+    ul_color: bool = false,
     /// 0 none, 1 single, 2 double, 3 curly, 4 dotted, 5 dashed (foot SGR 4:n).
     underline_style: u3 = 0,
-    _padding: u4 = 0,
+    _padding: u3 = 0,
+};
+
+pub const Rgb = packed struct {
+    r: u8 = 0,
+    g: u8 = 0,
+    b: u8 = 0,
 };
 
 pub const Cell = packed struct {
     codepoint: u21 = ' ',
     attrs: Attrs = .{},
-    _pad: u2 = 0,
+    _pad: u3 = 0,
     fg: Color = Color.default_fg,
     bg: Color = Color.default_bg,
+    ul: Rgb = .{},
 };
 
 pub const Cursor = struct { row: u16 = 0, col: u16 = 0 };
@@ -409,6 +418,11 @@ pub const Grid = struct {
     pub inline fn viewCellAt(self: *const Grid, row: u16, col: u16) Cell {
         const line_idx = (self.head + self.cap - self.scroll + row) % self.cap;
         return self.cells[self.starts[line_idx] + col];
+    }
+
+    pub inline fn viewRowWrapped(self: *const Grid, row: u16) bool {
+        const line_idx = (self.head + self.cap - self.scroll + row) % self.cap;
+        return self.wraps[line_idx] != 0;
     }
 
     /// Full-grid scroll that keeps the outgoing top line in the ring (primary history).

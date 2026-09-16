@@ -51,6 +51,9 @@ pub const CircBuffer = struct {
     mapped: bool,
     head: u64 = 0,
     tail: u64 = 0,
+    /// `head` when an incomplete ESC/CSI/OSC/UTF-8 run was parked at the end.
+    /// `pending` stays false until more bytes arrive so we do not spin.
+    hold_at_head: u64 = 0,
     epoch: u64 = 0,
     lines: std.ArrayListUnmanaged(Line) = .empty,
     runs: std.ArrayListUnmanaged(Run) = .empty,
@@ -108,15 +111,27 @@ pub const CircBuffer = struct {
     /// Consume everything and return runs.
     pub fn consumeAndGetRuns(self: *CircBuffer, nlines: usize) []Run {
         self.consumeAndPreparse();
-        if (self.lines.items.len == 0) return &.{};
+        if (self.lines.items.len == 0) {
+            self.finishConsume(0);
+            return &.{};
+        }
+        const all = nlines >= self.lines.items.len;
         const lines = self.getLastNLines(nlines);
-        if (lines.len == 0) return &.{};
+        if (lines.len == 0) {
+            self.finishConsume(0);
+            return &.{};
+        }
         self.splitIntoRuns(lines);
+        var held: u32 = 0;
+        if (all) held = self.trimIncomplete();
+        self.finishConsume(held);
         return self.runs.items;
     }
 
     pub fn pending(self: *const CircBuffer) bool {
-        return self.head != self.tail;
+        if (self.head == self.tail) return false;
+        if (self.hold_at_head != 0 and self.head == self.hold_at_head) return false;
+        return true;
     }
 
     /// The circular buffer read directly from the PTY using
@@ -158,11 +173,23 @@ pub const CircBuffer = struct {
                 error.WouldBlock => {
                     const elapsed = nowNs() - start_ns;
                     if (elapsed >= period_ns) return;
-                    const remaining_ms = @divTrunc(period_ns - elapsed, 1_000_000);
-                    const timeout_ms: i32 = @intCast(@min(@max(remaining_ms, 0), 1000));
+                    // Never poll(0): a readable X fd plus 0ms timeout busy-loops.
+                    const remaining_ns = period_ns - elapsed;
+                    const timeout_ms: i32 = @intCast(@min(@max(@divTrunc(remaining_ns + 999_999, 1_000_000), 1), 1000));
                     if (pump) |p| {
+                        const t0 = nowNs();
                         waitReadable2(pty, p.fd, timeout_ms);
                         p.tick(p.ctx);
+                        // Motion/XI floods keep the X fd readable so poll returns
+                        // immediately. Sleep on the PTY only for the rest of the
+                        // frame instead of spinning at 100% CPU.
+                        if (nowNs() - t0 < 200_000) {
+                            const elapsed2 = nowNs() - start_ns;
+                            if (elapsed2 >= period_ns) return;
+                            const rest = period_ns - elapsed2;
+                            const rest_ms: i32 = @intCast(@min(@max(@divTrunc(rest + 999_999, 1_000_000), 1), 1000));
+                            waitReadable(pty, rest_ms);
+                        }
                     } else {
                         waitReadable(pty, timeout_ms);
                     }
@@ -205,7 +232,25 @@ pub const CircBuffer = struct {
         if ((self.head - self.tail) > self.capacity)
             self.tail = self.head - self.capacity;
         splitIntoLines(self);
-        self.tail = self.head;
+    }
+
+    fn finishConsume(self: *CircBuffer, held: u32) void {
+        if (held == 0 or held > self.head - self.tail) {
+            self.tail = self.head;
+            self.hold_at_head = 0;
+            return;
+        }
+        self.tail = self.head - held;
+        self.hold_at_head = self.head;
+    }
+
+    fn trimIncomplete(self: *CircBuffer) u32 {
+        if (self.runs.items.len == 0) return 0;
+        const last = self.runs.items[self.runs.items.len - 1];
+        const bytes = self.storage[last.off .. last.off + last.len];
+        if (runIsComplete(last.kind, bytes)) return 0;
+        _ = self.runs.pop();
+        return last.len;
     }
 
     /// Get last N lines of input. May be less than expected.
@@ -356,9 +401,13 @@ pub const CircBuffer = struct {
                 }
             } else if (c >= 0x80) { // High-bit (UTF-8 or C1 control)
                 const utf8_len = std.unicode.utf8ByteSequenceLength(c) catch 1;
-                if (utf8_len > 1 and i + utf8_len <= to_read) {
+                if (utf8_len > 1) {
                     kind = .utf8;
-                    seq_len = @intCast(utf8_len);
+                    if (i + utf8_len <= to_read) {
+                        seq_len = @intCast(utf8_len);
+                    } else {
+                        seq_len = to_read - i;
+                    }
                 } else {
                     kind = .c1;
                     seq_len = 1;
@@ -441,6 +490,32 @@ pub const CircBuffer = struct {
     }
 };
 
+fn runIsComplete(kind: Run.Kind, bytes: []const u8) bool {
+    if (bytes.len == 0) return true;
+    switch (kind) {
+        .c0, .c1, .plain => return true,
+        .utf8 => {
+            const need = std.unicode.utf8ByteSequenceLength(bytes[0]) catch return true;
+            return bytes.len >= need;
+        },
+        .esc => {
+            if (bytes.len < 2) return false;
+            const last = bytes[bytes.len - 1];
+            return last < 0x20 or last > 0x2F;
+        },
+        .csi => {
+            if (bytes.len < 3) return false;
+            const last = bytes[bytes.len - 1];
+            return last >= 0x40 and last <= 0x7E;
+        },
+        .osc, .str, .esc_kitty, .esc_sixel => {
+            if (bytes[bytes.len - 1] == 0x07) return true;
+            if (bytes.len >= 2 and bytes[bytes.len - 2] == 0x1b and bytes[bytes.len - 1] == '\\') return true;
+            return false;
+        },
+    }
+}
+
 inline fn skipEsc(slice: []const u8) usize {
     if (slice.len < 2) return slice.len;
     var i: usize = 1;
@@ -518,6 +593,7 @@ test "hardware level mirroring" {
     const gpa = std.testing.allocator;
     const cap = std.heap.pageSize();
     var buf = try CircBuffer.create(gpa, cap);
+    defer buf.destroy();
     if (buf.mapped) return;
 
     // We should be able to write capacity bytes
@@ -533,8 +609,6 @@ test "hardware level mirroring" {
     //                 ^head
     //
     // |1234xxxx|
-
-    defer buf.destroy();
 }
 
 
@@ -571,4 +645,52 @@ test "correct circular buffer feed" {
     try std.testing.expectError(error.Hangup, buf.readPTY(fds[0], 1000));
     try std.testing.expect(buf.pending());
     try std.testing.expectEqual(@as(u64, msg.len), buf.head - buf.tail);
+}
+
+fn append(buf: *CircBuffer, src: []const u8) void {
+    const cap = buf.capacity;
+    const off: usize = @intCast(buf.head & (cap - 1));
+    @memcpy(buf.storage[off..][0..src.len], src);
+    buf.syncMirror(off, src.len);
+    buf.head += src.len;
+}
+
+test "hold incomplete csi until final" {
+    const gpa = std.testing.allocator;
+    const cap = std.heap.pageSize();
+    var buf = try CircBuffer.create(gpa, cap);
+    defer buf.destroy();
+
+    append(&buf, "\x1b[31");
+    try std.testing.expect(buf.pending());
+    const first = buf.consumeAndGetRuns(std.math.maxInt(usize));
+    try std.testing.expectEqual(@as(usize, 0), first.len);
+    try std.testing.expect(!buf.pending());
+
+    append(&buf, "mX");
+    try std.testing.expect(buf.pending());
+    const second = buf.consumeAndGetRuns(std.math.maxInt(usize));
+    try std.testing.expectEqual(@as(usize, 2), second.len);
+    try std.testing.expectEqual(Run.Kind.csi, second[0].kind);
+    try std.testing.expectEqual(Run.Kind.plain, second[1].kind);
+    try std.testing.expect(!buf.pending());
+}
+
+test "hold lone ESC then CSI" {
+    const gpa = std.testing.allocator;
+    const cap = std.heap.pageSize();
+    var buf = try CircBuffer.create(gpa, cap);
+    defer buf.destroy();
+
+    append(&buf, "\x1b");
+    const first = buf.consumeAndGetRuns(std.math.maxInt(usize));
+    try std.testing.expectEqual(@as(usize, 0), first.len);
+    try std.testing.expect(!buf.pending());
+
+    append(&buf, "[7m");
+    const second = buf.consumeAndGetRuns(std.math.maxInt(usize));
+    try std.testing.expectEqual(@as(usize, 1), second.len);
+    try std.testing.expectEqual(Run.Kind.csi, second[0].kind);
+    const bytes = buf.storage[second[0].off .. second[0].off + second[0].len];
+    try std.testing.expectEqualStrings("\x1b[7m", bytes);
 }

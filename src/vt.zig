@@ -1,7 +1,9 @@
 //! State machine, VT operations, sequence routing, and flags.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const GridMod = @import("grid.zig");
+const Debug = @import("debug.zig");
 const Kitty = @import("kitty.zig");
 const CsiSeq = @import("csi.zig");
 const Esc = @import("esc.zig");
@@ -18,6 +20,7 @@ pub const Attrs = GridMod.Attrs;
 pub const Cell = GridMod.Cell;
 pub const Cursor = GridMod.Cursor;
 pub const Grid = GridMod.Grid;
+const Sixel = @import("sixel.zig");
 
 pub const Mouse = enum {
     off,
@@ -62,7 +65,6 @@ pub const Flags = packed struct {
     meta_eight_bit: bool = true,
     num_lock_modifier: bool = true,
     meta_esc_prefix: bool = true,
-    bell_action: bool = true,
     sixel_display: bool = false,
     sixel_private_palette: bool = true,
     sixel_cursor_right: bool = false,
@@ -71,7 +73,7 @@ pub const Flags = packed struct {
     visibility_reports: bool = false,
     size_notifications: bool = false,
     ime: bool = false,
-    _pad: u2 = 0,
+    _pad: u3 = 0,
 };
 
 pub const VtState = struct {
@@ -110,8 +112,37 @@ pub const VtState = struct {
     title_stack: std.ArrayListUnmanaged([]u8) = .empty,
     cell_px_w: u16 = 8,
     cell_px_h: u16 = 16,
+    win_px_w: u16 = 0,
+    win_px_h: u16 = 0,
     dark_theme: bool = true,
     visible: bool = true,
+    title_dirty: bool = false,
+    notify_pending: bool = false,
+    pointer_dirty: bool = false,
+    app_id_dirty: bool = false,
+    /// Debug-only visual overlay (OSC 556 / CSI ? 556). Always none in Release.
+    debug_overlay: Debug.Overlay = .{},
+    /// Last OSC numeric id (debug HUD). 0 if none since reset.
+    debug_osc_id: u16 = 0,
+    /// 0 none, 1 CLIPBOARD, 2 PRIMARY, 3 both.
+    clip_kind: u8 = 0,
+    pointer: u8 = 0,
+    have_sel_fg: bool = false,
+    have_sel_bg: bool = false,
+    sel_fg: Color = Color.default_fg,
+    sel_bg: Color = Color.default_bg,
+    cwd: std.ArrayListUnmanaged(u8) = .empty,
+    app_id: std.ArrayListUnmanaged(u8) = .empty,
+    notify_title: std.ArrayListUnmanaged(u8) = .empty,
+    notify_body: std.ArrayListUnmanaged(u8) = .empty,
+    clip: std.ArrayListUnmanaged(u8) = .empty,
+    sixel_reg: u16 = 256,
+    sixel_geo_w: u16 = 0,
+    sixel_geo_h: u16 = 0,
+    sixel_palette: [256]Color = undefined,
+    sixel_palette_ok: bool = false,
+    /// Last OSC 133 mark ('A' prompt, 'B' prompt end, 'C' command, 'D' done).
+    shell_mark: u8 = 0,
     kitty: Kitty.Store,
     storage: []u8,
     reply: std.ArrayListUnmanaged(u8) = .empty,
@@ -146,6 +177,11 @@ pub const VtState = struct {
     pub fn deinit(self: *VtState) void {
         self.reply.deinit(self.allocator);
         self.title.deinit(self.allocator);
+        self.cwd.deinit(self.allocator);
+        self.app_id.deinit(self.allocator);
+        self.notify_title.deinit(self.allocator);
+        self.notify_body.deinit(self.allocator);
+        self.clip.deinit(self.allocator);
         for (self.title_stack.items) |t| self.allocator.free(t);
         self.title_stack.deinit(self.allocator);
         self.grids[0].deinit(self.allocator);
@@ -171,6 +207,25 @@ pub const VtState = struct {
         self.saved_mode = @splat(0);
         self.saved_mode_val = @splat(0);
         self.ul_set = false;
+        self.title_dirty = false;
+        self.notify_pending = false;
+        self.pointer_dirty = false;
+        self.app_id_dirty = false;
+        self.debug_overlay = .{};
+        self.debug_osc_id = 0;
+        self.clip_kind = 0;
+        self.pointer = 0;
+        self.have_sel_fg = false;
+        self.have_sel_bg = false;
+        self.sixel_reg = 256;
+        self.sixel_geo_w = 0;
+        self.sixel_geo_h = 0;
+        self.sixel_palette_ok = false;
+        self.cwd.clearRetainingCapacity();
+        self.app_id.clearRetainingCapacity();
+        self.notify_title.clearRetainingCapacity();
+        self.notify_body.clearRetainingCapacity();
+        self.clip.clearRetainingCapacity();
         self.color_stack_size = 0;
         self.color_stack_idx = 0;
         self.kitty_kbd = @splat(0);
@@ -193,6 +248,10 @@ pub const VtState = struct {
         self.initTable();
         remapGrid(&self.grids[0], prev, next);
         remapGrid(&self.grids[1], prev, next);
+        self.dark_theme = @as(u16, next.bg.r) + next.bg.g + next.bg.b < 384;
+        if (self.flags.report_theme) {
+            self.respond(if (self.dark_theme) "\x1b[?997;1n" else "\x1b[?997;2n");
+        }
         self.markDirtyAll();
     }
 
@@ -226,7 +285,7 @@ pub const VtState = struct {
                     if (Kitty.isPrefix(slice)) self.feedKitty(slice) else Dcs.dispatch(self, slice);
                 },
                 .esc_kitty => self.feedKitty(slice),
-                .esc_sixel => {},
+                .esc_sixel => Dcs.dispatch(self, slice),
             }
         }
     }
@@ -343,6 +402,7 @@ pub const VtState = struct {
 
     pub fn printCodepoint(self: *VtState, cp: u21) void {
         const mapped = self.mapCp(cp);
+        if (self.flags.grapheme_shaping and EastAsian.isCombining(mapped)) return;
         var width: u16 = @max(1, EastAsian.cellWidth(mapped));
         var g = self.grid();
 
@@ -377,12 +437,14 @@ pub const VtState = struct {
         if (g.cursor.col >= self.cols) g.cursor.col = self.cols - 1;
 
         const attrs = self.paintAttrs();
+        const ul = self.penUl();
         const slot = g.getCell(g.cursor.row, g.cursor.col);
         slot.* = .{
             .codepoint = mapped,
             .attrs = attrs,
             .fg = g.fg,
             .bg = g.bg,
+            .ul = ul,
         };
         if (width == 2 and g.cursor.col + 1 < self.cols) {
             g.getCell(g.cursor.row, g.cursor.col + 1).* = .{
@@ -390,6 +452,7 @@ pub const VtState = struct {
                 .attrs = attrs,
                 .fg = g.fg,
                 .bg = g.bg,
+                .ul = ul,
             };
         }
         self.markDirty(g.cursor.row);
@@ -422,7 +485,13 @@ pub const VtState = struct {
     fn paintAttrs(self: *const VtState) Attrs {
         var a = self.gridConst().attrs;
         a.link = self.flags.osc8;
+        a.ul_color = self.ul_set;
         return a;
+    }
+
+    fn penUl(self: *const VtState) GridMod.Rgb {
+        if (!self.ul_set) return .{};
+        return .{ .r = self.ul_color.r, .g = self.ul_color.g, .b = self.ul_color.b };
     }
 
     pub fn eraseCell(self: *const VtState) Cell {
@@ -495,19 +564,43 @@ pub const VtState = struct {
     }
 
     pub fn tabForward(self: *VtState, count: u16) void {
-        const g = self.grid();
-        g.wrap_pending = false;
-        var col = g.cursor.col;
         var left = count;
-        var c = col + 1;
-        while (c < self.cols and left > 0) : (c += 1) {
-            if (tabIsSet(self.tabs, c)) {
-                col = c;
-                left -= 1;
+        while (left > 0) : (left -= 1) {
+            const g = self.grid();
+            g.wrap_pending = false;
+            const start = g.cursor.col;
+            var dest = self.cols - 1;
+            var c = start + 1;
+            while (c < self.cols) : (c += 1) {
+                if (tabIsSet(self.tabs, c)) {
+                    dest = c;
+                    break;
+                }
             }
+            if (start < dest) {
+                const attrs = self.paintAttrs();
+                const ul = self.penUl();
+                g.getCell(g.cursor.row, start).* = .{
+                    .codepoint = '\t',
+                    .attrs = attrs,
+                    .fg = g.fg,
+                    .bg = g.bg,
+                    .ul = ul,
+                };
+                var x = start + 1;
+                while (x < dest) : (x += 1) {
+                    g.getCell(g.cursor.row, x).* = .{
+                        .codepoint = ' ',
+                        .attrs = attrs,
+                        .fg = g.fg,
+                        .bg = g.bg,
+                        .ul = ul,
+                    };
+                }
+                self.markDirty(g.cursor.row);
+            }
+            g.cursor.col = dest;
         }
-        if (left != 0) col = self.cols - 1;
-        g.cursor.col = col;
     }
 
     pub fn tabBackN(self: *VtState, count: u16) void {
@@ -608,7 +701,13 @@ pub const VtState = struct {
                 @memset(g.rowSlice(g.cursor.row, self.cols)[0..end], blank);
                 self.markDirty(g.cursor.row);
             },
-            3 => {},
+            3 => {
+                if (self.which == 0) {
+                    g.used = self.rows;
+                    g.scroll = 0;
+                    self.kitty.dropHistory(0);
+                }
+            },
             else => {
                 var r: u16 = 0;
                 while (r < self.rows) : (r += 1) {
@@ -800,21 +899,37 @@ pub const VtState = struct {
                 1034 => self.flags.meta_eight_bit = enable,
                 1035 => self.flags.num_lock_modifier = enable,
                 1036 => self.flags.meta_esc_prefix = enable,
-                1042 => self.flags.bell_action = enable,
                 1048 => if (enable) self.saveCursor() else self.restoreCursor(),
                 1049 => self.setAlt(enable, true, true),
                 1070 => self.flags.sixel_private_palette = enable,
                 2004 => self.flags.bracket_paste = enable,
                 2026 => self.flags.sync_output = enable,
                 2027 => self.flags.grapheme_shaping = enable,
-                2031 => self.flags.report_theme = enable,
+                2031 => {
+                    self.flags.report_theme = enable;
+                    if (enable) self.respond(if (self.dark_theme) "\x1b[?997;1n" else "\x1b[?997;2n");
+                },
                 2033 => {
                     self.flags.visibility_reports = enable;
                     if (enable) self.respond(if (self.visible) "\x1b[?999;1n" else "\x1b[?999;2n");
                 },
-                2048 => self.flags.size_notifications = enable,
+                2048 => {
+                    self.flags.size_notifications = enable;
+                    if (enable) {
+                        self.respondFmt("\x1b[48;{d};{d};{d};{d}t", .{
+                            self.rows,
+                            self.cols,
+                            self.pixelHeight(true),
+                            self.pixelWidth(true),
+                        });
+                    }
+                },
                 8452 => self.flags.sixel_cursor_right = enable,
                 737769 => self.flags.ime = enable,
+                556 => {
+                    Debug.applyDec(&self.debug_overlay, enable);
+                    self.markDirtyAll();
+                },
                 else => {},
             }
         }
@@ -935,7 +1050,6 @@ pub const VtState = struct {
             1034 => self.flags.meta_eight_bit,
             1035 => self.flags.num_lock_modifier,
             1036 => self.flags.meta_esc_prefix,
-            1042 => self.flags.bell_action,
             1070 => self.flags.sixel_private_palette,
             2004 => self.flags.bracket_paste,
             2026 => self.flags.sync_output,
@@ -945,6 +1059,7 @@ pub const VtState = struct {
             2048 => self.flags.size_notifications,
             8452 => self.flags.sixel_cursor_right,
             737769 => self.flags.ime,
+            556 => if (comptime builtin.mode == .Debug) self.debug_overlay.any() else return 0,
             else => return 0,
         };
         return if (on) 1 else 2;
@@ -981,13 +1096,144 @@ pub const VtState = struct {
     }
 
     pub fn pixelWidth(self: *const VtState, window: bool) u16 {
-        _ = window;
+        if (window and self.win_px_w != 0) return self.win_px_w;
         return self.cols *| self.cell_px_w;
     }
 
     pub fn pixelHeight(self: *const VtState, window: bool) u16 {
-        _ = window;
+        if (window and self.win_px_h != 0) return self.win_px_h;
         return self.rows *| self.cell_px_h;
+    }
+
+    pub fn setVisible(self: *VtState, on: bool) void {
+        if (self.visible == on) return;
+        self.visible = on;
+        if (self.flags.visibility_reports) {
+            self.respond(if (on) "\x1b[?999;1n" else "\x1b[?999;2n");
+        }
+    }
+
+    pub fn xtsmgraphics(self: *VtState, pi: u32, pa: u32, pv: u32, pv2: u32) void {
+        switch (pi) {
+            1 => switch (pa) {
+                1 => self.respondFmt("\x1b[?1;0;{d}S", .{self.sixel_reg}),
+                2 => {
+                    self.sixel_reg = 256;
+                    self.respondFmt("\x1b[?1;0;256S", .{});
+                },
+                3 => {
+                    self.sixel_reg = @intCast(std.math.clamp(pv, 2, 256));
+                    self.respondFmt("\x1b[?1;0;{d}S", .{self.sixel_reg});
+                },
+                4 => self.respondFmt("\x1b[?1;0;256S", .{}),
+                else => self.respondFmt("\x1b[?1;2;0S", .{}),
+            },
+            2 => {
+                const max_w = self.pixelWidth(true);
+                const max_h = self.pixelHeight(true);
+                switch (pa) {
+                    1 => {
+                        const w = if (self.sixel_geo_w != 0) self.sixel_geo_w else max_w;
+                        const h = if (self.sixel_geo_h != 0) self.sixel_geo_h else max_h;
+                        self.respondFmt("\x1b[?2;0;{d};{d}S", .{ w, h });
+                    },
+                    2 => {
+                        self.sixel_geo_w = 0;
+                        self.sixel_geo_h = 0;
+                        self.respondFmt("\x1b[?2;0;{d};{d}S", .{ max_w, max_h });
+                    },
+                    3 => {
+                        self.sixel_geo_w = sat16vt(pv);
+                        self.sixel_geo_h = sat16vt(pv2);
+                        self.respondFmt("\x1b[?2;0;{d};{d}S", .{ self.sixel_geo_w, self.sixel_geo_h });
+                    },
+                    4 => self.respondFmt("\x1b[?2;0;{d};{d}S", .{ max_w, max_h }),
+                    else => self.respondFmt("\x1b[?2;2;0S", .{}),
+                }
+            },
+            else => self.respondFmt("\x1b[?{d};2;0S", .{pi}),
+        }
+    }
+
+    pub fn feedSixel(self: *VtState, bytes: []const u8) void {
+        var i: usize = 0;
+        if (bytes.len >= 2 and bytes[0] == 0x1b and bytes[1] == 'P') i = 2;
+        var p2: u32 = 0;
+        var nparam: u8 = 0;
+        var val: u32 = 0;
+        var have = false;
+        while (i < bytes.len) {
+            const c = bytes[i];
+            if (c >= '0' and c <= '9') {
+                have = true;
+                val = val *% 10 +% (c - '0');
+                i += 1;
+                continue;
+            }
+            if (c == ';' or c == 'q') {
+                if (nparam == 1) p2 = if (have) val else 0;
+                nparam += 1;
+                val = 0;
+                have = false;
+                i += 1;
+                if (c == 'q') break;
+                continue;
+            }
+            if (c == 'q') {
+                i += 1;
+                break;
+            }
+            if (c < 0x20) {
+                i += 1;
+                continue;
+            }
+            break;
+        }
+        const body = payloadTrim(bytes[i..]);
+        if (body.len == 0) return;
+        if (!self.sixel_palette_ok or self.flags.sixel_private_palette) {
+            self.sixel_palette = Sixel.defaultPalette();
+            self.sixel_palette_ok = true;
+        }
+        const max_w = if (self.sixel_geo_w != 0) @as(u32, self.sixel_geo_w) else @as(u32, self.pixelWidth(false));
+        const max_h = if (self.sixel_geo_h != 0) @as(u32, self.sixel_geo_h) else @as(u32, self.pixelHeight(false));
+        const bmp = Sixel.decode(self.allocator, body, .{
+            .transparent = p2 == 1,
+            .max_w = @max(1, max_w),
+            .max_h = @max(1, max_h),
+            .palette = &self.sixel_palette,
+            .registers = self.sixel_reg,
+        }) catch return;
+        const cell_w = @max(@as(u32, 1), self.cell_px_w);
+        const cell_h = @max(@as(u32, 1), self.cell_px_h);
+        const cols_used: u32 = (bmp.width + cell_w - 1) / cell_w;
+        const rows_used: u32 = (bmp.height + cell_h - 1) / cell_h;
+        const cur = self.grid().cursor;
+        if (!self.flags.sixel_display) {
+            const need: u16 = sat16vt(rows_used);
+            const room = self.rows -| cur.row;
+            if (need > room) self.regionScrollUp(need - room);
+        }
+        self.kitty.placeBitmap(bmp.rgba, bmp.width, bmp.height, .{ .row = cur.row, .col = cur.col }, self.which, cols_used, rows_used);
+        const g = self.grid();
+        if (self.flags.sixel_cursor_right) {
+            g.cursor.col = @min(self.cols - 1, cur.col +| sat16vt(cols_used));
+        } else {
+            g.wrap_pending = false;
+            const down = sat16vt(rows_used);
+            var r = cur.row;
+            var k: u16 = 0;
+            while (k < down) : (k += 1) {
+                if (r == g.scroll_bottom) {
+                    if (!self.flags.sixel_display) self.regionScrollUp(1);
+                } else if (r + 1 < self.rows) {
+                    r += 1;
+                }
+            }
+            g.cursor.row = r;
+            g.cursor.col = 0;
+        }
+        self.markDirtyAll();
     }
 
     pub fn pushTitle(self: *VtState) void {
@@ -1008,6 +1254,7 @@ pub const VtState = struct {
     pub fn setTitle(self: *VtState, s: []const u8) void {
         self.title.clearRetainingCapacity();
         self.title.appendSlice(self.allocator, s) catch {};
+        self.title_dirty = true;
     }
 
     pub fn kittyKbdQuery(self: *VtState) void {
@@ -1319,6 +1566,16 @@ pub const VtState = struct {
         return out.toOwnedSlice(allocator);
     }
 };
+
+fn sat16vt(v: u32) u16 {
+    return @intCast(@min(v, 65535));
+}
+
+fn payloadTrim(s: []const u8) []const u8 {
+    if (s.len > 0 and s[s.len - 1] == 0x07) return s[0 .. s.len - 1];
+    if (s.len >= 2 and s[s.len - 2] == 0x1b and s[s.len - 1] == '\\') return s[0 .. s.len - 2];
+    return s;
+}
 
 fn paramVal(params: []const CsiSeq.Param, idx: usize, default: u32) u32 {
     if (idx >= params.len) return default;
@@ -1716,6 +1973,123 @@ test "lcf backspace does not leave last column" {
     try std.testing.expect(!vt.grid().wrap_pending);
 }
 
+test "ed 3 drops scrollback" {
+    var dummy: [1]u8 = .{0};
+    var vt = try VtState.init(std.testing.allocator, 4, 2, 8, &dummy);
+    defer vt.deinit();
+    for ("AABBCCDDEEFF") |b| vt.printCodepoint(b);
+    try std.testing.expect(vt.grid().used > 2);
+    applyCsi(&vt, "\x1b[3J");
+    try std.testing.expectEqual(@as(u32, 2), vt.grid().used);
+    try std.testing.expectEqual(@as(u32, 0), vt.grid().scroll);
+}
+
+test "tab writes tab and spaces" {
+    var dummy: [1]u8 = .{0};
+    var vt = try VtState.init(std.testing.allocator, 16, 1, 2, &dummy);
+    defer vt.deinit();
+    vt.printCodepoint('A');
+    C0.dispatch(&vt, 0x09);
+    try std.testing.expectEqual(@as(u21, '\t'), vt.grid().cellAt(0, 1).codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), vt.grid().cellAt(0, 2).codepoint);
+    try std.testing.expectEqual(@as(u16, 8), vt.grid().cursor.col);
+}
+
+test "sgr underline color on cell" {
+    var dummy: [1]u8 = .{0};
+    var vt = try VtState.init(std.testing.allocator, 8, 1, 2, &dummy);
+    defer vt.deinit();
+    applyCsi(&vt, "\x1b[4;58:2:1:2:3m");
+    vt.printCodepoint('X');
+    const c = vt.grid().cellAt(0, 0);
+    try std.testing.expect(c.attrs.underline);
+    try std.testing.expect(c.attrs.ul_color);
+    try std.testing.expectEqual(@as(u8, 1), c.ul.r);
+    try std.testing.expectEqual(@as(u8, 2), c.ul.g);
+    try std.testing.expectEqual(@as(u8, 3), c.ul.b);
+}
+
+test "grapheme clustering skips combining" {
+    var dummy: [1]u8 = .{0};
+    var vt = try VtState.init(std.testing.allocator, 8, 1, 2, &dummy);
+    defer vt.deinit();
+    applyCsi(&vt, "\x1b[?2027h");
+    vt.printCodepoint('e');
+    vt.printCodepoint(0x0301);
+    try std.testing.expectEqual(@as(u16, 1), vt.grid().cursor.col);
+    try std.testing.expectEqual(@as(u21, 'e'), vt.grid().cellAt(0, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), vt.grid().cellAt(0, 1).codepoint);
+}
+
+test "xtsmgraphics color registers" {
+    var dummy: [1]u8 = .{0};
+    var vt = try VtState.init(std.testing.allocator, 8, 2, 2, &dummy);
+    defer vt.deinit();
+    applyCsi(&vt, "\x1b[?1;1;0S");
+    try std.testing.expectEqualStrings("\x1b[?1;0;256S", vt.reply.items);
+}
+
+test "osc 7 cwd" {
+    var dummy: [1]u8 = .{0};
+    var vt = try VtState.init(std.testing.allocator, 8, 2, 2, &dummy);
+    defer vt.deinit();
+    Osc.dispatch(&vt, "\x1b]7;file://host/tmp/work\x07");
+    try std.testing.expectEqualStrings("/tmp/work", vt.cwd.items);
+}
+
+test "osc 9 conemu progress is not a notification" {
+    var dummy: [1]u8 = .{0};
+    var vt = try VtState.init(std.testing.allocator, 8, 2, 2, &dummy);
+    defer vt.deinit();
+    Osc.dispatch(&vt, "\x1b]9;4;1;0\x1b\\");
+    try std.testing.expect(!vt.notify_pending);
+    Osc.dispatch(&vt, "\x1b]9;4;0;0\x1b\\");
+    try std.testing.expect(!vt.notify_pending);
+    Osc.dispatch(&vt, "\x1b]9;hello\x07");
+    try std.testing.expect(vt.notify_pending);
+    try std.testing.expectEqualStrings("hello", vt.notify_body.items);
+}
+
+test "osc 9;9 sets cwd" {
+    var dummy: [1]u8 = .{0};
+    var vt = try VtState.init(std.testing.allocator, 8, 2, 2, &dummy);
+    defer vt.deinit();
+    Osc.dispatch(&vt, "\x1b]9;9;/tmp/work\x07");
+    try std.testing.expect(!vt.notify_pending);
+    try std.testing.expectEqualStrings("/tmp/work", vt.cwd.items);
+}
+
+test "osc 777 notify prefix only" {
+    var dummy: [1]u8 = .{0};
+    var vt = try VtState.init(std.testing.allocator, 8, 2, 2, &dummy);
+    defer vt.deinit();
+    Osc.dispatch(&vt, "\x1b]777;preedit;foo\x07");
+    try std.testing.expect(!vt.notify_pending);
+    Osc.dispatch(&vt, "\x1b]777;notify;Title;Body\x07");
+    try std.testing.expect(vt.notify_pending);
+    try std.testing.expectEqualStrings("Title", vt.notify_title.items);
+    try std.testing.expectEqualStrings("Body", vt.notify_body.items);
+}
+
+test "osc 99 kitty close is not a notification" {
+    var dummy: [1]u8 = .{0};
+    var vt = try VtState.init(std.testing.allocator, 8, 2, 2, &dummy);
+    defer vt.deinit();
+    Osc.dispatch(&vt, "\x1b]99;i=id:d=2;\x07");
+    try std.testing.expect(!vt.notify_pending);
+    Osc.dispatch(&vt, "\x1b]99;i=id:d=0:p=body;saved\x07");
+    try std.testing.expect(vt.notify_pending);
+    try std.testing.expectEqualStrings("saved", vt.notify_body.items);
+}
+
+test "xtgettcap name" {
+    var dummy: [1]u8 = .{0};
+    var vt = try VtState.init(std.testing.allocator, 8, 2, 2, &dummy);
+    defer vt.deinit();
+    Dcs.dispatch(&vt, "\x1bP+q544e\x1b\\");
+    try std.testing.expect(std.mem.indexOf(u8, vt.reply.items, "544e=") != null);
+}
+
 test "resize reflows wrapped lines" {
     var dummy: [1]u8 = .{0};
     var vt = try VtState.init(std.testing.allocator, 8, 2, 16, &dummy);
@@ -1730,4 +2104,27 @@ test "resize reflows wrapped lines" {
     try std.testing.expectEqual(@as(u21, 'A'), vt.grid().cellAt(0, 0).codepoint);
     try std.testing.expectEqual(@as(u21, 'H'), vt.grid().cellAt(0, 7).codepoint);
     try std.testing.expectEqual(@as(u21, ' '), vt.grid().cellAt(1, 0).codepoint);
+}
+
+test "osc 556 debug overlay" {
+    var dummy: [1]u8 = .{0};
+    var vt = try VtState.init(std.testing.allocator, 8, 2, 2, &dummy);
+    defer vt.deinit();
+    Osc.dispatch(&vt, "\x1b]556;wrap,lcf\x07");
+    if (comptime builtin.mode == .Debug) {
+        try std.testing.expect(vt.debug_overlay.wrap);
+        try std.testing.expect(vt.debug_overlay.lcf);
+        try std.testing.expect(!vt.debug_overlay.grid);
+    } else {
+        try std.testing.expect(!vt.debug_overlay.any());
+    }
+    applyCsi(&vt, "\x1b[?556h");
+    if (comptime builtin.mode == .Debug) {
+        try std.testing.expect(vt.debug_overlay.any());
+        try std.testing.expectEqual(@as(u16, 1), vt.privateMode(556));
+    }
+    applyCsi(&vt, "\x1b[?556l");
+    try std.testing.expect(!vt.debug_overlay.any());
+    Osc.dispatch(&vt, "\x1b]556;off\x07");
+    try std.testing.expect(!vt.debug_overlay.any());
 }

@@ -302,6 +302,8 @@ fn syncGrid(
     term.cell_px_w = @intCast(@min(cell_w, std.math.maxInt(u16)));
     term.cell_px_h = @intCast(@min(cell_h, std.math.maxInt(u16)));
     const fb = window.framebuffer();
+    term.win_px_w = @intCast(@min(fb.width, std.math.maxInt(u16)));
+    term.win_px_h = @intCast(@min(fb.height, std.math.maxInt(u16)));
     const next = gridDims(fb.width, fb.height, cell_w, cell_h, pad_px);
     const new_fw = @as(u32, next.cols) * cell_w;
     const new_fh = @as(u32, next.rows) * cell_h;
@@ -332,6 +334,59 @@ fn flushReply(pty: *Platform.Pty, term: *VtState) void {
     term.reply.clearRetainingCapacity();
 }
 
+fn zcopy(buf: []u8, src: []const u8) [:0]u8 {
+    const n = @min(src.len, buf.len - 1);
+    @memcpy(buf[0..n], src[0..n]);
+    buf[n] = 0;
+    return buf[0..n :0];
+}
+
+fn drainHost(window: *Platform.Window, term: *VtState, allocator: std.mem.Allocator) void {
+    window.setAllMotion(term.mouse == .any);
+    if (term.title_dirty) {
+        var buf: [256]u8 = undefined;
+        window.setTitle(zcopy(&buf, term.title.items));
+        term.title_dirty = false;
+    }
+    if (term.app_id_dirty) {
+        var buf: [128]u8 = undefined;
+        window.setClass(zcopy(&buf, term.app_id.items));
+        term.app_id_dirty = false;
+    }
+    if (term.pointer_dirty) {
+        window.setPointer(term.pointer);
+        term.pointer_dirty = false;
+    }
+    if (term.clip_kind != 0) {
+        if (term.clip_kind & 1 != 0) window.setClipboard(term.clip.items);
+        if (term.clip_kind & 2 != 0) window.setPrimary(term.clip.items);
+        term.clip_kind = 0;
+        term.clip.clearRetainingCapacity();
+    }
+    if (term.notify_pending) {
+        spawnNotify(allocator, term.notify_title.items, term.notify_body.items);
+        term.notify_pending = false;
+        term.notify_title.clearRetainingCapacity();
+        term.notify_body.clearRetainingCapacity();
+    }
+}
+
+fn spawnNotify(_: std.mem.Allocator, title: []const u8, body: []const u8) void {
+    const t = if (title.len == 0) "Velocitty" else title;
+    var tbuf: [128]u8 = undefined;
+    var bbuf: [512]u8 = undefined;
+    const tz = zcopy(&tbuf, t);
+    const bz = zcopy(&bbuf, body);
+    const rc = std.os.linux.fork();
+    const errno = std.os.linux.errno(rc);
+    if (errno != .SUCCESS) return;
+    if (rc != 0) return;
+    const argv = [_:null]?[*:0]const u8{ "notify-send", tz, bz, null };
+    const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+    _ = std.c.execve("/usr/bin/notify-send", &argv, envp);
+    std.os.linux.exit(127);
+}
+
 fn layoutIfNeeded(
     need_layout: *bool,
     need_draw: *bool,
@@ -354,6 +409,7 @@ fn layoutIfNeeded(
 ) void {
     if (!need_layout.*) return;
     const next_scale = uiScaleCached(io, allocator, false);
+    var changed = false;
     if (scaleChanged(next_scale, scale.*)) {
         scale.* = next_scale;
         size_px.* = fontPixels(config, scale.*);
@@ -362,10 +418,17 @@ fn layoutIfNeeded(
         eloop.cell_h = cell_h.*;
         eloop.pad_px = pad_px.*;
         frame.invalidate();
+        changed = true;
     }
+    const old_cols = cols.*;
+    const old_rows = rows.*;
+    const old_fw = frame.width;
+    const old_fh = frame.height;
     syncGrid(window, term, frame, pty, cols, rows, cell_w.*, cell_h.*, pad_px.*);
     need_layout.* = false;
-    need_draw.* = true;
+    if (changed or cols.* != old_cols or rows.* != old_rows or frame.width != old_fw or frame.height != old_fh) {
+        need_draw.* = true;
+    }
 }
 
 fn loadConfig(io: std.Io, gpa: std.mem.Allocator) Scheme.Config {
@@ -416,22 +479,23 @@ fn blitFrame(dst: *Platform.Framebuffer, src: *const Draw.Frame, bg: u32) void {
     const h = @min(dst.height -| oy, src.height);
     if (ox == 0 and oy == 0 and w == dst.width and w == src.width and h == dst.height and h == src.height and dst.stride == src.width) {
         @memcpy(dst.pixels, src.pixels);
-        return;
-    }
-    if (dst.stride == dst.width) {
-        @memset(dst.pixels, bg);
     } else {
-        var y: u32 = 0;
-        while (y < dst.height) : (y += 1) {
-            @memset(dst.pixels[y * dst.stride ..][0..dst.width], bg);
+        if (dst.stride == dst.width) {
+            @memset(dst.pixels, bg);
+        } else {
+            var y: u32 = 0;
+            while (y < dst.height) : (y += 1) {
+                @memset(dst.pixels[y * dst.stride ..][0..dst.width], bg);
+            }
         }
-    }
-    if (w == 0 or h == 0) return;
-    var y: u32 = 0;
-    while (y < h) : (y += 1) {
-        const d = dst.pixels[(y + oy) * dst.stride + ox ..][0..w];
-        const s = src.pixels[y * src.width ..][0..w];
-        @memcpy(d, s);
+        if (w != 0 and h != 0) {
+            var y: u32 = 0;
+            while (y < h) : (y += 1) {
+                const d = dst.pixels[(y + oy) * dst.stride + ox ..][0..w];
+                const s = src.pixels[y * src.width ..][0..w];
+                @memcpy(d, s);
+            }
+        }
     }
 }
 
@@ -441,42 +505,55 @@ fn cellAt(px: i32, cell: u32, max_cells: u16) u16 {
     return @intCast(@min(c, @as(u32, max_cells)));
 }
 
-fn encodeMouseWheel(
+const MouseReport = struct {
+    btn: u16,
+    press: bool,
+    motion: bool,
+    x: i32,
+    y: i32,
+    mods: Platform.Event.KeyMod,
+};
+
+fn encodeMouse(
     term: *const VtState,
-    w: Platform.Event.MouseWheel,
+    r: MouseReport,
     ox: u32,
     oy: u32,
     cell_w: u32,
     cell_h: u32,
     buf: *[64]u8,
 ) []const u8 {
-    var btn: u16 = if (w.up) 64 else 65;
-    if (w.mods.shift) btn += 4;
-    if (w.mods.alt) btn += 8;
-    if (w.mods.ctrl) btn += 16;
+    var btn = r.btn;
+    if (r.mods.shift) btn += 4;
+    if (r.mods.alt) btn += 8;
+    if (r.mods.ctrl) btn += 16;
+    if (r.motion) btn += 32;
 
-    const rel_x = w.x - @as(i32, @intCast(ox));
-    const rel_y = w.y - @as(i32, @intCast(oy));
+    const rel_x = r.x - @as(i32, @intCast(ox));
+    const rel_y = r.y - @as(i32, @intCast(oy));
+    const final: u8 = if (term.flags.mouse_sgr or term.flags.mouse_pixels) (if (r.press or r.motion) 'M' else 'm') else 'M';
 
     if (term.flags.mouse_pixels) {
         const x: u32 = @intCast(@max(1, rel_x + 1));
         const y: u32 = @intCast(@max(1, rel_y + 1));
-        return std.fmt.bufPrint(buf, "\x1b[<{d};{d};{d}M", .{ btn, x, y }) catch "";
+        return std.fmt.bufPrint(buf, "\x1b[<{d};{d};{d}{c}", .{ btn, x, y, final }) catch "";
     }
 
     const col = cellAt(rel_x, cell_w, term.cols);
     const row = cellAt(rel_y, cell_h, term.rows);
     if (term.flags.mouse_sgr) {
-        return std.fmt.bufPrint(buf, "\x1b[<{d};{d};{d}M", .{ btn, col, row }) catch "";
+        return std.fmt.bufPrint(buf, "\x1b[<{d};{d};{d}{c}", .{ btn, col, row, final }) catch "";
     }
     if (term.flags.mouse_urxvt) {
-        return std.fmt.bufPrint(buf, "\x1b[{d};{d};{d}M", .{ btn, col, row }) catch "";
+        const b = if (r.press or r.motion) btn else @as(u16, 3);
+        return std.fmt.bufPrint(buf, "\x1b[{d};{d};{d}M", .{ b, col, row }) catch "";
     }
     if (col > 223 or row > 223) return "";
+    const legacy: u16 = if (r.press or r.motion) btn else 3;
     buf[0] = 0x1b;
     buf[1] = '[';
     buf[2] = 'M';
-    buf[3] = @intCast(btn + 32);
+    buf[3] = @intCast(@min(legacy + 32, 255));
     buf[4] = @intCast(col + 32);
     buf[5] = @intCast(row + 32);
     return buf[0..6];
@@ -540,6 +617,7 @@ const EventLoop = struct {
     click_time: u32 = 0,
     click_col: u16 = 0,
     click_row: u16 = 0,
+    mouse_held: u8 = 0,
 
     fn pump(ptr: *anyopaque) void {
         const self: *EventLoop = @ptrCast(@alignCast(ptr));
@@ -562,7 +640,17 @@ const EventLoop = struct {
                 self.need_draw.* = true;
             },
             .redraw => self.need_draw.* = true,
-            .focus_gained => self.need_layout.* = true,
+            .focus_gained => {
+                self.need_layout.* = true;
+                if (self.term.flags.focus_event) self.pty.write("\x1b[I");
+                self.term.setVisible(true);
+                flushReply(self.pty, self.term);
+            },
+            .focus_lost => {
+                if (self.term.flags.focus_event) self.pty.write("\x1b[O");
+                self.term.setVisible(false);
+                flushReply(self.pty, self.term);
+            },
             .key_press => |k| {
                 self.clearSel();
                 const bytes = encodeKey(k.key, k.mods, self.term.flags.app_cursor);
@@ -576,13 +664,8 @@ const EventLoop = struct {
                 const ticks: u8 = @max(1, w.steps);
                 var t: u8 = 0;
                 if (self.term.mouse != .off) {
-                    const fb = self.window.framebuffer();
-                    const ox: u32 = if (fb.width > self.frame.width) (fb.width - self.frame.width) / 2 else 0;
-                    const oy: u32 = if (fb.height > self.frame.height) (fb.height - self.frame.height) / 2 else 0;
-                    var buf: [64]u8 = undefined;
-                    const bytes = encodeMouseWheel(self.term, w, ox, oy, self.cell_w, self.cell_h, &buf);
                     while (t < ticks) : (t += 1) {
-                        if (bytes.len != 0) self.pty.write(bytes);
+                        self.reportMouse(.{ .btn = if (w.up) 64 else 65, .press = true, .motion = false, .x = w.x, .y = w.y, .mods = w.mods });
                     }
                 } else if (self.term.which == 1) {
                     const key: Platform.Event.KeyCode = if (w.up) .arrow_up else .arrow_down;
@@ -619,9 +702,32 @@ const EventLoop = struct {
         };
     }
 
+    fn reportMouse(self: *EventLoop, r: MouseReport) void {
+        const fb = self.window.framebuffer();
+        const ox: u32 = if (fb.width > self.frame.width) (fb.width - self.frame.width) / 2 else 0;
+        const oy: u32 = if (fb.height > self.frame.height) (fb.height - self.frame.height) / 2 else 0;
+        var buf: [64]u8 = undefined;
+        const bytes = encodeMouse(self.term, r, ox, oy, self.cell_w, self.cell_h, &buf);
+        if (bytes.len != 0) self.pty.write(bytes);
+    }
+
+    fn reporting(self: *const EventLoop, mods: Platform.Event.KeyMod) bool {
+        return self.term.mouse != .off and !mods.shift;
+    }
+
     fn onMouseDown(self: *EventLoop, m: Platform.Event.Mouse) void {
+        if (self.reporting(m.mods)) {
+            if (m.button >= 1 and m.button <= 3) {
+                self.mouse_held = m.button;
+                self.reportMouse(.{ .btn = m.button - 1, .press = true, .motion = false, .x = m.x, .y = m.y, .mods = m.mods });
+            }
+            return;
+        }
+        if (m.button == 2) {
+            self.window.requestPasteFrom(.primary);
+            return;
+        }
         if (m.button != 1) return;
-        if (self.term.mouse != .off and !m.mods.shift) return;
         const p = self.hit(m.x, m.y);
         const chained = p.col == self.click_col and p.row == self.click_row and m.time -% self.click_time < 500;
         self.clicks = if (chained) self.clicks % 3 + 1 else 1;
@@ -644,6 +750,13 @@ const EventLoop = struct {
     }
 
     fn onMouseMove(self: *EventLoop, m: Platform.Event.Mouse) void {
+        if (self.term.mouse == .any or (self.term.mouse == .drag and self.mouse_held != 0)) {
+            if (!m.mods.shift) {
+                const btn: u16 = if (self.mouse_held != 0) self.mouse_held - 1 else 0;
+                self.reportMouse(.{ .btn = btn, .press = true, .motion = true, .x = m.x, .y = m.y, .mods = m.mods });
+                return;
+            }
+        }
         if (!self.dragging) return;
         const p = self.hit(m.x, m.y);
         if (p.col != self.click_col or p.row != self.click_row) self.drag_moved = true;
@@ -656,6 +769,11 @@ const EventLoop = struct {
     }
 
     fn onMouseUp(self: *EventLoop, m: Platform.Event.Mouse) void {
+        if (self.reporting(m.mods) and m.button >= 1 and m.button <= 3) {
+            self.reportMouse(.{ .btn = m.button - 1, .press = false, .motion = false, .x = m.x, .y = m.y, .mods = m.mods });
+            if (self.mouse_held == m.button) self.mouse_held = 0;
+            return;
+        }
         if (m.button != 1 or !self.dragging) return;
         self.dragging = false;
         const p = self.hit(m.x, m.y);
@@ -849,6 +967,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var theme_stamp = Scheme.watchStamp(io.io());
     var need_draw = true;
     var need_layout = true;
+    var last_alpha: u8 = 255;
+    var last_watch_ns: i128 = 0;
+    var sync_hold: u32 = 0;
 
     var eloop = EventLoop{
         .window = &window,
@@ -871,8 +992,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
         if (!running) break;
 
-        const stamp = Scheme.watchStamp(io.io());
-        if (stamp != theme_stamp) reload_requested.store(true, .release);
+        const now_ns: i128 = @intCast(std.Io.Timestamp.now(io.io(), .awake).nanoseconds);
+        if (now_ns -| last_watch_ns >= 250_000_000) {
+            last_watch_ns = now_ns;
+            const stamp = Scheme.watchStamp(io.io());
+            if (stamp != theme_stamp) reload_requested.store(true, .release);
+        }
 
         if (reload_requested.swap(false, .acq_rel)) {
             config = loadConfig(io.io(), allocator);
@@ -964,15 +1089,24 @@ pub fn main(init: std.process.Init.Minimal) !void {
             if (runs.len != 0) term.feedRuns(runs);
             need_draw = true;
         }
+        drainHost(&window, &term, allocator);
+        if (term.scheme.bg.a != last_alpha) {
+            last_alpha = term.scheme.bg.a;
+            window.setOpacity(last_alpha);
+        }
         flushReply(&pty, &term);
 
-        if (need_draw) {
+        const hold_sync = term.flags.sync_output and sync_hold < hz;
+        if (need_draw and !hold_sync) {
             frame.renderSel(&term, cell_w, cell_h, type_ptr, size_px, eloop.sel);
             term.clearDirty();
             const fb = window.framebuffer();
             blitFrame(fb, &frame, padColor(&term));
             window.present();
             need_draw = false;
+            sync_hold = 0;
+        } else if (need_draw and hold_sync) {
+            sync_hold += 1;
         }
 
         if (hangup) running = false;

@@ -379,6 +379,32 @@ pub fn cellWidth(cp: u21) u8 {
     return 1;
 }
 
+/// Grapheme extend (Mn/Me-ish, ZWJ, variation selectors, emoji modifiers).
+pub fn isCombining(cp: u21) bool {
+    return switch (cp) {
+        0x0300...0x036F,
+        0x0483...0x0489,
+        0x07EB...0x07F3,
+        0x135D...0x135F,
+        0x1AB0...0x1ACE,
+        0x1DC0...0x1DFF,
+        0x200B...0x200D,
+        0x20D0...0x20F0,
+        0x2DE0...0x2DFF,
+        0x302A...0x302F,
+        0x3099...0x309A,
+        0xA66F...0xA67D,
+        0xA69E...0xA69F,
+        0xFE00...0xFE0F,
+        0xFE20...0xFE2F,
+        0xFEFF,
+        0x1F3FB...0x1F3FF,
+        0xE0100...0xE01EF,
+        => true,
+        else => false,
+    };
+}
+
 test "ascii narrow cjk wide emoji two cells" {
     try std.testing.expectEqual(Width.narrow, width('A'));
     try std.testing.expectEqual(@as(u8, 1), cellWidth('A'));

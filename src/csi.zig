@@ -246,6 +246,12 @@ fn applyDec(final: u8, params: []const Param, vt: *Vt) void {
         },
         'm' => xtqmodkeys(params, vt),
         'u' => vt.kittyKbdQuery(),
+        'S' => vt.xtsmgraphics(
+            pget(params, 0, 0),
+            pget(params, 1, 0),
+            pget(params, 2, 0),
+            if (params.len > 3) params[3].value else 0,
+        ),
         'p' => {
             // ANSI DECRQM without '$' is not this branch.
         },

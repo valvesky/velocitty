@@ -120,6 +120,10 @@ pub const Window = struct {
         return self.impl.eventsPending();
     }
 
+    pub fn setAllMotion(self: *Window, on: bool) void {
+        self.impl.setAllMotion(on);
+    }
+
     /// X connection fd (`ConnectionNumber(dpy)`). Poll with the PTY; do not read it.
     pub fn eventFd(self: *Window) std.posix.fd_t {
         return self.impl.eventFd();
@@ -139,6 +143,22 @@ pub const Window = struct {
 
     pub fn setPrimary(self: *Window, text: []const u8) void {
         self.impl.setPrimary(text);
+    }
+
+    pub fn setTitle(self: *Window, title: [:0]const u8) void {
+        self.impl.setTitle(title);
+    }
+
+    pub fn setClass(self: *Window, class: [:0]const u8) void {
+        self.impl.setClass(class);
+    }
+
+    pub fn setOpacity(self: *Window, alpha: u8) void {
+        self.impl.setOpacity(alpha);
+    }
+
+    pub fn setPointer(self: *Window, shape: u8) void {
+        self.impl.setPointer(shape);
     }
 
     pub fn framebuffer(self: *Window) *Framebuffer {
