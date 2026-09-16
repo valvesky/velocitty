@@ -18,6 +18,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
     b.installFile("velocitty.desktop", "share/applications/velocitty.desktop");
     b.installFile("icon.png", "share/icons/hicolor/512x512/apps/velocitty.png");
+    b.installFile("velocitty.1", "share/man/man1/velocitty.1");
 
     // Standard run step
     const run_cmd = b.addRunArtifact(exe);
@@ -39,8 +40,10 @@ pub fn build(b: *std.Build) void {
         .root_module = bench_mod,
     });
     const bench_run = b.addRunArtifact(bench_exe);
+    bench_run.setCwd(b.path("."));
+    bench_run.has_side_effects = true;
     if (b.args) |args| bench_run.addArgs(args);
-    const bench_step = b.step("bench", "Run firehose/parse/VT microbenchmark (ReleaseFast)");
+    const bench_step = b.step("bench", "Run pipeline microbenchmark: IO/parse/VT/draw/LRU (ReleaseFast)");
     bench_step.dependOn(&bench_run.step);
 
     // Release: Linux gnu/musl. Same-arch links system X11; other arches use
@@ -72,6 +75,7 @@ pub fn build(b: *std.Build) void {
         pkg_cmd.addArtifactArg(exe_rel);
         pkg_cmd.addFileArg(b.path("velocitty.desktop"));
         pkg_cmd.addFileArg(b.path("icon.png"));
+        pkg_cmd.addFileArg(b.path("velocitty.1"));
         pkg_cmd.addArg(packages_dir);
         pkg_cmd.stdio = .inherit;
         pkg_cmd.has_side_effects = true;
@@ -90,6 +94,7 @@ pub fn build(b: *std.Build) void {
     usr_cmd.addArtifactArg(usr_exe);
     usr_cmd.addFileArg(b.path("velocitty.desktop"));
     usr_cmd.addFileArg(b.path("icon.png"));
+    usr_cmd.addFileArg(b.path("velocitty.1"));
     usr_cmd.stdio = .inherit;
     usr_cmd.has_side_effects = true;
     usr_cmd.disable_zig_progress = true;

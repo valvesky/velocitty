@@ -1,8 +1,8 @@
 # Architecture / Design
 1. IO:
     - Truncates firehose input through a mirrored circular buffer allowing users to cat large files.
-    - EAGAIN: We only consume on EAGAIN if 1/hz time has passed and we need to refresh the screen.
-    - Otherwise we keep reading until EOF.
+    - We keep reading until EOF.
+    - In the case that IO lasts longer than 1/hz, we 
 2. VECTORIZED PREPARSING:
     - After truncating input, input is split into lines via AVX2 accelerated preparsing.
     - For correctness we detect escape sequences and newlines. 
@@ -17,6 +17,7 @@
     - Split the lines that fit on the screen into "runs".
     - Runs will be split into C0 (<0x1b), (>=DEL) C1, Esc (0x1b), EscKitty, EscSixel, Plain, UTF-8, possibly more in the future.
 4. MINIMAL STATE TERMINAL EMULATOR:
+    - As branchless as possible.
     - Feed the runs into the optimized minimal-state terminal emulator to get the final screen.
     - The final terminal cells and lines will be added to the buffer of cells and get indexed allowing for 
     - The minimal state terminal should also use vectorization when possible.

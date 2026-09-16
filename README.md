@@ -25,7 +25,9 @@
   </p>
 </p>
 
-Velocitty is a lightning-fast cross-platform terminal.
+Velocitty is a lightning-fast terminal for omarchy.
+
+It's a streamlined version of my GPU-accelerated terminal multiplexer [VT](https://github.com/valvesky/velocitty).
 
 ## Features
 - Lightning fast (literally bottlenecked by the kernel)
@@ -65,12 +67,6 @@ Config file is `~/.config/velocitty/config.toml` and will be overwritten by omar
 
 See `example.config.toml` for an example config file.
 It's purposefully similar to `alacritty` in many ways.
-
-## Supported Platforms 
-- [x] Linux (Wayland)
-- [x] Linux (X11)
-- [ ] macOS
-- [ ] Windows
 
 ## Shoutouts
 - [vt](https://github.com/valvesky/vt) --- older brother

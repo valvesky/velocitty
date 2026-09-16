@@ -1,0 +1,266 @@
+.TH VELOCITTY 1 "September 2026" "velocitty 0.2.0" "Velocitty Terminal Emulator"
+.SH NAME
+velocitty \- CPU-rendered terminal emulator
+.SH SYNOPSIS
+.B velocitty
+.RI [ options ]
+.RB [ \-e | \-\-
+.IR command " [" arg "...]]"
+.SH DESCRIPTION
+.B velocitty
+is a CPU-rendered terminal emulator.
+It is designed to keep up with high-volume output such as
+.BR cat (1)
+of large files: PTY input is truncated through a mirrored circular buffer,
+split into lines and runs with SIMD, then fed to a minimal-state VT emulator
+and drawn to a software framebuffer.
+.PP
+With no
+.B \-e
+command, the child is
+.B $SHELL
+(or
+.B /bin/sh
+if unset). The child environment sets
+.BR TERM = xterm-256color
+(SSH-safe terminfo),
+.BR COLORTERM = truecolor ,
+.BR TERM_PROGRAM = velocitty ,
+and
+.BR KITTY_WINDOW_ID
+to the emulator PID.
+.PP
+Window class and title follow
+.B \-\-class
+/
+.B \-\-title
+and may be updated by OSC 176 and OSC 0/2. Geometry, font size, and inner
+padding use CSS 96 DPI times a Hyprland /
+.B GDK_SCALE
+multiplier (not X11 millimetre DPI), reapplied on focus and resize only when
+the scale or grid actually changes.
+.SH OPTIONS
+.TP
+.BR \-e ", " \-\- " " \fIcommand\fR " [" \fIarg\fR ...]
+Execute
+.I command
+in the PTY instead of the shell. All following arguments are passed to
+.IR command .
+Must be last among options.
+.TP
+.BR \-\-class " " \fIname\fR
+ICCCM / WM_CLASS instance name (also
+.BR \-\-class= name ).
+Default:
+.BR velocitty .
+.TP
+.BR \-\-title " " \fItext\fR
+Initial window title (also
+.BR \-\-title= text ).
+Default:
+.BR Velocitty .
+.TP
+.BR \-\-working\-directory " " \fIdir\fR
+Working directory of the child (also
+.BR \-\-working\-directory= dir ).
+Used by
+.BR xdg-terminal-exec (1).
+.SH KEY BINDINGS
+.TP
+.B Ctrl+Shift+C
+Copy the current selection to CLIPBOARD (UTF8_STRING).
+.TP
+.B Ctrl+Shift+V
+Paste CLIPBOARD into the PTY (bracketed paste if DECSET 2004 is on).
+.TP
+.B Shift+Insert
+Same as Ctrl+Shift+V.
+.PP
+Other keys are sent as VT sequences (including application-cursor keys when
+the application has enabled them).
+.SH MOUSE
+Left-drag selects a cell stream. Double-click selects a word; triple-click
+selects a line. Releasing the button copies the selection to PRIMARY.
+.PP
+When mouse reporting is enabled (DECSET 1000/1002/1003, SGR/urxvt/pixel
+modes), Shift+drag still selects instead of reporting. Middle-click pastes
+PRIMARY. Wheel events go to the application when reporting, otherwise scroll
+the primary screen history or send arrow keys on the alternate screen.
+.SH CONFIGURATION
+Config is TOML, similar to Alacritty. Unknown keys are ignored.
+.PP
+Load order (later files overlay earlier; Omarchy theme colors win when
+present):
+.IP 1. 3
+.I $XDG_CONFIG_HOME/velocitty/config.toml
+(default
+.IR ~/.config/velocitty/config.toml )
+.IP 2.
+.I ./config.toml
+in the current working directory
+.IP 3.
+Omarchy current theme
+.I colors.toml
+.IP 4.
+Omarchy current theme
+.I alacritty.toml
+.PP
+If
+.B [font].size
+is still unset, size is taken from
+.IR ~/.config/alacritty/alacritty.toml ,
+then 9 when an Omarchy theme is in use. Unset family is resolved with
+fontconfig
+.B monospace
+.RB ( "omarchy font current" ).
+.SS Colors
+Root or
+.B [colors]
+/
+.B [colors.primary]
+keys:
+.BR foreground " (" fg ),
+.BR background " (" bg ),
+.BR cursor .
+.B [normal]
+and
+.B [bright]
+(or
+.BR [colors.normal] ,
+.BR [colors.bright] )
+set the 16 ANSI colors. Omarchy
+.I colors.toml
+keys such as
+.BR muted ,
+.BR bright_foreground ,
+and root-level ANSI names are accepted.
+.SS [general]
+.TP
+.BR refreshrate " / " hz
+Target redraw rate in Hz when PTY reads return EAGAIN. Default: 30.
+.TP
+.B whitelist
+If true, parse a whitelist of escape sequences during line split (payloads
+may contain newline bytes). Default: false (split on newlines only).
+.TP
+.BR pad " / " padding
+Inner window margin in CSS pixels, all sides. Default: 14. Scaled by the
+output scale factor.
+.SS [font]
+.TP
+.BR family " / " font " / " font_family
+Fontconfig family name. Default: fontconfig
+.BR monospace .
+.TP
+.BR size " / " font_size
+Point size. Default: Alacritty config, else 9 under Omarchy, else the
+built-in fallback fonts.
+.PP
+Example:
+.PP
+.nf
+.RS
+foreground = "#ebdbb2"
+background = "#282828"
+cursor = "#ebdbb2"
+
+[normal]
+black = "#282828"
+red = "#cc241d"
+# ...
+
+[bright]
+black = "#928374"
+# ...
+
+[general]
+refreshrate = 30
+whitelist = false
+pad = 14
+
+[font]
+family = "monospace"
+size = 16
+.RE
+.fi
+.SH ENVIRONMENT
+.TP
+.B HOME
+Used to locate config, Omarchy state, and fontconfig.
+.TP
+.B XDG_CONFIG_HOME
+Overrides
+.IR ~/.config
+for user config and Alacritty overlay.
+.TP
+.B XDG_STATE_HOME
+Overrides
+.IR ~/.local/state
+for Omarchy current theme paths.
+.TP
+.B SHELL
+Child program when
+.B \-e
+is not given.
+.TP
+.B GDK_SCALE ", " QT_SCALE_FACTOR
+UI scale fallback when Hyprland scale is unavailable.
+.TP
+.B TERM ", " COLORTERM ", " TERM_PROGRAM ", " KITTY_WINDOW_ID
+Set in the child. Incoming
+.B KITTY_LISTEN_ON
+is cleared.
+.SH SIGNALS
+.TP
+.BR SIGUSR1 ", " SIGUSR2
+Reload colors and font from config and the current Omarchy theme without
+restarting. Theme/font file changes are also watched (throttled) and trigger
+the same reload; CSI 2031 is sent when the palette changes.
+.TP
+.B SIGWINCH
+Sent to the slave foreground process group after
+.B TIOCSWINSZ
+on resize.
+.SH FILES
+.TP
+.I $XDG_CONFIG_HOME/velocitty/config.toml
+User configuration.
+.TP
+.I $XDG_STATE_HOME/omarchy/current/theme/colors.toml
+.TQ
+.I $XDG_STATE_HOME/omarchy/current/theme/alacritty.toml
+Omarchy live theme (overlaid on user config).
+.TP
+.I $XDG_CONFIG_HOME/alacritty/alacritty.toml
+Font size fallback when unset.
+.SH PROTOCOL
+Implements a large subset of xterm / foot control sequences: C0/C1, ESC
+charsets, CSI (SGR, CUP, DECSET/DECRQM, rectangular ops, kitty keyboard,
+window ops, color stack, XTSMGRAPHICS), OSC (title, colors, OSC 8 hyperlinks,
+cwd, notify, alpha, selection, cursor shape, OSC 52 clipboard, OSC 176
+app-id), DCS (DECRQSS, iTerm sync, XTGETTCAP, sixel), and kitty graphics
+(APC G, including
+.B a=q
+replies for icat).
+.PP
+DECSET 2026 and iTerm DCS
+.B =1s
+defer presenting frames until the synchronized update ends (1s timeout).
+In-band resize (2048) flushes VT replies after a grid change.
+.PP
+In Debug builds only, OSC 556 and CSI
+.B ? 556
+toggle a visual overlay (grid, wrap, LCF, cursor, dirty, region, wide, HUD).
+Ignored in Release.
+.SH SEE ALSO
+.BR xterm (1),
+.BR foot (1),
+.BR fc-match (1),
+.BR xdg-terminal-exec (1)
+.SH BUGS
+macOS and Windows targets are not supported yet. There is no GPU renderer,
+no multiplexer, and no kitty-style CTL.
+.SH AUTHOR
+Vasco Alves
+.SH COPYRIGHT
+MIT License. Copyright (c) 2026 Vasco Alves.
