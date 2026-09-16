@@ -2,7 +2,8 @@ const std = @import("std");
 
 const targets: []const std.Target.Query = &.{
     .{ .cpu_arch = .aarch64, .os_tag = .macos },
-    .{ .cpu_arch = .aarch64, .os_tag = .linux },
+    .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu },
+    .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl },
     .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu },
     .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl },
     .{ .cpu_arch = .x86_64, .os_tag = .windows },
@@ -42,8 +43,8 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run firehose/parse/VT microbenchmark (ReleaseFast)");
     bench_step.dependOn(&bench_run.step);
 
-    // Release cross-compilation step. Only targets the host can actually
-    // compile and link are built (Linux + same-arch X11 today).
+    // Release: Linux gnu/musl. Same-arch links system X11; other arches use
+    // link-time X11/Xi stubs (runtime still needs the real libraries).
     const release_step = b.step("release", "Build optimized velocitty for all target platforms");
     const package_step = b.step("package", "Build release and write tar.gz archives to packages/");
     package_step.dependOn(release_step);
@@ -98,13 +99,10 @@ pub fn build(b: *std.Build) void {
     usr_step.dependOn(&usr_cmd.step);
 }
 
-fn canLinkReleaseTarget(b: *std.Build, target: std.Build.ResolvedTarget) bool {
-    const host = b.graph.host.result;
+fn canLinkReleaseTarget(_: *std.Build, target: std.Build.ResolvedTarget) bool {
     const t = target.result;
     if (t.os.tag != .linux) return false;
-    if (t.cpu.arch != host.cpu.arch) return false;
-    if (t.abi != host.abi) return false;
-    return true;
+    return t.abi == .gnu or t.abi == .musl;
 }
 
 fn buildExeForTarget(
@@ -137,13 +135,49 @@ fn buildExeForTarget(
 }
 
 fn addLinuxX11(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+    // After Zig's libc so host bits/math.h cannot shadow the target headers.
+    mod.addAfterIncludePath(.{ .cwd_relative = "/usr/include" });
     const host = b.graph.host.result;
     if (target.result.cpu.arch == host.cpu.arch) {
         mod.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
-        mod.addIncludePath(.{ .cwd_relative = "/usr/include" });
+    } else {
+        // Host has no aarch64 (etc.) libX11/libXi; stub .so files provide link
+        // symbols and the libX11.so.6 / libXi.so.6 sonames. Not packaged.
+        const x11 = addX11LinkStub(b, target, "X11", "src/platform/x11_link_stub.c");
+        const xi = addX11LinkStub(b, target, "Xi", "src/platform/xi_link_stub.c");
+        mod.addLibraryPath(x11.getEmittedBinDirectory());
+        mod.addLibraryPath(xi.getEmittedBinDirectory());
     }
-    mod.linkSystemLibrary("X11", .{});
-    mod.linkSystemLibrary("Xi", .{});
+    const syslib: std.Build.Module.LinkSystemLibraryOptions = .{
+        .needed = true,
+        .use_pkg_config = .no,
+    };
+    mod.linkSystemLibrary("X11", syslib);
+    mod.linkSystemLibrary("Xi", syslib);
+}
+
+fn addX11LinkStub(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    name: []const u8,
+    src: []const u8,
+) *std.Build.Step.Compile {
+    const lib = b.addLibrary(.{
+        .name = name,
+        .linkage = .dynamic,
+        .version = .{ .major = 6, .minor = 0, .patch = 0 },
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = .ReleaseSmall,
+            .link_libc = true,
+            .pic = true,
+        }),
+    });
+    lib.root_module.addCSourceFile(.{
+        .file = b.path(src),
+        .flags = &.{ "-std=c99", "-fPIC", "-fno-sanitize=undefined" },
+    });
+    return lib;
 }
 
 fn addStbTrueType(mod: *std.Build.Module, b: *std.Build) void {

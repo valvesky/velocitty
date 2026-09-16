@@ -1,6 +1,6 @@
 .{
     .name = .Velocitty,
-    .version = "0.1.1",
+    .version = "0.2.0",
     .fingerprint = 0x63301961c26f0d7f, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{

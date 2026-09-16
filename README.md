@@ -32,7 +32,7 @@ Velocitty is a lightning-fast cross-platform terminal.
 - `cat` large files.
 - Cross-platform.
 - CPU rendered.
-- Image support (kitty protocol)
+- Image support (sixel)
 - Extensive unicode support.
 - Simple config file.
 - No external dependencies.
@@ -66,14 +66,14 @@ Config file is `~/.config/velocitty/config.toml` and will be overwritten by omar
 See `example.config.toml` for an example config file.
 It's purposefully similar to `alacritty` in many ways.
 
-
 ## Supported Platforms 
 - [x] Linux (Wayland)
-- [ ] Linux (X11)
+- [x] Linux (X11)
 - [ ] macOS
 - [ ] Windows
 
 ## Shoutouts
+- [vt](https://github.com/valvesky/vt) --- older brother
 - [st](https://st.suckless.org) --- how to suck less
 - [refterm](https://github.com/cmuratori/refterm) --- how to black magic
 - [kitty](https://sw.kovidgoyal.net/kitty/) --- how to meow

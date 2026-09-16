@@ -6,7 +6,7 @@
 - Pipeline: `circbuffer` (line split + runs) → `vt` → `draw`.
 
 # Release
-- `zig build release` builds ReleaseFast for host-linkable Linux triples only (same arch/abi, needs X11).
+- `zig build release` builds ReleaseFast for Linux gnu and musl (x86_64 and aarch64). Same-arch links system X11; other arches link X11/Xi stubs (`src/platform/x11_link_stub.c`, `xi_link_stub.c`) so the binary still needs libX11/libXi at runtime.
 - `zig build package` runs `release` and writes `packages/velocitty-<version>-<triple>.tar.gz` (binary, desktop, icon).
 
 # Install
