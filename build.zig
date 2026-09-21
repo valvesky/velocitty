@@ -47,7 +47,8 @@ pub fn build(b: *std.Build) void {
     bench_step.dependOn(&bench_run.step);
 
     // Release: Linux gnu/musl. Same-arch links system X11; other arches use
-    // link-time X11/Xi stubs (runtime still needs the real libraries).
+    // link-time X11/Xi stubs. xkbcommon is always a link stub (host .so needs
+    // a newer glibc than Zig's). Runtime still needs the real libraries.
     const release_step = b.step("release", "Build optimized velocitty for all target platforms");
     const package_step = b.step("package", "Build release and write tar.gz archives to packages/");
     package_step.dependOn(release_step);
@@ -143,13 +144,20 @@ fn addLinuxX11(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolved
     // After Zig's libc so host bits/math.h cannot shadow the target headers.
     mod.addAfterIncludePath(.{ .cwd_relative = "/usr/include" });
     const host = b.graph.host.result;
+    // Host libxkbcommon is built against a newer glibc than Zig's (stat64@2.33,
+    // __isoc23_strtol@2.38). Always link the stub; runtime still needs
+    // libxkbcommon.so.0. Stub path is first so -lxkbcommon does not pick /usr/lib.
+    const ver0: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 };
+    const xkb = addX11LinkStub(b, target, "xkbcommon", "src/platform/xkb_link_stub.c", ver0);
+    mod.addLibraryPath(xkb.getEmittedBinDirectory());
     if (target.result.cpu.arch == host.cpu.arch) {
         mod.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
     } else {
         // Host has no aarch64 (etc.) libX11/libXi; stub .so files provide link
         // symbols and the libX11.so.6 / libXi.so.6 sonames. Not packaged.
-        const x11 = addX11LinkStub(b, target, "X11", "src/platform/x11_link_stub.c");
-        const xi = addX11LinkStub(b, target, "Xi", "src/platform/xi_link_stub.c");
+        const ver6: std.SemanticVersion = .{ .major = 6, .minor = 0, .patch = 0 };
+        const x11 = addX11LinkStub(b, target, "X11", "src/platform/x11_link_stub.c", ver6);
+        const xi = addX11LinkStub(b, target, "Xi", "src/platform/xi_link_stub.c", ver6);
         mod.addLibraryPath(x11.getEmittedBinDirectory());
         mod.addLibraryPath(xi.getEmittedBinDirectory());
     }
@@ -159,10 +167,7 @@ fn addLinuxX11(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolved
     };
     mod.linkSystemLibrary("X11", syslib);
     mod.linkSystemLibrary("Xi", syslib);
-    mod.addCSourceFile(.{
-        .file = b.path("src/platform/xim.c"),
-        .flags = &.{ "-std=c99", "-fno-sanitize=undefined" },
-    });
+    mod.linkSystemLibrary("xkbcommon", syslib);
 }
 
 fn addX11LinkStub(
@@ -170,11 +175,12 @@ fn addX11LinkStub(
     target: std.Build.ResolvedTarget,
     name: []const u8,
     src: []const u8,
+    version: std.SemanticVersion,
 ) *std.Build.Step.Compile {
     const lib = b.addLibrary(.{
         .name = name,
         .linkage = .dynamic,
-        .version = .{ .major = 6, .minor = 0, .patch = 0 },
+        .version = version,
         .root_module = b.createModule(.{
             .target = target,
             .optimize = .ReleaseSmall,

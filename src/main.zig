@@ -10,6 +10,7 @@ const Draw = @import("draw.zig");
 const TypeCtx = @import("type.zig").Context;
 const Scheme = @import("scheme.zig");
 const Select = @import("select.zig");
+const Key = @import("key.zig");
 
 const font_paths: []const []const u8 = switch (builtin.os.tag) {
     .macos, .ios, .tvos, .watchos, .visionos => &.{
@@ -606,40 +607,8 @@ fn encodeMouse(
     return buf[0..6];
 }
 
-fn encodeKey(key: Platform.Event.KeyCode, mods: Platform.Event.KeyMod, app_cursor: bool) []const u8 {
-    _ = mods;
-    return switch (key) {
-        .enter => "\r",
-        .backspace => "\x7f",
-        .tab => "\t",
-        .escape => "\x1b",
-        .arrow_up => if (app_cursor) "\x1bOA" else "\x1b[A",
-        .arrow_down => if (app_cursor) "\x1bOB" else "\x1b[B",
-        .arrow_right => if (app_cursor) "\x1bOC" else "\x1b[C",
-        .arrow_left => if (app_cursor) "\x1bOD" else "\x1b[D",
-        .home => if (app_cursor) "\x1bOH" else "\x1b[H",
-        .end => if (app_cursor) "\x1bOF" else "\x1b[F",
-        .insert => "\x1b[2~",
-        .delete => "\x1b[3~",
-        .page_up => "\x1b[5~",
-        .page_down => "\x1b[6~",
-        .f1 => "\x1bOP",
-        .f2 => "\x1bOQ",
-        .f3 => "\x1bOR",
-        .f4 => "\x1bOS",
-        .f5 => "\x1b[15~",
-        .f6 => "\x1b[17~",
-        .f7 => "\x1b[18~",
-        .f8 => "\x1b[19~",
-        .f9 => "\x1b[20~",
-        .f10 => "\x1b[21~",
-        .f11 => "\x1b[23~",
-        .f12 => "\x1b[24~",
-        else => "",
-    };
-}
 
-fn textLen(text: [32]u8) usize {
+fn textLen(text: [64]u8) usize {
     return std.mem.indexOfScalar(u8, &text, 0) orelse text.len;
 }
 
@@ -699,8 +668,18 @@ const EventLoop = struct {
                 flushReply(self.pty, self.term);
             },
             .key_press => |k| {
+                self.followOutput();
                 self.clearSel();
-                const bytes = encodeKey(k.key, k.mods, self.term.flags.app_cursor);
+                var buf: [64]u8 = undefined;
+                const bytes = Key.encode(
+                    k.key,
+                    k.mods,
+                    self.term.flags.app_cursor,
+                    self.term.kitty_kbd[self.term.kitty_kbd_idx],
+                    self.term.modify_other_keys,
+                    k.cp,
+                    &buf,
+                );
                 if (bytes.len != 0) self.pty.write(bytes);
             },
             .mouse_down => |m| self.onMouseDown(m),
@@ -716,7 +695,16 @@ const EventLoop = struct {
                     }
                 } else if (self.term.which == 1) {
                     const key: Platform.Event.KeyCode = if (w.up) .arrow_up else .arrow_down;
-                    const bytes = encodeKey(key, w.mods, self.term.flags.app_cursor);
+                    var buf: [64]u8 = undefined;
+                    const bytes = Key.encode(
+                        key,
+                        w.mods,
+                        self.term.flags.app_cursor,
+                        self.term.kitty_kbd[self.term.kitty_kbd_idx],
+                        self.term.modify_other_keys,
+                        0,
+                        &buf,
+                    );
                     while (t < ticks) : (t += 1) {
                         if (bytes.len != 0) self.pty.write(bytes);
                     }
@@ -727,10 +715,14 @@ const EventLoop = struct {
                 }
             },
             .paste_request => |src| self.window.requestPasteFrom(src),
-            .paste => |text| writePaste(self.pty, self.term, self.allocator, text),
+            .paste => |text| {
+                self.followOutput();
+                writePaste(self.pty, self.term, self.allocator, text);
+            },
             .text_input => |text| {
                 const n = textLen(text);
                 if (n != 0) {
+                    self.followOutput();
                     self.clearSel();
                     self.pty.write(text[0..n]);
                 }
@@ -830,6 +822,12 @@ const EventLoop = struct {
             return;
         }
         self.commitPrimary();
+        self.need_draw.* = true;
+    }
+
+    fn followOutput(self: *EventLoop) void {
+        if (self.term.scrollOffset() == 0) return;
+        self.term.viewBottom();
         self.need_draw.* = true;
     }
 

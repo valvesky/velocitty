@@ -318,6 +318,14 @@ pub const VtState = struct {
         self.markDirtyAll();
     }
 
+    /// Leave history view. Typing and paste use this so output is visible again.
+    pub fn viewBottom(self: *VtState) void {
+        if (self.which != 0) return;
+        if (self.grid().scroll == 0) return;
+        self.grid().scroll = 0;
+        self.markDirtyAll();
+    }
+
     pub fn cursor(self: *const VtState) Cursor {
         return self.gridConst().cursor;
     }
@@ -1971,6 +1979,17 @@ test "lcf backspace does not leave last column" {
     vt.backspace();
     try std.testing.expectEqual(@as(u16, 3), vt.grid().cursor.col);
     try std.testing.expect(!vt.grid().wrap_pending);
+}
+
+test "key returns scrollback to the bottom" {
+    var dummy: [1]u8 = .{0};
+    var vt = try VtState.init(std.testing.allocator, 4, 2, 8, &dummy);
+    defer vt.deinit();
+    for ("AABBCCDDEEFF") |b| vt.printCodepoint(b);
+    vt.viewScroll(4);
+    try std.testing.expect(vt.scrollOffset() > 0);
+    vt.viewBottom();
+    try std.testing.expectEqual(@as(u32, 0), vt.scrollOffset());
 }
 
 test "ed 3 drops scrollback" {

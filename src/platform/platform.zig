@@ -30,6 +30,8 @@ pub const Event = union(enum) {
     pub const KeyEvent = struct {
         key: KeyCode,
         mods: KeyMod,
+        /// Unicode (unshifted when possible) for kitty / modifyOtherKeys.
+        cp: u21 = 0,
     };
 
     pub const MouseWheel = struct {
@@ -69,7 +71,7 @@ pub const Event = union(enum) {
     paste_request: Clipboard,
     copy_request,
     paste: []const u8,
-    text_input: [32]u8, // UTF-8 encoded text stream from OS IME/Keyboard
+    text_input: [64]u8, // UTF-8 from the keyboard, after compose / dead keys
     resize: Dimensions,
     /// Window contents were lost (Expose) or need a full present.
     redraw,

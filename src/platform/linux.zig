@@ -12,11 +12,12 @@ const c = @cImport({
     @cInclude("X11/Xutil.h");
     @cInclude("X11/Xatom.h");
     @cInclude("X11/keysym.h");
+    @cInclude("X11/XKBlib.h");
     @cInclude("X11/extensions/XInput2.h");
     @cInclude("X11/cursorfont.h");
+    @cInclude("xkbcommon/xkbcommon.h");
+    @cInclude("xkbcommon/xkbcommon-compose.h");
 });
-
-extern fn zt_create_ic(xim: c.XIM, win: c.Window) c.XIC;
 
 const XiAxis = struct {
     deviceid: i32,
@@ -71,8 +72,8 @@ pub const Window = struct {
     /// together flood the X fd on every pixel.
     all_motion: bool = false,
 
-    xim: c.XIM = null,
-    xic: c.XIC = null,
+    xkb: ?*c.struct_xkb_context = null,
+    compose: ?*c.struct_xkb_compose_state = null,
 
     gpa: std.mem.Allocator,
 
@@ -81,10 +82,8 @@ pub const Window = struct {
         self.width = width;
         self.height = height;
 
-        // Locale + XIM so dead keys (~, ´, ¸) compose to UTF-8 (ã, é, ç).
+        // Locale so compose finds XCOMPOSEFILE / ~/.XCompose and dead keys.
         _ = c.setlocale(c.LC_CTYPE, "");
-        _ = c.XSupportsLocale();
-        _ = c.XSetLocaleModifiers("");
 
         const display = c.XOpenDisplay(null) orelse return error.CannotOpenDisplay;
         errdefer _ = c.XCloseDisplay(display);
@@ -173,21 +172,17 @@ pub const Window = struct {
         self.primary_buf = &.{};
         self.pointer_grabbed = false;
         self.all_motion = false;
-        self.xim = null;
-        self.xic = null;
+        self.xkb = null;
+        self.compose = null;
         initXi(self);
-        initIme(self);
+        initCompose(self);
     }
 
     pub fn close(self: *Window) void {
-        if (self.xic != null) {
-            c.XDestroyIC(self.xic);
-            self.xic = null;
-        }
-        if (self.xim != null) {
-            _ = c.XCloseIM(self.xim);
-            self.xim = null;
-        }
+        if (self.compose) |st| c.xkb_compose_state_unref(st);
+        if (self.xkb) |ctx| c.xkb_context_unref(ctx);
+        self.compose = null;
+        self.xkb = null;
         if (self.pointer_grabbed) {
             _ = c.XUngrabPointer(self.display, c.CurrentTime);
             self.pointer_grabbed = false;
@@ -231,7 +226,6 @@ pub const Window = struct {
         while (c.XPending(self.display) > 0) {
             var xev: c.XEvent = undefined;
             _ = c.XNextEvent(self.display, &xev);
-            if (c.XFilterEvent(&xev, c.None) != 0) continue;
 
             switch (xev.type) {
                 c.GenericEvent => {
@@ -277,31 +271,72 @@ pub const Window = struct {
                     return true;
                 },
                 c.KeyPress => {
-                    var buf: [32]u8 = undefined;
-                    var keysym: c.KeySym = 0;
-                    const len = lookupString(self, &xev.xkey, &buf, &keysym);
-                    const mods = getMods(xev.xkey.state);
+                    const keysym = eventKeysym(self, &xev.xkey);
+                    var mods = getMods(xev.xkey.state);
                     if (isPasteKey(keysym, mods)) {
+                        self.resetCompose();
                         ev.* = .{ .paste_request = .clipboard };
                         return true;
                     }
                     if (isCopyKey(keysym, mods)) {
+                        self.resetCompose();
                         ev.* = .copy_request;
                         return true;
                     }
 
+                    if (keysym == c.XK_ISO_Left_Tab) {
+                        self.resetCompose();
+                        mods.shift = true;
+                        ev.* = .{ .key_press = .{ .key = .tab, .mods = mods, .cp = 9 } };
+                        return true;
+                    }
+
+                    // Shift/AltGr stay in the keysym. Ctrl/Alt/Super abort compose.
+                    if (mods.ctrl or mods.alt or mods.super) {
+                        self.resetCompose();
+                        if (translateKey(keysym)) |key| {
+                            ev.* = .{ .key_press = .{ .key = key, .mods = mods } };
+                            return true;
+                        }
+                        if (chordKey(keysym)) |ck| {
+                            ev.* = .{ .key_press = .{ .key = ck.key, .mods = mods, .cp = ck.cp } };
+                            return true;
+                        }
+                        return false;
+                    }
+
+                    if (isModifierSym(keysym)) return false;
+
+                    // Enter, arrows, and the rest leave a half-finished sequence
+                    // and are delivered. Otherwise CapsLock-as-compose eats Return.
                     if (translateKey(keysym)) |key| {
+                        self.resetCompose();
                         ev.* = .{ .key_press = .{ .key = key, .mods = mods } };
                         return true;
                     }
 
-                    if (len > 0) {
-                        var text: [32]u8 = undefined;
-                        @memset(&text, 0);
-                        @memcpy(text[0..@intCast(len)], buf[0..@intCast(len)]);
-                        ev.* = .{ .text_input = text };
-                        return true;
+                    if (self.compose) |st| {
+                        _ = c.xkb_compose_state_feed(st, @intCast(keysym));
+                        switch (c.xkb_compose_state_get_status(st)) {
+                            c.XKB_COMPOSE_COMPOSING => {
+                                // Dead key / Multi_key (CapsLock compose). No bytes,
+                                // but a key still leaves scrollback.
+                                ev.* = .{ .key_press = .{ .key = .unknown, .mods = mods } };
+                                return true;
+                            },
+                            c.XKB_COMPOSE_COMPOSED => {
+                                var raw: [64]u8 = undefined;
+                                const need = c.xkb_compose_state_get_utf8(st, &raw, raw.len);
+                                if (need > 0) {
+                                    const n: usize = @min(@as(usize, @intCast(need)), raw.len - 1);
+                                    putText(ev, raw[0..n]);
+                                    return true;
+                                }
+                            },
+                            else => {},
+                        }
                     }
+                    if (putKeysymText(ev, keysym)) return true;
                 },
                 c.ButtonPress => {
                     const button = xev.xbutton.button;
@@ -344,20 +379,18 @@ pub const Window = struct {
                     return true;
                 },
                 c.KeyRelease => {
-                    var keysym: c.KeySym = 0;
-                    _ = c.XLookupString(&xev.xkey, null, 0, &keysym, null);
+                    const keysym = eventKeysym(self, &xev.xkey);
                     if (translateKey(keysym)) |key| {
                         ev.* = .{ .key_release = .{ .key = key, .mods = getMods(xev.xkey.state) } };
                         return true;
                     }
                 },
                 c.FocusIn => {
-                    if (self.xic != null) c.XSetICFocus(self.xic);
                     ev.* = .focus_gained;
                     return true;
                 },
                 c.FocusOut => {
-                    if (self.xic != null) c.XUnsetICFocus(self.xic);
+                    self.resetCompose();
                     ev.* = .focus_lost;
                     return true;
                 },
@@ -469,6 +502,10 @@ pub const Window = struct {
         _ = c.XFlush(self.display);
     }
 
+    fn resetCompose(self: *Window) void {
+        if (self.compose) |st| c.xkb_compose_state_reset(st);
+    }
+
     fn resizeFramebuffer(self: *Window, w: u32, h: u32) !void {
         if (w == 0 or h == 0) return;
         if (w == self.width and h == self.height) return;
@@ -492,35 +529,56 @@ pub const Window = struct {
     }
 };
 
-fn initIme(self: *Window) void {
-    self.xim = openXim(self.display);
-    if (self.xim == null) return;
-    self.xic = zt_create_ic(self.xim, self.window);
-    if (self.xic == null) {
-        _ = c.XCloseIM(self.xim);
-        self.xim = null;
+fn initCompose(self: *Window) void {
+    const ctx = c.xkb_context_new(c.XKB_CONTEXT_NO_FLAGS) orelse return;
+    const loc = c.setlocale(c.LC_CTYPE, null);
+    const locale: [*:0]const u8 = if (loc == null or loc[0] == 0) "C" else @ptrCast(loc);
+    const table = c.xkb_compose_table_new_from_locale(ctx, locale, c.XKB_COMPOSE_COMPILE_NO_FLAGS);
+    if (table == null) {
+        c.xkb_context_unref(ctx);
+        return;
     }
+    const state = c.xkb_compose_state_new(table, c.XKB_COMPOSE_STATE_NO_FLAGS);
+    c.xkb_compose_table_unref(table);
+    if (state == null) {
+        c.xkb_context_unref(ctx);
+        return;
+    }
+    self.xkb = ctx;
+    self.compose = state;
 }
 
-fn openXim(display: *c.Display) c.XIM {
-    if (c.XOpenIM(display, null, null, null)) |im| return im;
-    if (c.XSetLocaleModifiers("@im=local") != null) {
-        if (c.XOpenIM(display, null, null, null)) |im| return im;
+fn eventKeysym(self: *Window, xkey: *c.XKeyEvent) c.KeySym {
+    // XLookupString follows the core (often US) keysyms. Xwayland's XKB map
+    // is the Hyprland one: CapsLock is Multi_key, Portuguese dead keys, etc.
+    var sym: c.KeySym = 0;
+    var consumed: c_uint = 0;
+    if (xkey.keycode != 0) {
+        _ = c.XkbLookupKeySym(self.display, @intCast(xkey.keycode), xkey.state, &consumed, &sym);
     }
-    if (c.XSetLocaleModifiers("@im=none") != null) {
-        if (c.XOpenIM(display, null, null, null)) |im| return im;
+    if (sym == 0 and xkey.keycode != 0) {
+        const group: c_int = @intCast((xkey.state >> 13) & 3);
+        sym = c.XkbKeycodeToKeysym(self.display, @intCast(xkey.keycode), group, 0);
     }
-    return null;
+    return sym;
 }
 
-fn lookupString(self: *Window, xkey: *c.XKeyEvent, buf: *[32]u8, keysym: *c.KeySym) c_int {
-    if (self.xic != null) {
-        var status: c.Status = 0;
-        const len = c.Xutf8LookupString(self.xic, xkey, buf, @intCast(buf.len), keysym, &status);
-        return if (len > 0) len else 0;
-    }
-    const len = c.XLookupString(xkey, buf, @intCast(buf.len), keysym, null);
-    return if (len > 0) len else 0;
+fn putText(ev: *Platform.Event, bytes: []const u8) void {
+    if (bytes.len == 0) return;
+    var text: [64]u8 = undefined;
+    @memset(&text, 0);
+    const n = @min(bytes.len, text.len - 1);
+    @memcpy(text[0..n], bytes[0..n]);
+    ev.* = .{ .text_input = text };
+}
+
+fn putKeysymText(ev: *Platform.Event, sym: c.KeySym) bool {
+    if (sym == 0) return false;
+    var raw: [8]u8 = undefined;
+    const n = c.xkb_keysym_to_utf8(@intCast(sym), &raw, raw.len);
+    if (n <= 1) return false;
+    putText(ev, raw[0..@intCast(n - 1)]);
+    return true;
 }
 
 fn coreInputMask(all_motion: bool) c_long {
@@ -808,6 +866,15 @@ fn isCopyKey(sym: c.KeySym, mods: Platform.Event.KeyMod) bool {
     return mods.ctrl and mods.shift and (sym == c.XK_c or sym == c.XK_C);
 }
 
+fn isModifierSym(sym: c.KeySym) bool {
+    const s: u32 = @intCast(sym);
+    if (s >= c.XK_Shift_L and s <= c.XK_Hyper_R) return true;
+    return switch (sym) {
+        c.XK_Mode_switch, c.XK_ISO_Level3_Shift, c.XK_ISO_Level5_Shift, 0 => true,
+        else => false,
+    };
+}
+
 fn getMods(state: c_uint) Platform.Event.KeyMod {
     return .{
         .shift = (state & c.ShiftMask) != 0,
@@ -817,12 +884,36 @@ fn getMods(state: c_uint) Platform.Event.KeyMod {
     };
 }
 
+fn chordKey(sym: c.KeySym) ?struct { key: Platform.Event.KeyCode, cp: u21 } {
+    const s: u32 = @intCast(sym);
+    if (s >= c.XK_A and s <= c.XK_Z) {
+        const off: u32 = s - c.XK_A;
+        const key: Platform.Event.KeyCode = @enumFromInt(@intFromEnum(Platform.Event.KeyCode.a) + off);
+        return .{ .key = key, .cp = @intCast('a' + off) };
+    }
+    if (s >= c.XK_a and s <= c.XK_z) {
+        const off: u32 = s - c.XK_a;
+        const key: Platform.Event.KeyCode = @enumFromInt(@intFromEnum(Platform.Event.KeyCode.a) + off);
+        return .{ .key = key, .cp = @intCast('a' + off) };
+    }
+    if (s >= c.XK_0 and s <= c.XK_9) {
+        const off: u32 = s - c.XK_0;
+        const key: Platform.Event.KeyCode = @enumFromInt(@intFromEnum(Platform.Event.KeyCode.num_0) + off);
+        return .{ .key = key, .cp = @intCast('0' + off) };
+    }
+    if (s == c.XK_space) return .{ .key = .space, .cp = ' ' };
+    if (s >= 0x20 and s <= 0xff and s != 0x7f) {
+        return .{ .key = .unknown, .cp = @intCast(s) };
+    }
+    return null;
+}
+
 fn translateKey(sym: c.KeySym) ?Platform.Event.KeyCode {
     return switch (sym) {
-        c.XK_Return => .enter,
+        c.XK_Return, c.XK_KP_Enter => .enter,
         c.XK_Escape => .escape,
         c.XK_BackSpace => .backspace,
-        c.XK_Tab => .tab,
+        c.XK_Tab, c.XK_KP_Tab => .tab,
         c.XK_Up => .arrow_up,
         c.XK_Down => .arrow_down,
         c.XK_Left => .arrow_left,
