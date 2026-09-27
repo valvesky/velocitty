@@ -15,5 +15,6 @@
         "build.zig.zon",
         "src",
         "lib",
+        "godstack",
     },
 }

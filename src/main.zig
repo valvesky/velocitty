@@ -1006,7 +1006,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer pty.close();
 
     const x_fd = window.eventFd();
-    const pty_fd = pty.impl.master;
+    const pty_fd = pty.fd();
 
     var running = true;
     var theme_stamp = Scheme.watchStamp(io.io());

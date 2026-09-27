@@ -60,7 +60,7 @@ Unzip then copy to `/usr/bin`
 
 Just clone the repo and run:
 ```
-git clone https://github.com/valvesky/velocitty
+git clone --recursive https://github.com/valvesky/velocitty 
 cd velocitty
 zig build install-usr
 ```

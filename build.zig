@@ -46,9 +46,8 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run pipeline microbenchmark: IO/parse/VT/draw/LRU (ReleaseFast)");
     bench_step.dependOn(&bench_run.step);
 
-    // Release: Linux gnu/musl. Same-arch links system X11; other arches use
-    // link-time X11/Xi stubs. xkbcommon is always a link stub (host .so needs
-    // a newer glibc than Zig's). Runtime still needs the real libraries.
+    // Release: Linux gnu/musl, x86_64 and aarch64. Peak compiles against
+    // host X11 and Wayland headers and dlopens them at runtime.
     const release_step = b.step("release", "Build optimized velocitty for all target platforms");
     const package_step = b.step("package", "Build release and write tar.gz archives to packages/");
     package_step.dependOn(release_step);
@@ -124,75 +123,32 @@ fn buildExeForTarget(
     });
 
     addStbTrueType(exe_mod, b);
+    if (target.result.os.tag == .linux) addPeak(exe_mod, b, target);
 
     const exe = b.addExecutable(.{
         .name = "velocitty",
         .root_module = exe_mod,
     });
 
-    if (target.result.os.tag == .linux) {
-        addLinuxX11(b, exe.root_module, target);
-    } else if (target.result.os.tag == .windows) {
-        exe.root_module.linkSystemLibrary("ws2_32", .{});
-        exe.root_module.linkSystemLibrary("mswsock", .{});
-    }
-
     return exe;
 }
 
-fn addLinuxX11(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
-    // After Zig's libc so host bits/math.h cannot shadow the target headers.
+fn addPeak(mod: *std.Build.Module, b: *std.Build, target: std.Build.ResolvedTarget) void {
+    mod.addIncludePath(b.path("godstack/Peak"));
+    // X11 and Wayland headers. After Zig's libc so host bits/math.h
+    // cannot shadow the target headers. Those libraries are dlopened.
     mod.addAfterIncludePath(.{ .cwd_relative = "/usr/include" });
-    const host = b.graph.host.result;
-    // Host libxkbcommon is built against a newer glibc than Zig's (stat64@2.33,
-    // __isoc23_strtol@2.38). Always link the stub; runtime still needs
-    // libxkbcommon.so.0. Stub path is first so -lxkbcommon does not pick /usr/lib.
-    const ver0: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 };
-    const xkb = addX11LinkStub(b, target, "xkbcommon", "src/platform/xkb_link_stub.c", ver0);
-    mod.addLibraryPath(xkb.getEmittedBinDirectory());
-    if (target.result.cpu.arch == host.cpu.arch) {
-        mod.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
-    } else {
-        // Host has no aarch64 (etc.) libX11/libXi; stub .so files provide link
-        // symbols and the libX11.so.6 / libXi.so.6 sonames. Not packaged.
-        const ver6: std.SemanticVersion = .{ .major = 6, .minor = 0, .patch = 0 };
-        const x11 = addX11LinkStub(b, target, "X11", "src/platform/x11_link_stub.c", ver6);
-        const xi = addX11LinkStub(b, target, "Xi", "src/platform/xi_link_stub.c", ver6);
-        mod.addLibraryPath(x11.getEmittedBinDirectory());
-        mod.addLibraryPath(xi.getEmittedBinDirectory());
+    mod.addCSourceFile(.{
+        .file = b.path("godstack/Peak/peak.c"),
+        .flags = &.{ "-std=c99", "-Wno-deprecated-declarations" },
+    });
+    // musl folds dl, pthread, and openpty into libc.
+    if (target.result.abi != .musl and target.result.abi != .none) {
+        const lib: std.Build.Module.LinkSystemLibraryOptions = .{ .use_pkg_config = .no };
+        mod.linkSystemLibrary("dl", lib);
+        mod.linkSystemLibrary("pthread", lib);
+        mod.linkSystemLibrary("util", lib);
     }
-    const syslib: std.Build.Module.LinkSystemLibraryOptions = .{
-        .needed = true,
-        .use_pkg_config = .no,
-    };
-    mod.linkSystemLibrary("X11", syslib);
-    mod.linkSystemLibrary("Xi", syslib);
-    mod.linkSystemLibrary("xkbcommon", syslib);
-}
-
-fn addX11LinkStub(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    name: []const u8,
-    src: []const u8,
-    version: std.SemanticVersion,
-) *std.Build.Step.Compile {
-    const lib = b.addLibrary(.{
-        .name = name,
-        .linkage = .dynamic,
-        .version = version,
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = .ReleaseSmall,
-            .link_libc = true,
-            .pic = true,
-        }),
-    });
-    lib.root_module.addCSourceFile(.{
-        .file = b.path(src),
-        .flags = &.{ "-std=c99", "-fPIC", "-fno-sanitize=undefined" },
-    });
-    return lib;
 }
 
 fn addStbTrueType(mod: *std.Build.Module, b: *std.Build) void {
