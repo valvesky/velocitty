@@ -1920,6 +1920,20 @@ test "lcf stays on last column until next char" {
     try std.testing.expectEqual(@as(u8, 1), vt.grid().wraps[(vt.grid().head + 0) % vt.grid().cap]);
 }
 
+test "lf indexes without carriage return" {
+    var dummy: [1]u8 = .{0};
+    var vt = try VtState.init(std.testing.allocator, 8, 3, 8, &dummy);
+    defer vt.deinit();
+    vt.printCodepoint('A');
+    vt.printCodepoint('B');
+    C0.dispatch(&vt, 0x0A);
+    try std.testing.expectEqual(@as(u16, 1), vt.grid().cursor.row);
+    try std.testing.expectEqual(@as(u16, 2), vt.grid().cursor.col);
+    vt.printCodepoint('C');
+    try std.testing.expectEqual(@as(u21, 'C'), vt.grid().cellAt(1, 2).codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), vt.grid().cellAt(1, 0).codepoint);
+}
+
 test "lcf newline does not wrap twice" {
     var dummy: [1]u8 = .{0};
     var vt = try VtState.init(std.testing.allocator, 4, 4, 8, &dummy);

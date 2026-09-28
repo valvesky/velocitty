@@ -450,7 +450,7 @@ const PeakPty = struct {
             _ = chdir(dir);
         };
 
-        pushChildEnv();
+        pushChildEnv(dims);
         defer popChildEnv();
 
         self.proc = peak.ptySpawn(std.mem.span(file), @ptrCast(&argv_buf), dims.cols, dims.rows, dims.px_w, dims.px_h) orelse return error.OpenPty;
@@ -661,6 +661,8 @@ var save_color: Saved = .{};
 var save_prog: Saved = .{};
 var save_kitty: Saved = .{};
 var save_listen: Saved = .{};
+var save_columns: Saved = .{};
+var save_lines: Saved = .{};
 
 fn remember(slot: *Saved, key: [:0]const u8) void {
     slot.* = .{};
@@ -682,12 +684,14 @@ fn restore(slot: *Saved, key: [:0]const u8) void {
     _ = setenv(key, slot.buf[0..slot.n :0], 1);
 }
 
-fn pushChildEnv() void {
+fn pushChildEnv(dims: Dimensions) void {
     remember(&save_term, "TERM");
     remember(&save_color, "COLORTERM");
     remember(&save_prog, "TERM_PROGRAM");
     remember(&save_kitty, "KITTY_WINDOW_ID");
     remember(&save_listen, "KITTY_LISTEN_ON");
+    remember(&save_columns, "COLUMNS");
+    remember(&save_lines, "LINES");
     _ = setenv("TERM", "xterm-256color", 1);
     _ = setenv("COLORTERM", "truecolor", 1);
     _ = setenv("TERM_PROGRAM", "velocitty", 1);
@@ -695,6 +699,12 @@ fn pushChildEnv() void {
     const id = std.fmt.bufPrintZ(&id_buf, "{d}", .{peak.pid()}) catch "1";
     _ = setenv("KITTY_WINDOW_ID", id, 1);
     _ = unsetenv("KITTY_LISTEN_ON");
+    var col_buf: [16]u8 = undefined;
+    var row_buf: [16]u8 = undefined;
+    const cols = std.fmt.bufPrintZ(&col_buf, "{d}", .{dims.cols}) catch "80";
+    const rows = std.fmt.bufPrintZ(&row_buf, "{d}", .{dims.rows}) catch "24";
+    _ = setenv("COLUMNS", cols, 1);
+    _ = setenv("LINES", rows, 1);
 }
 
 fn popChildEnv() void {
@@ -703,4 +713,6 @@ fn popChildEnv() void {
     restore(&save_prog, "TERM_PROGRAM");
     restore(&save_kitty, "KITTY_WINDOW_ID");
     restore(&save_listen, "KITTY_LISTEN_ON");
+    restore(&save_columns, "COLUMNS");
+    restore(&save_lines, "LINES");
 }

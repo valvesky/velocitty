@@ -721,7 +721,14 @@ const EventLoop = struct {
             },
             .text_input => |text| {
                 const n = textLen(text);
-                if (n != 0) {
+                if (n == 1 and text[0] == 0x7f) {
+                    // Lone DEL is tty erase (backspace). Forward delete is CSI 3~.
+                    self.followOutput();
+                    self.clearSel();
+                    var buf: [64]u8 = undefined;
+                    const bytes = Key.encode(.delete, .{}, self.term.flags.app_cursor, self.term.kitty_kbd[self.term.kitty_kbd_idx], self.term.modify_other_keys, 0, &buf);
+                    if (bytes.len != 0) self.pty.write(bytes);
+                } else if (n != 0) {
                     self.followOutput();
                     self.clearSel();
                     self.pty.write(text[0..n]);
