@@ -268,10 +268,9 @@ const PeakWindow = struct {
         self.win.setOpacity(alpha);
     }
 
-    /// Peak hides or shows the cursor. It does not select XC_* glyphs.
+    /// Peak cursor shapes: 0 default, 1 text, 2 hand, 3 wait, 4 crosshair, 5 not-allowed, 6 help.
     pub fn setPointer(self: *PeakWindow, shape: u8) void {
-        _ = self;
-        _ = shape;
+        self.win.setCursorShape(shape);
     }
 
     pub fn setClipboard(self: *PeakWindow, text: []const u8) void {

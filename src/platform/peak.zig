@@ -258,6 +258,11 @@ pub const Window = extern struct {
     pub fn setOpacity(self: *Window, alpha: u8) void {
         peak_window_set_opacity(self, alpha);
     }
+
+    /// 0 default, 1 text, 2 hand, 3 wait, 4 crosshair, 5 not-allowed, 6 help.
+    pub fn setCursorShape(self: *Window, shape: u8) void {
+        peak_window_cursor_shape(self, shape);
+    }
 };
 
 pub const Proc = extern struct {
@@ -407,6 +412,7 @@ extern fn peak_window_present(win: *Window) void;
 extern fn peak_window_set_title(win: *Window, name: [*:0]const u8) void;
 extern fn peak_window_set_class(win: *Window, name: [*:0]const u8) void;
 extern fn peak_window_set_opacity(win: *Window, alpha: u8) void;
+extern fn peak_window_cursor_shape(win: *Window, shape: c_int) void;
 extern fn peak_get_time() u64;
 extern fn peak_pid() c_int;
 extern fn peak_pty_spawn(file: [*:0]const u8, argv: Argv, cols: u32, rows: u32, xpixel: u32, ypixel: u32) Proc;
