@@ -140,7 +140,9 @@ fn addPeak(mod: *std.Build.Module, b: *std.Build, target: std.Build.ResolvedTarg
     mod.addAfterIncludePath(.{ .cwd_relative = "/usr/include" });
     mod.addCSourceFile(.{
         .file = b.path("godstack/Peak/peak.c"),
-        .flags = &.{ "-std=c99", "-Wno-deprecated-declarations" },
+        // Gaming mice can also expose /dev/input/js*: never turn their
+        // global joystick events into clicks in every terminal window.
+        .flags = &.{ "-std=c99", "-Wno-deprecated-declarations", "-DPEAK_NO_GAMEPAD" },
     });
     // musl folds dl, pthread, and openpty into libc.
     if (target.result.abi != .musl and target.result.abi != .none) {

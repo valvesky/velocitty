@@ -649,24 +649,30 @@ const EventLoop = struct {
 
     fn dispatch(self: *EventLoop, ev: Platform.Event) void {
         switch (ev) {
+
             .quit => self.running.* = false,
             .resize => {
                 self.clearSel();
                 self.need_layout.* = true;
                 self.need_draw.* = true;
             },
+
             .redraw => self.need_draw.* = true,
             .focus_gained => {
+                self.resetMouse();
                 self.need_layout.* = true;
                 if (self.term.flags.focus_event) self.pty.write("\x1b[I");
                 self.term.setVisible(true);
                 flushReply(self.pty, self.term);
             },
+
             .focus_lost => {
+                self.resetMouse();
                 if (self.term.flags.focus_event) self.pty.write("\x1b[O");
                 self.term.setVisible(false);
                 flushReply(self.pty, self.term);
             },
+
             .key_press => |k| {
                 self.followOutput();
                 self.clearSel();
@@ -738,6 +744,11 @@ const EventLoop = struct {
         }
     }
 
+    fn inside(self: *const EventLoop, x: i32, y: i32) bool {
+        const fb = self.window.framebuffer();
+        return x >= 0 and y >= 0 and x < @as(i32, @intCast(fb.width)) and y < @as(i32, @intCast(fb.height));
+    }
+
     fn hit(self: *const EventLoop, x: i32, y: i32) Select.Point {
         const fb = self.window.framebuffer();
         const ox: i32 = if (fb.width > self.frame.width) @intCast((fb.width - self.frame.width) / 2) else 0;
@@ -761,7 +772,28 @@ const EventLoop = struct {
         return self.term.mouse != .off and !mods.shift;
     }
 
+    fn resetMouse(self: *EventLoop) void {
+        // Neither a drag nor a multi-click sequence may span focus changes.
+        self.mouse_held = 0;
+        self.dragging = false;
+        self.clicks = 0;
+    }
+
+    fn clickKind(self: *EventLoop, p: Select.Point, time: u32) Select.Kind {
+        const chained = self.clicks != 0 and p.col == self.click_col and p.row == self.click_row and time -% self.click_time < 500;
+        self.clicks = if (chained) self.clicks % 3 + 1 else 1;
+        self.click_time = time;
+        self.click_col = p.col;
+        self.click_row = p.row;
+        return switch (self.clicks) {
+            2 => .word,
+            3 => .line,
+            else => .cell,
+        };
+    }
+
     fn onMouseDown(self: *EventLoop, m: Platform.Event.Mouse) void {
+        if (!self.inside(m.x, m.y)) return;
         if (self.reporting(m.mods)) {
             if (m.button >= 1 and m.button <= 3) {
                 self.mouse_held = m.button;
@@ -775,16 +807,7 @@ const EventLoop = struct {
         }
         if (m.button != 1) return;
         const p = self.hit(m.x, m.y);
-        const chained = p.col == self.click_col and p.row == self.click_row and m.time -% self.click_time < 500;
-        self.clicks = if (chained) self.clicks % 3 + 1 else 1;
-        self.click_time = m.time;
-        self.click_col = p.col;
-        self.click_row = p.row;
-        const kind: Select.Kind = switch (self.clicks) {
-            2 => .word,
-            3 => .line,
-            else => .cell,
-        };
+        const kind = self.clickKind(p, m.time);
         if (m.mods.shift and self.sel.on) {
             self.sel.drag(self.term, p.col, p.row);
         } else {
@@ -796,6 +819,7 @@ const EventLoop = struct {
     }
 
     fn onMouseMove(self: *EventLoop, m: Platform.Event.Mouse) void {
+        if (!self.dragging and !self.inside(m.x, m.y)) return;
         if (self.term.mouse == .any or (self.term.mouse == .drag and self.mouse_held != 0)) {
             if (!m.mods.shift) {
                 const btn: u16 = if (self.mouse_held != 0) self.mouse_held - 1 else 0;
@@ -1163,5 +1187,29 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
         if (hangup) running = false;
     }
+}
+
+test "multi-click sequences stop at focus changes" {
+    // Only the mouse bookkeeping is used; no window or PTY is needed.
+    var a: EventLoop = undefined;
+    var b: EventLoop = undefined;
+    a.resetMouse();
+    b.resetMouse();
+    const p: Select.Point = .{ .col = 4, .row = 2 };
+    try std.testing.expectEqual(Select.Kind.cell, a.clickKind(p, 100));
+    try std.testing.expectEqual(Select.Kind.word, a.clickKind(p, 150));
+    a.dragging = true;
+    a.mouse_held = 1;
+    a.resetMouse(); // focus leaves A for B
+    try std.testing.expect(!a.dragging);
+    try std.testing.expectEqual(@as(u8, 0), a.mouse_held);
+    try std.testing.expectEqual(Select.Kind.cell, b.clickKind(p, 200));
+    b.resetMouse();
+    a.resetMouse(); // focus returns to A inside the double-click timeout
+    try std.testing.expectEqual(Select.Kind.cell, a.clickKind(p, 250));
+    try std.testing.expectEqual(Select.Kind.word, a.clickKind(p, 300));
+    try std.testing.expectEqual(Select.Kind.line, a.clickKind(p, 350));
+    try std.testing.expectEqual(Select.Kind.cell, a.clickKind(p, 400));
+    try std.testing.expectEqual(Select.Kind.cell, a.clickKind(p, 900));
 }
 
