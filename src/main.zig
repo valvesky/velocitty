@@ -49,6 +49,10 @@ const fallback_paths: []const []const u8 = switch (builtin.os.tag) {
         "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/gnu-free/FreeSans.otf",
         "/usr/share/fonts/noto/NotoColorEmoji.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
     },
 };
 
@@ -171,6 +175,15 @@ fn loadFonts(io: std.Io, gpa: std.mem.Allocator, out: *std.ArrayList(FontBlob), 
     }
     for (fallback_paths) |path| {
         _ = append_path(io, gpa, out, path, .{}, &seen, seen_len[0..], &seen_n);
+    }
+    // User-installed icon faces are absent from the distro fallback list.
+    // Resolve by family so package-managed or hashed filenames can change.
+    const user_fallback_families = [_][]const u8{
+        "Herdr Agent Icons Max",
+        "Monaspace Neon NF",
+    };
+    for (user_fallback_families) |name| {
+        try_pattern(io, gpa, out, name, .{}, &seen, seen_len[0..], &seen_n);
     }
     try_pattern(io, gpa, out, "Noto Color Emoji", .{}, &seen, seen_len[0..], &seen_n);
     if (out.items.len == 0) return error.InvalidFont;
