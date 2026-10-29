@@ -32,7 +32,7 @@
     <a href="#shoutouts">Shoutouts</a>
 </p>
 
-Velocitty is a lightning-fast terminal for Omarchy, Windows, and macOS.
+Velocitty is (not) a lightning-fast terminal for Omarchy, Windows, and macOS.
 
 It's a streamlined version of my GPU-accelerated terminal multiplexer [VT](https://github.com/valvesky/vt).
 
@@ -60,13 +60,16 @@ Download from [releases](https://github.com/valvesky/velocitty/releases).
 - **Windows 10 1903+:** run the per-user installer `.exe`, or extract the portable `.zip` and launch `velocitty.exe`.
 - **macOS 11+:** open the universal `.dmg` and drag `Velocitty.app` into Applications. It supports Intel and Apple Silicon.
 
-Windows and macOS packages are unsigned. If Windows shows SmartScreen, use **More info → Run anyway**. On macOS, allow Velocitty in **System Settings → Privacy & Security** after the first launch attempt.
+Windows and macOS packages are unsigned.
+If Windows shows SmartScreen, use **More info > Run anyway**.
+On macOS, allow Velocitty in **System Settings -> Privacy & Security** after the first launch attempt.
 
 Musl packages use dynamic linking: install them on a musl system such as Alpine, with its musl loader and native Wayland/X11 libraries. GNU packages are for glibc systems such as Omarchy. `SHA256SUMS` accompanies the release downloads.
 
 ## Build
 
-Requires Zig 0.17 or newer. Linux builds need X11/Wayland development headers; the terminal loads the desktop libraries at runtime and uses `fc-match` for font discovery. macOS builds need Xcode Command Line Tools. Windows builds use Zig's bundled toolchain and system libraries.
+Requires Zig 0.17 or newer.
+Linux builds need X11/Wayland development headers; the terminal loads the desktop libraries at runtime and uses `fc-match` for font discovery. macOS builds need Xcode Command Line Tools. Windows builds use Zig's bundled toolchain and system libraries.
 
 ```
 git clone --recursive https://github.com/valvesky/velocitty
