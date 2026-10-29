@@ -2,7 +2,8 @@
 - DESIGN.md is the original design sketch, not a feature-completeness contract.
 - Do not change the README.md
 - Keep AGENTS.md up-to-date.
-- Omarchy-first terminal, with Windows and macOS ports through Peak. Executable is `src/main.zig`.
+- Omarchy-first, (not) a terminal, with Windows and macOS ports through Peak. Executable is `src/main.zig`.
+- User-facing branding says “(not) a terminal”; preserve technical terminal terminology and integration identifiers.
 - Use Peak for windowing, input, clipboard, PTYs and process I/O on Linux (Wayland, then X11), Windows (Win32/ConPTY), and macOS (AppKit/POSIX PTY). Omarchy (Hyprland, themes, fonts, app menu) remains the primary Linux desktop.
 - Pipeline: `circbuffer` (line split + runs) → `vt` → `draw`.
 

@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
 Name=Velocitty
-GenericName=Terminal emulator
-Comment=Lightning-fast CPU-rendered terminal
+GenericName=(not) a terminal
+Comment=Lightning-fast, CPU-rendered, and (not) a terminal
 TryExec=velocitty
 Exec=velocitty
 Icon=velocitty
