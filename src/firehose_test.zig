@@ -142,8 +142,20 @@ const Pair = struct {
         return buf[0..n];
     }
 
-    fn cellStr(buf: []u8, c: Cell) []const u8 {
-        return std.fmt.bufPrint(buf, "U+{X:0>4} fg={d},{d},{d} bg={d},{d},{d} attrs=0x{x}", .{ c.codepoint, c.fg.r, c.fg.g, c.fg.b, c.bg.r, c.bg.g, c.bg.b, @as(u16, @bitCast(c.attrs)) }) catch "?";
+    fn cellStr(buf: []u8, vt: *const VtState, c: Cell) []const u8 {
+        const st = vt.styleOf(c);
+        return std.fmt.bufPrint(buf, "U+{X:0>4} fg={d},{d},{d} bg={d},{d},{d} attrs=0x{x}", .{ c.codepoint, st.fg.r, st.fg.g, st.fg.b, st.bg.r, st.bg.g, st.bg.b, @as(u16, @bitCast(st.attrs)) }) catch "?";
+    }
+
+    /// Same character and same resolved style (the two terminals intern
+    /// styles in different orders, so ids differ).
+    fn cellEql(va: *const VtState, ca: Cell, vb: *const VtState, cb: Cell) bool {
+        return ca.codepoint == cb.codepoint and va.styleOf(ca).key() == vb.styleOf(cb).key();
+    }
+
+    fn rowEql(va: *const VtState, ra: []const Cell, vb: *const VtState, rb: []const Cell) bool {
+        for (ra, rb) |ca, cb| if (!cellEql(va, ca, vb, cb)) return false;
+        return true;
     }
 
     fn named(buf: []u8, comptime fmt: []const u8, args: anytype) []const u8 {
@@ -164,7 +176,7 @@ const Pair = struct {
             for (0..p.rows) |r| {
                 const ra = ga.rowSliceConst(@intCast(r), p.cols);
                 const rb = gb.rowSliceConst(@intCast(r), p.cols);
-                if (!std.mem.eql(u8, std.mem.sliceAsBytes(ra), std.mem.sliceAsBytes(rb))) {
+                if (!rowEql(a, ra, b, rb)) {
                     p.bad += 1;
                     noteFirst(named(&wbuf, "screen {d} cells", .{k}));
                     if (!p.quiet) {
@@ -172,14 +184,14 @@ const Pair = struct {
                         var tb: [512]u8 = undefined;
                         var first: usize = 0;
                         for (ra, rb, 0..) |ca, cb, x| {
-                            if (!std.meta.eql(ca, cb)) {
+                            if (!cellEql(a, ca, b, cb)) {
                                 first = x;
                                 break;
                             }
                         }
                         var ca: [96]u8 = undefined;
                         var cb: [96]u8 = undefined;
-                        std.debug.print("  [{s}] screen {d} row {d} cells differ (first at col {d}: exact={s} drained={s})\n    exact:   |{s}|\n    drained: |{s}|\n", .{ p.name, k, r, first, cellStr(&ca, ra[first]), cellStr(&cb, rb[first]), rowText(&ta, ra), rowText(&tb, rb) });
+                        std.debug.print("  [{s}] screen {d} row {d} cells differ (first at col {d}: exact={s} drained={s})\n    exact:   |{s}|\n    drained: |{s}|\n", .{ p.name, k, r, first, cellStr(&ca, a, ra[first]), cellStr(&cb, b, rb[first]), rowText(&ta, ra), rowText(&tb, rb) });
                     }
                 }
                 const wa = ga.wraps[ga.lineIndex(@intCast(r))];

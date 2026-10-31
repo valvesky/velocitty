@@ -1674,7 +1674,17 @@ fn hashBytes(bytes: []const u8) u64 {
 fn hashTerm(term: *const VtState) u64 {
     var h: u64 = 0;
     var r: u16 = 0;
-    while (r < term.rows) : (r += 1) h = (h *% 0x100000001b3) ^ hashBytes(std.mem.sliceAsBytes(term.rowCells(r)));
+    while (r < term.rows) : (r += 1) {
+        // Resolved styles: ids depend on interning order.
+        var row: [2 * 1024]u128 = undefined;
+        const cells = term.rowCells(r);
+        const n = @min(cells.len, row.len / 2);
+        for (cells[0..n], 0..) |c, i| {
+            row[2 * i] = c.codepoint;
+            row[2 * i + 1] = term.styleOf(c).key();
+        }
+        h = (h *% 0x100000001b3) ^ hashBytes(std.mem.sliceAsBytes(row[0 .. 2 * n]));
+    }
     const c = term.cursor();
     return h ^ (@as(u64, c.row) << 32) ^ c.col;
 }

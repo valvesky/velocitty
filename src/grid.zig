@@ -54,30 +54,197 @@ pub const Rgb = packed struct {
     b: u8 = 0,
 };
 
-/// `@memset` for cells: stores four 16-byte cells per 64-byte vector
-/// (a packed-struct `@memset` compiles to two scalar stores per cell).
+/// `@memset` for cells: stores eight 8-byte cells per 64-byte vector.
 pub fn fillCells(dst: []Cell, value: Cell) void {
-    const bits: u128 = @bitCast(value);
-    const lo: u64 = @truncate(bits);
-    const hi: u64 = @truncate(bits >> 64);
-    const pat: @Vector(8, u64) = .{ lo, hi, lo, hi, lo, hi, lo, hi };
+    const bits: u64 = @bitCast(value);
+    const pat: @Vector(8, u64) = @splat(bits);
     const words: [*]u64 = @ptrCast(dst.ptr);
-    const n = dst.len * 2;
+    const n = dst.len;
     var i: usize = 0;
     while (i + 8 <= n) : (i += 8) words[i..][0..8].* = pat;
-    while (i < n) : (i += 2) {
-        words[i] = lo;
-        words[i + 1] = hi;
-    }
+    while (i < n) : (i += 1) words[i] = bits;
 }
 
-pub const Cell = packed struct {
-    codepoint: u21 = ' ',
-    attrs: Attrs = .{},
-    _pad: u3 = 0,
+/// Everything about a cell except its character: colors (resolved RGB, as
+/// the pen held them), underline color and attributes. Stored once in
+/// `Styles`; cells refer to it by id.
+pub const Style = packed struct(u128) {
     fg: Color = Color.default_fg,
     bg: Color = Color.default_bg,
+    /// Underline color, used when `attrs.ul_color` is set.
     ul: Rgb = .{},
+    attrs: Attrs = .{},
+    _pad: u24 = 0,
+
+    pub inline fn key(self: Style) u128 {
+        return @bitCast(self);
+    }
+};
+
+/// Index into `Styles.list`. 0 is `Style{}`'s slot (it is recolored like
+/// any other entry, so it is not always `Style{}`).
+pub const StyleId = u32;
+
+/// 8 bytes: the character and its interned style. A wide character's
+/// second cell holds codepoint 0.
+pub const Cell = packed struct(u64) {
+    codepoint: u21 = ' ',
+    _pad: u11 = 0,
+    style: StyleId = 0,
+};
+
+/// Interned styles shared by both grids of a terminal. The pen interns its
+/// style when it prints (a small memo of recent interns makes that a
+/// compare while the pen and the erase style do not change); erase paths
+/// intern the erase style.
+///
+/// Lifetime: once `list` reaches `limit`, `compact` marks every id still in
+/// a cell (both grids, every ring row including scrollback and rows not in
+/// use, and the row-tail blanks), drops the rest, renumbers the survivors
+/// in order and rewrites every cell. Pens are kept as raw colors, not ids,
+/// so nothing else holds an id across calls. Ids change only there, and
+/// entries change only in `recolor`; both bump `gen` (the renderer keeps a
+/// cell snapshot and repaints everything when `gen` moves). A caller must
+/// not keep an id across a call that may intern a new style (anything that
+/// clears with a blank, or prints): fetch it again after.
+/// `limit` doubles when more than half the entries survive a compaction,
+/// so compaction stays amortized O(1) per new style and a screen with more
+/// distinct live styles than any fixed limit still gets exact colors.
+pub const Styles = struct {
+    allocator: std.mem.Allocator,
+    list: std.ArrayListUnmanaged(Style) = .empty,
+    map: std.AutoHashMapUnmanaged(u128, StyleId) = .empty,
+    limit: u32 = default_limit,
+    gen: u32 = 0,
+    /// Direct-mapped memo of recent interns (by a cheap hash of the key):
+    /// the pen, the erase style and the few styles a TUI cycles through
+    /// resolve without the hash map.
+    cache: [cache_len]Entry = @splat(no_entry),
+    /// The latest intern (usually the pen): checked before the memo.
+    last: Entry = no_entry,
+    /// The cell buffers whose ids `compact` keeps and rewrites, one per grid.
+    roots: [2]Root = .{ .{}, .{} },
+
+    pub const default_limit: u32 = 1 << 16;
+    const cache_bits = 5;
+    const cache_len = 1 << cache_bits;
+    const Entry = struct { key: u128, id: StyleId };
+    /// Never a real key: `Style._pad` is always zero.
+    const no_entry: Entry = .{ .key = std.math.maxInt(u128), .id = 0 };
+    pub const Root = struct { cells: []Cell = &.{}, tail: []u64 = &.{} };
+
+    pub fn create(allocator: std.mem.Allocator) std.mem.Allocator.Error!*Styles {
+        const self = try allocator.create(Styles);
+        errdefer allocator.destroy(self);
+        self.* = .{ .allocator = allocator };
+        errdefer self.list.deinit(allocator);
+        try self.list.append(allocator, .{});
+        try self.map.put(allocator, (Style{}).key(), 0);
+        return self;
+    }
+
+    pub fn destroy(self: *Styles) void {
+        const allocator = self.allocator;
+        self.list.deinit(allocator);
+        self.map.deinit(allocator);
+        allocator.destroy(self);
+    }
+
+    pub inline fn get(self: *const Styles, id: StyleId) Style {
+        return self.list.items[id];
+    }
+
+    pub inline fn of(self: *const Styles, c: Cell) Style {
+        return self.list.items[c.style];
+    }
+
+    inline fn cacheSlot(k: u128) usize {
+        const x = @as(u64, @truncate(k)) ^ @as(u64, @truncate(k >> 64));
+        // Top log2(cache_len) bits of a multiplicative hash.
+        return @intCast((x *% 0x9E37_79B9_7F4A_7C15) >> (64 - cache_bits));
+    }
+
+    pub inline fn intern(self: *Styles, s: Style) StyleId {
+        const k = s.key();
+        if (self.last.key == k) return self.last.id;
+        return self.internSlow(k);
+    }
+
+    fn internSlow(self: *Styles, k: u128) StyleId {
+        const e = &self.cache[cacheSlot(k)];
+        if (e.key != k) {
+            const id = self.map.get(k) orelse self.add(k);
+            // After `add`: a compaction there clears the memo.
+            self.cache[cacheSlot(k)] = .{ .key = k, .id = id };
+        }
+        self.last = self.cache[cacheSlot(k)];
+        return self.last.id;
+    }
+
+    fn add(self: *Styles, k: u128) StyleId {
+        if (self.list.items.len >= self.limit) self.compact();
+        const allocator = self.allocator;
+        // Out of memory: the default style (wrong colors, but a valid id).
+        self.list.ensureUnusedCapacity(allocator, 1) catch return 0;
+        self.map.ensureUnusedCapacity(allocator, 1) catch return 0;
+        const id: StyleId = @intCast(self.list.items.len);
+        self.list.appendAssumeCapacity(@bitCast(k));
+        self.map.putAssumeCapacity(k, id);
+        return id;
+    }
+
+    /// Drop every entry no cell refers to and renumber the rest (see the
+    /// type comment). Skipped if its scratch memory cannot be allocated.
+    pub fn compact(self: *Styles) void {
+        const allocator = self.allocator;
+        const n = self.list.items.len;
+        var live = std.DynamicBitSetUnmanaged.initEmpty(allocator, n) catch return;
+        defer live.deinit(allocator);
+        const remap = allocator.alloc(StyleId, n) catch return;
+        defer allocator.free(remap);
+        live.set(0);
+        for (self.roots) |root| {
+            for (root.cells) |c| live.set(c.style);
+            for (root.tail) |t| live.set(@as(Cell, @bitCast(t)).style);
+        }
+        var next: StyleId = 0;
+        for (0..n) |i| {
+            if (!live.isSet(i)) continue;
+            remap[i] = next;
+            self.list.items[next] = self.list.items[i];
+            next += 1;
+        }
+        self.list.shrinkRetainingCapacity(next);
+        for (self.roots) |root| {
+            for (root.cells) |*c| c.style = remap[c.style];
+            for (root.tail) |*t| {
+                var c: Cell = @bitCast(t.*);
+                c.style = remap[c.style];
+                t.* = @bitCast(c);
+            }
+        }
+        self.rebuildMap();
+        if (@as(u64, next) * 2 > self.limit) self.limit = @intCast(@min(@as(u64, self.limit) * 2, std.math.maxInt(StyleId)));
+    }
+
+    /// Apply `f(ctx, &style)` to every entry (a palette or default color
+    /// change); cells keep their ids and pick the new colors up.
+    pub fn recolor(self: *Styles, ctx: anytype, comptime f: fn (@TypeOf(ctx), *Style) void) void {
+        for (self.list.items) |*s| f(ctx, s);
+        self.rebuildMap();
+    }
+
+    /// Re-key the map after entries changed or moved (equal entries may
+    /// now repeat: any of their ids is fine). Bumps `gen`.
+    fn rebuildMap(self: *Styles) void {
+        // The map only deduplicates: a key it misses (out of memory) just
+        // gets a second entry later.
+        self.map.clearRetainingCapacity();
+        for (self.list.items, 0..) |s, i| self.map.put(self.allocator, s.key(), @intCast(i)) catch break;
+        self.cache = @splat(no_entry);
+        self.last = no_entry;
+        self.gen +%= 1;
+    }
 };
 
 pub const Cursor = struct { row: u16 = 0, col: u16 = 0 };
@@ -91,7 +258,11 @@ pub const Grid = struct {
     /// (the blank the row was last cleared with), so clearing it again with
     /// the same blank only needs `[0, extent)`. `full_extent`: unknown.
     extent: []u16,
-    tail: []u128,
+    tail: []u64,
+    /// Style table shared with the other grid; `slot` is this grid's root
+    /// in it (the cells `Styles.compact` rewrites).
+    styles: *Styles,
+    slot: u1,
     /// Cells per row.
     width: u16,
     /// Use `extent` to shorten whole-row clears (tests turn it off to
@@ -118,7 +289,10 @@ pub const Grid = struct {
     scroll_top: u16 = 0,
     scroll_bottom: u16,
 
-    pub fn init(allocator: std.mem.Allocator, cols: u16, rows: u16, cap: u32) !Grid {
+    /// The grid registers its buffers as root `slot` of `styles`; the
+    /// caller must keep it in place until `deinit` (or call `register`
+    /// again after moving it, though only the buffers are recorded).
+    pub fn init(allocator: std.mem.Allocator, cols: u16, rows: u16, cap: u32, styles: *Styles, slot: u1) !Grid {
         const total = @as(usize, cols) * cap;
         const cells = try allocator.alloc(Cell, total);
         errdefer allocator.free(cells);
@@ -136,24 +310,34 @@ pub const Grid = struct {
         const extent = try allocator.alloc(u16, cap);
         errdefer allocator.free(extent);
         @memset(extent, 0);
-        const tail = try allocator.alloc(u128, cap);
+        const tail = try allocator.alloc(u64, cap);
         errdefer allocator.free(tail);
-        @memset(tail, @as(u128, @bitCast(Cell{})));
+        @memset(tail, @as(u64, @bitCast(Cell{})));
 
-        return Grid{
+        const g = Grid{
             .cells = cells,
             .starts = starts,
             .wraps = wraps,
             .extent = extent,
             .tail = tail,
+            .styles = styles,
+            .slot = slot,
             .width = cols,
             .cap = cap,
             .used = rows,
             .scroll_bottom = rows -| 1,
         };
+        g.register();
+        return g;
+    }
+
+    /// Record the current cell and tail buffers in the style table.
+    pub fn register(self: *const Grid) void {
+        self.styles.roots[self.slot] = .{ .cells = self.cells, .tail = self.tail };
     }
 
     pub fn deinit(self: *Grid, allocator: std.mem.Allocator) void {
+        self.styles.roots[self.slot] = .{};
         allocator.free(self.cells);
         allocator.free(self.starts);
         allocator.free(self.wraps);
@@ -178,12 +362,15 @@ pub const Grid = struct {
     fn resizeTracking(self: *Grid, allocator: std.mem.Allocator, cap: u32) std.mem.Allocator.Error!void {
         const extent = try allocator.alloc(u16, cap);
         errdefer allocator.free(extent);
-        const tail = try allocator.alloc(u128, cap);
+        const tail = try allocator.alloc(u64, cap);
+        // Never read while the extent is full, but `Styles.compact` scans it.
+        @memset(tail, @as(u64, @bitCast(Cell{})));
         allocator.free(self.extent);
         allocator.free(self.tail);
         self.extent = extent;
         self.tail = tail;
         self.markAllWritten();
+        self.register();
     }
 
     pub fn setRowWrap(self: *Grid, row: u16, wrapped: bool) void {
@@ -257,6 +444,7 @@ pub const Grid = struct {
         allocator.free(self.starts);
         allocator.free(self.wraps);
         self.cells = new_cells;
+        self.register();
         self.starts = new_starts;
         self.wraps = new_wraps;
         self.cap = new_cap;
@@ -393,6 +581,7 @@ pub const Grid = struct {
         allocator.free(self.starts);
         allocator.free(self.wraps);
         self.cells = new_cells;
+        self.register();
         self.starts = new_starts;
         self.wraps = new_wraps;
         self.cap = new_cap;
@@ -444,10 +633,10 @@ pub const Grid = struct {
     }
 
     pub fn reset(self: *Grid, cols: u16, rows: u16, scheme: Scheme) void {
-        const blank = Cell{ .fg = scheme.fg, .bg = scheme.bg };
+        const blank = Cell{ .style = self.styles.intern(.{ .fg = scheme.fg, .bg = scheme.bg }) };
         fillCells(self.cells, blank);
         @memset(self.extent, 0);
-        @memset(self.tail, @as(u128, @bitCast(blank)));
+        @memset(self.tail, @as(u64, @bitCast(blank)));
         self.width = cols;
         for (self.starts, 0..) |*s, i| {
             s.* = @intCast(i * cols);
@@ -545,25 +734,26 @@ pub const Grid = struct {
         }
     }
 
-    pub inline fn blankCell(self: *Grid) Cell {
-        return Cell{
-            .codepoint = ' ',
+    /// The erase style: pen colors and which of them are explicit.
+    pub inline fn blankStyle(self: *const Grid) Style {
+        return .{
             .attrs = .{ .fg_explicit = self.attrs.fg_explicit, .bg_explicit = self.attrs.bg_explicit },
             .fg = self.fg,
             .bg = self.bg,
         };
     }
 
+    /// A blank in the erase style. May intern (see `Styles`).
+    pub inline fn blankCell(self: *Grid) Cell {
+        return .{ .codepoint = ' ', .style = self.styles.intern(self.blankStyle()) };
+    }
+
     /// Primary cell mutation primitive
     pub fn writeCell(self: *Grid, row: u16, col: u16, cp: u21) void {
+        const id = self.styles.intern(.{ .attrs = self.attrs, .fg = self.fg, .bg = self.bg });
         const cell = &self.cellPtr(row, col)[0];
         self.noteWrite(row, col + 1);
-        cell.* = .{
-            .codepoint = cp,
-            .attrs = self.attrs,
-            .fg = self.fg,
-            .bg = self.bg,
-        };
+        cell.* = .{ .codepoint = cp, .style = id };
     }
 
     /// Clear cell range [start_col, end_col) on a given row
@@ -571,7 +761,7 @@ pub const Grid = struct {
         const line_idx = self.lineIndex(row);
         const row_offset = self.starts[line_idx];
         const blank = self.blankCell();
-        const bits: u128 = @bitCast(blank);
+        const bits: u64 = @bitCast(blank);
         if (start_col == 0 and end_col >= self.width) {
             // A whole row: past `extent` it already holds this blank.
             const ext = self.extent[line_idx];
@@ -768,7 +958,9 @@ fn mapCursor(offset: u32, new_cols: u16, before_rows: u32, row: *u32, col: *u16)
 }
 
 test "reflow keeps glyphs" {
-    var g = try Grid.init(std.testing.allocator, 4, 2, 8);
+    const styles = try Styles.create(std.testing.allocator);
+    defer styles.destroy();
+    var g = try Grid.init(std.testing.allocator, 4, 2, 8, styles, 0);
     defer g.deinit(std.testing.allocator);
     g.writeCell(0, 0, 'A');
     g.writeCell(0, 1, 'B');
@@ -779,14 +971,79 @@ test "reflow keeps glyphs" {
 }
 
 test "fillCells matches memset" {
-    var a: [11]Cell = undefined;
-    var b: [11]Cell = undefined;
-    const v: Cell = .{ .codepoint = 'q', .fg = .{ .r = 1, .g = 2, .b = 3 }, .bg = .{ .r = 4, .g = 5, .b = 6 }, .ul = .{ .r = 7 } };
-    for (0..11) |n| {
+    var a: [19]Cell = undefined;
+    var b: [19]Cell = undefined;
+    const v: Cell = .{ .codepoint = 'q', .style = 0xdead_beef };
+    for (0..19) |n| {
         @memset(&a, Cell{});
         @memset(&b, Cell{});
         @memset(a[0..n], v);
         fillCells(b[0..n], v);
         try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&a), std.mem.sliceAsBytes(&b));
     }
+}
+
+test "cells are 8 bytes" {
+    try std.testing.expectEqual(8, @sizeOf(Cell));
+    try std.testing.expectEqual(16, @sizeOf(Style));
+}
+
+test "a full style table compacts without reusing live ids" {
+    const gpa = std.testing.allocator;
+    const styles = try Styles.create(gpa);
+    defer styles.destroy();
+    styles.limit = 64;
+    var g = try Grid.init(gpa, 8, 4, 6, styles, 0);
+    defer g.deinit(gpa);
+    var alt = try Grid.init(gpa, 8, 4, 4, styles, 1);
+    defer alt.deinit(gpa);
+    // Every cell gets its own style; most are overwritten later, so their
+    // ids die. Check after every write that each cell still resolves to the
+    // style it was written with.
+    var want: [2][8 * 6]u32 = @splat(@splat(0));
+    var prng = std.Random.DefaultPrng.init(42);
+    const rnd = prng.random();
+    var serial: u32 = 1;
+    var compactions: u32 = 0;
+    for (0..5000) |_| {
+        const which = rnd.uintLessThan(u8, 2);
+        const grid = if (which == 0) &g else &alt;
+        const ncells = grid.cells.len;
+        const k = rnd.uintLessThan(usize, ncells);
+        // Reuse an old color now and then so lookups hit existing entries.
+        const color = if (rnd.uintLessThan(u8, 4) == 0) 1 + rnd.uintLessThan(u32, serial) else serial;
+        serial += 1;
+        const st: Style = .{ .fg = @bitCast(color), .bg = Color.default_bg };
+        const gen = styles.gen;
+        grid.cells[k] = .{ .codepoint = 'x', .style = styles.intern(st) };
+        if (styles.gen != gen) compactions += 1;
+        want[which][k] = color;
+        try std.testing.expect(styles.list.items.len <= styles.limit);
+        for ([_]*Grid{ &g, &alt }, 0..) |gr, w| {
+            for (gr.cells, 0..) |c, i| {
+                const got = styles.of(c);
+                if (want[w][i] == 0) {
+                    try std.testing.expectEqual((Style{}).key(), got.key());
+                } else {
+                    try std.testing.expectEqual(want[w][i], @as(u32, @bitCast(got.fg)));
+                }
+            }
+        }
+    }
+    try std.testing.expect(compactions > 10);
+    // At most 80 cells + the default are live: the limit stops growing
+    // once that is under half of it.
+    try std.testing.expect(styles.limit <= 256);
+}
+
+test "the style limit grows when every id is live" {
+    const gpa = std.testing.allocator;
+    const styles = try Styles.create(gpa);
+    defer styles.destroy();
+    styles.limit = 16;
+    var g = try Grid.init(gpa, 10, 10, 10, styles, 0);
+    defer g.deinit(gpa);
+    for (g.cells, 0..) |*c, i| c.* = .{ .codepoint = 'x', .style = styles.intern(.{ .fg = @bitCast(@as(u32, @intCast(i + 1))) }) };
+    for (g.cells, 0..) |c, i| try std.testing.expectEqual(@as(u32, @intCast(i + 1)), @as(u32, @bitCast(styles.of(c).fg)));
+    try std.testing.expect(styles.limit >= 101);
 }

@@ -26,6 +26,10 @@ pub const Frame = struct {
     height: u32,
     pixels: []u32,
     prev: []Term.Cell = &.{},
+    /// Style table and generation the snapshot's ids belong to: ids are
+    /// only comparable within one generation (`Term.Styles`).
+    prev_styles: ?*const Term.Styles = null,
+    prev_gen: u32 = 0,
     prev_cols: u16 = 0,
     prev_rows: u16 = 0,
     prev_cursor: Term.Cursor = .{},
@@ -113,6 +117,12 @@ pub const Frame = struct {
 
         const cols = screen.cols;
         const rows = screen.rows;
+        if (self.prev_styles != screen.styles or self.prev_gen != screen.styles.gen) {
+            // Same ids may now mean other colors: compare nothing.
+            self.prev_rows = 0;
+            self.prev_styles = screen.styles;
+            self.prev_gen = screen.styles.gen;
+        }
         const have_prev = self.ensurePrev(cols, rows);
         const cur_on = screen.cursorVisible() and screen.scrollOffset() == 0;
         var cur = screen.cursor();
@@ -310,11 +320,15 @@ fn runUniformBg(screen: *const Term.Screen, start: u16, end: u16) ?u32 {
     const first = screen.rowCells(start);
     if (first.len == 0) return null;
     const rev = screen.flags.reverse;
-    const bg = packColor(effectiveBg(first[0], rev));
+    const styles = screen.styles;
+    var id = first[0].style;
+    const bg = packColor(effectiveBg(styles.get(id), rev));
     var r = start;
     while (r < end) : (r += 1) {
         for (screen.rowCells(r)) |cell| {
-            if (packColor(effectiveBg(cell, rev)) != bg) return null;
+            if (cell.style == id) continue;
+            if (packColor(effectiveBg(styles.of(cell), rev)) != bg) return null;
+            id = cell.style;
         }
     }
     return bg;
@@ -433,20 +447,20 @@ fn markDirtyStrip(self: *Frame, row: u16, cell_h: u32) void {
     self.dirty_h = y1 - y0;
 }
 
-fn effectiveBg(cell: Term.Cell, reverse: bool) Term.Color {
-    const inv = cell.attrs.inverse != reverse;
-    return if (inv) cell.fg else cell.bg;
+fn effectiveBg(st: Term.Style, reverse: bool) Term.Color {
+    const inv = st.attrs.inverse != reverse;
+    return if (inv) st.fg else st.bg;
 }
 
-fn effectiveFg(cell: Term.Cell, reverse: bool) Term.Color {
-    var fg = cell.fg;
-    var bg = cell.bg;
-    if (cell.attrs.inverse != reverse) {
+fn effectiveFg(st: Term.Style, reverse: bool) Term.Color {
+    var fg = st.fg;
+    var bg = st.bg;
+    if (st.attrs.inverse != reverse) {
         const tmp = fg;
         fg = bg;
         bg = tmp;
     }
-    if (cell.attrs.dim) {
+    if (st.attrs.dim) {
         fg = .{ .r = fg.r / 2, .g = fg.g / 2, .b = fg.b / 2, .a = fg.a };
     }
     return fg;
@@ -460,19 +474,26 @@ fn paintBgSpan(self: *Frame, screen: *const Term.Screen, line: []const Term.Cell
     const y0 = @as(u32, row) * cell_h;
     const last: u16 = @intCast(@min(@as(usize, col1), line.len));
     var c = col0;
+    const styles = screen.styles;
     while (c < last) {
-        const bg = packColor(paintColors(screen, line[c], sel.contains(c, row, cols)).bg);
+        const in_sel = sel.contains(c, row, cols);
+        const bg = packColor(paintColors(screen, styles.of(line[c]), in_sel).bg);
         var n: u16 = 1;
-        while (c + n < last and packColor(paintColors(screen, line[c + n], sel.contains(c + n, row, cols)).bg) == bg) : (n += 1) {}
+        while (c + n < last) : (n += 1) {
+            const next_sel = sel.contains(c + n, row, cols);
+            // Same style and selection state: same color, no lookup.
+            if (line[c + n].style == line[c].style and next_sel == in_sel) continue;
+            if (packColor(paintColors(screen, styles.of(line[c + n]), next_sel).bg) != bg) break;
+        }
         fillRect(self, @as(u32, c) * cell_w, y0, @as(u32, n) * cell_w, cell_h, bg);
         c += n;
     }
 }
 
-fn paintColors(screen: *const Term.Screen, cell: Term.Cell, selected: bool) struct { fg: Term.Color, bg: Term.Color } {
+fn paintColors(screen: *const Term.Screen, st: Term.Style, selected: bool) struct { fg: Term.Color, bg: Term.Color } {
     const rev = screen.flags.reverse;
-    var fg = effectiveFg(cell, rev);
-    var bg = effectiveBg(cell, rev);
+    var fg = effectiveFg(st, rev);
+    var bg = effectiveBg(st, rev);
     if (selected) {
         if (screen.have_sel_fg or screen.have_sel_bg) {
             if (screen.have_sel_fg) fg = screen.sel_fg;
@@ -507,11 +528,14 @@ fn blitLine(
 ) void {
     const y0 = @as(u32, row) * cell_h;
     const last: u16 = @intCast(@min(@as(usize, col1), line.len));
+    const styles = screen.styles;
     var c = col0;
     while (c < last) : (c += 1) {
         const cell = line[c];
-        if (cell.attrs.hidden or cell.codepoint < 0x20 or cell.codepoint == 0x7F) continue;
-        const painted = paintColors(screen, cell, sel.contains(c, row, @intCast(line.len)));
+        if (cell.codepoint < 0x20 or cell.codepoint == 0x7F) continue;
+        const st = styles.of(cell);
+        if (st.attrs.hidden) continue;
+        const painted = paintColors(screen, st, sel.contains(c, row, @intCast(line.len)));
         const fg = packColor(painted.fg);
         const bg = packColor(painted.bg);
         const x0 = @as(u32, c) * cell_w;
@@ -527,14 +551,14 @@ fn blitLine(
             bg,
             .{ .x0 = clip.x0, .y0 = clip.y0, .x1 = clip.x1, .y1 = clip.y1 },
             cell.codepoint,
-            cell.attrs.bold,
+            st.attrs.bold,
         ))) {
             if (type_ctx) |ctx| {
                 if (cell.codepoint != ' ') {
-                    const st = Type.Style{ .bold = cell.attrs.bold, .italic = cell.attrs.italic };
-                    var g = ctx.peekGlyphStyled(cell.codepoint, size, st);
+                    const face = Type.Style{ .bold = st.attrs.bold, .italic = st.attrs.italic };
+                    var g = ctx.peekGlyphStyled(cell.codepoint, size, face);
                     if (g == null) {
-                        g = ctx.ensureGlyphStyled(cell.codepoint, size, st) catch null;
+                        g = ctx.ensureGlyphStyled(cell.codepoint, size, face) catch null;
                     }
                     if (g) |glyph| {
                         const ox: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(x0)) + glyph.bearing_x));
@@ -559,12 +583,12 @@ fn blitLine(
                 }
             }
         }
-        if ((cell.attrs.underline or cell.attrs.link) and clip.y0 <= @as(i32, @intCast(y0)) and clip.y1 >= @as(i32, @intCast(y0 + cell_h))) {
-            const ul = if (cell.attrs.ul_color)
-                packColor(.{ .r = cell.ul.r, .g = cell.ul.g, .b = cell.ul.b, .a = 255 })
+        if ((st.attrs.underline or st.attrs.link) and clip.y0 <= @as(i32, @intCast(y0)) and clip.y1 >= @as(i32, @intCast(y0 + cell_h))) {
+            const ul = if (st.attrs.ul_color)
+                packColor(.{ .r = st.ul.r, .g = st.ul.g, .b = st.ul.b, .a = 255 })
             else
                 fg;
-            const style: u3 = if (cell.attrs.underline_style != 0) cell.attrs.underline_style else 1;
+            const style: u3 = if (st.attrs.underline_style != 0) st.attrs.underline_style else 1;
             drawUnderline(self, x0, y0, cell_w, cell_h, ul, style);
         }
     }
@@ -1163,4 +1187,74 @@ test "incremental render after multi-line scroll and image moves matches full re
         fresh.render(&vt, 4, 4, null, 8);
         try std.testing.expectEqualSlices(u32, fresh.pixels, frame.pixels);
     }
+}
+
+test "incremental render matches full render across style compactions and recolors" {
+    const a = std.testing.allocator;
+    var storage: [4096]u8 = undefined;
+    var vt = try Term.VtState.init(a, 6, 4, 8, &storage);
+    defer vt.deinit();
+    vt.flags.cursor_visible = false;
+    vt.styles.limit = 8;
+    var frame = try Frame.init(a, 24, 16);
+    defer frame.deinit();
+    var fresh = try Frame.init(a, 24, 16);
+    defer fresh.deinit();
+    var prng = std.Random.DefaultPrng.init(7);
+    const rnd = prng.random();
+    var compactions: u32 = 0;
+    for (0..300) |step| {
+        // A few cells in new colors: dirty rows are checked against the
+        // frame's snapshot by style id, which compactions renumber.
+        for (0..3) |_| {
+            const g = vt.grid();
+            g.cursor = .{ .row = rnd.uintLessThan(u16, 4), .col = rnd.uintLessThan(u16, 6) };
+            g.wrap_pending = false;
+            g.fg = .{ .r = rnd.int(u8), .g = rnd.int(u8), .b = rnd.int(u8) };
+            g.attrs.fg_explicit = rnd.boolean();
+            g.bg = .{ .r = rnd.uintLessThan(u8, 4), .g = 0, .b = 0 };
+            g.attrs.bg_explicit = rnd.boolean();
+            const gen = vt.styles.gen;
+            vt.printCodepoint('a' + rnd.uintLessThan(u8, 3));
+            if (vt.styles.gen != gen) compactions += 1;
+        }
+        if (step % 25 == 24) vt.setDefaultColor(step % 50 == 24, .{ .r = 9, .g = 9, .b = @intCast(step % 256) });
+        frame.render(&vt, 4, 4, null, 8);
+        vt.clearDirty();
+        fresh.invalidate();
+        fresh.forgetPrev();
+        fresh.render(&vt, 4, 4, null, 8);
+        try std.testing.expectEqualSlices(u32, fresh.pixels, frame.pixels);
+    }
+    try std.testing.expect(compactions > 10);
+}
+
+test "a compaction that hands a dead style's id to a new one repaints" {
+    const a = std.testing.allocator;
+    var storage: [4096]u8 = undefined;
+    var vt = try Term.VtState.init(a, 2, 1, 1, &storage);
+    defer vt.deinit();
+    vt.flags.cursor_visible = false;
+    var frame = try Frame.init(a, 8, 4);
+    defer frame.deinit();
+    var fresh = try Frame.init(a, 8, 4);
+    defer fresh.deinit();
+    const g = vt.grid();
+    g.bg = .{ .r = 200, .g = 0, .b = 0 };
+    vt.printCodepoint('a');
+    const first = vt.grid().cellAt(0, 0);
+    frame.render(&vt, 4, 4, null, 8);
+    vt.clearDirty();
+    // Same character in another style; the old style dies and the
+    // compaction gives its id to the new one: same cell bits as the
+    // frame's snapshot, different colors.
+    g.cursor.col = 0;
+    g.wrap_pending = false;
+    g.bg = .{ .r = 0, .g = 0, .b = 200 };
+    vt.printCodepoint('a');
+    vt.styles.compact();
+    try std.testing.expectEqual(first, vt.grid().cellAt(0, 0));
+    frame.render(&vt, 4, 4, null, 8);
+    fresh.render(&vt, 4, 4, null, 8);
+    try std.testing.expectEqualSlices(u32, fresh.pixels, frame.pixels);
 }
