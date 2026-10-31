@@ -124,13 +124,14 @@ pub fn wordAt(screen: *const Term.Screen, col: u16, row: u16) State {
     const line = screen.rowCells(row);
     const c = @min(col, screen.cols -| 1);
     if (line.len == 0) return .{ .on = true, .a = .{ .col = 0, .row = row }, .b = .{ .col = 0, .row = row } };
-    if (!isWord(line[c].codepoint)) {
+    const st = screen.styles;
+    if (!isWord(st.base(line[c]))) {
         return cellAt(c, row);
     }
     var l = c;
     var r = c;
-    while (l > 0 and isWord(line[l - 1].codepoint)) l -= 1;
-    while (r + 1 < line.len and isWord(line[r + 1].codepoint)) r += 1;
+    while (l > 0 and isWord(st.base(line[l - 1]))) l -= 1;
+    while (r + 1 < line.len and isWord(st.base(line[r + 1]))) r += 1;
     return .{
         .on = true,
         .a = .{ .col = l, .row = row },
@@ -163,13 +164,13 @@ pub fn copyAlloc(allocator: std.mem.Allocator, screen: *const Term.Screen, sel: 
         const line = screen.rowCells(row);
         const start: u16 = if (row == b.lo.row) b.lo.col else 0;
         const stop: u16 = if (row == b.hi.row) b.hi.col else screen.cols - 1;
-        try appendLine(allocator, &out, line, start, stop);
+        try appendLine(allocator, &out, screen, line, start, stop);
         if (row == b.hi.row) break;
     }
     return out.toOwnedSlice(allocator);
 }
 
-fn appendLine(allocator: std.mem.Allocator, out: *std.ArrayList(u8), line: []const Term.Cell, start: u16, stop: u16) std.mem.Allocator.Error!void {
+fn appendLine(allocator: std.mem.Allocator, out: *std.ArrayList(u8), screen: *const Term.Screen, line: []const Term.Cell, start: u16, stop: u16) std.mem.Allocator.Error!void {
     if (line.len == 0 or start > stop) return;
     const last: u16 = @intCast(@min(@as(usize, stop), line.len - 1));
     const first: u16 = @min(start, last);
@@ -182,14 +183,17 @@ fn appendLine(allocator: std.mem.Allocator, out: *std.ArrayList(u8), line: []con
     var c: u16 = first;
     const lim: u16 = @intCast(end);
     while (c <= lim) : (c += 1) {
-        const cp = line[c].codepoint;
-        if (cp == 0) continue;
-        var buf: [4]u8 = undefined;
-        const n = std.unicode.utf8Encode(cp, &buf) catch {
-            try out.append(allocator, '?');
-            continue;
-        };
-        try out.appendSlice(allocator, buf[0..n]);
+        if (line[c].codepoint == 0) continue;
+        // A cluster copies as all its code points.
+        var one: u32 = undefined;
+        for (screen.styles.text(line[c], &one)) |v| {
+            var buf: [4]u8 = undefined;
+            const n = std.unicode.utf8Encode(@intCast(v), &buf) catch {
+                try out.append(allocator, '?');
+                continue;
+            };
+            try out.appendSlice(allocator, buf[0..n]);
+        }
     }
 }
 
@@ -253,4 +257,18 @@ test "word and line grab" {
     sel.grab(&vt, 2, 0, .line);
     try std.testing.expectEqual(@as(u16, 0), sel.a.col);
     try std.testing.expectEqual(@as(u16, 11), sel.b.col);
+}
+
+test "copy and word selection take whole grapheme clusters" {
+    var vt = try Term.VtState.init(std.testing.allocator, 12, 1, 2, &.{});
+    defer vt.deinit();
+    vt.feedText("ae\u{301}b \u{1f468}\u{200d}\u{1f469}!");
+    var sel: State = .{};
+    sel.grab(&vt, 1, 0, .word);
+    try std.testing.expectEqual(@as(u16, 0), sel.a.col);
+    try std.testing.expectEqual(@as(u16, 2), sel.b.col);
+    sel.drag(&vt, 11, 0);
+    const text = try copyAlloc(std.testing.allocator, &vt, sel);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("ae\u{301}b \u{1f468}\u{200d}\u{1f469}!", text);
 }

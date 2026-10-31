@@ -3,6 +3,8 @@
 const Vt = @import("vt.zig").VtState;
 
 pub fn dispatch(vt: *Vt, byte: u8) void {
+    // Every control ends the open grapheme cluster.
+    if (byte != 0x20) vt.join.ok = false;
     switch (byte) {
         0x07 => {}, // BEL
         0x08 => vt.backspace(),

@@ -1680,7 +1680,9 @@ fn hashTerm(term: *const VtState) u64 {
         const cells = term.rowCells(r);
         const n = @min(cells.len, row.len / 2);
         for (cells[0..n], 0..) |c, i| {
-            row[2 * i] = c.codepoint;
+            // Clusters by content: ids depend on interning order too.
+            var one: u32 = undefined;
+            row[2 * i] = if (c.isCluster()) @as(u128, hashBytes(std.mem.sliceAsBytes(term.styles.text(c, &one)))) | (1 << 64) else c.codepoint;
             row[2 * i + 1] = term.styleOf(c).key();
         }
         h = (h *% 0x100000001b3) ^ hashBytes(std.mem.sliceAsBytes(row[0 .. 2 * n]));

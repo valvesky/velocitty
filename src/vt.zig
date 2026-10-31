@@ -10,7 +10,7 @@ const Esc = @import("esc.zig");
 const Osc = @import("osc.zig");
 const Dcs = @import("dcs.zig");
 const C0 = @import("c0.zig");
-const EastAsian = @import("type/eastasian.zig");
+const Grapheme = @import("type/grapheme.zig");
 const Ring = @import("circbuffer.zig");
 const Run = Ring.Run;
 const SIMD = @import("simd.zig");
@@ -24,7 +24,45 @@ pub const StyleId = GridMod.StyleId;
 pub const Styles = GridMod.Styles;
 pub const Cursor = GridMod.Cursor;
 pub const Grid = GridMod.Grid;
+pub const Clusters = GridMod.Clusters;
+pub const cluster_base = GridMod.cluster_base;
 const Sixel = @import("sixel.zig");
+
+/// The cell the last printed character started, while only printing (and
+/// SGR) happened since: a code point that continues its grapheme cluster
+/// (mode 2027: no UAX #29 break; else any zero-width code point) joins
+/// that cell instead of taking one. Any control, escape other than SGR,
+/// cursor move or scroll ends it (`VtState.joinable` also checks that the
+/// cursor is still where the print left it). Kept apart from the cells so
+/// ghost text (which writes none) tracks it the same way.
+pub const Join = struct {
+    ok: bool = false,
+    which: u1 = 0,
+    /// The cluster's cell.
+    row: u16 = 0,
+    col: u16 = 0,
+    /// The cursor right after the cluster (the join holds while it stays).
+    cur_col: u16 = 0,
+    pending: bool = false,
+    wide: bool = false,
+    /// Code points in the cluster, at most `Clusters.max_len`.
+    len: u8 = 1,
+    /// The cluster's first code point (printing sets only this, so a
+    /// print costs a few stores; the rest is derived when something joins).
+    base: u21 = ' ',
+    /// With `len` > 1: the last code point's properties and the UAX #29
+    /// state of the text ending with it (`lastProps`/`breakState`).
+    last: Grapheme.Props = .{ .width = 1, .class = .other, .vs_base = false },
+    state: Grapheme.State = .{},
+
+    pub inline fn lastProps(j: *const Join) Grapheme.Props {
+        return if (j.len == 1) Grapheme.props(j.base) else j.last;
+    }
+
+    pub inline fn breakState(j: *const Join) Grapheme.State {
+        return if (j.len == 1) Grapheme.State.start(Grapheme.props(j.base).class) else j.state;
+    }
+};
 
 pub const Mouse = enum {
     off,
@@ -99,7 +137,10 @@ pub const VtState = struct {
     gl: u2 = 0,
     ss: u2 = 0,
     ss_active: bool = false,
+    /// REP's character: the last code point that started a cell (Ghostty's
+    /// `previous_char`; code points that joined a cluster do not count).
     last_cp: u21 = ' ',
+    join: Join = .{},
     /// Feeding dead text (`Run.Flags.ghost`): the cursor moves, cells are
     /// not written. Wraps, insert mode and charsets still take the writing
     /// path; what they write is never seen.
@@ -218,6 +259,7 @@ pub const VtState = struct {
         self.gl = 0;
         self.ss_active = false;
         self.last_cp = ' ';
+        self.join.ok = false;
         self.shell_mark = 0;
         self.saved_mode = @splat(0);
         self.saved_mode_val = @splat(0);
@@ -326,6 +368,8 @@ pub const VtState = struct {
             const src = if (run.flags.spill) spill else self.storage;
             const slice = src[run.off .. run.off + run.len];
             self.ghost = run.flags.ghost;
+            // Only text and SGR keep a grapheme cluster open.
+            if (run.kind != .text and run.kind != .csi) self.join.ok = false;
             switch (run.kind) {
                 .text => if (!run.flags.ghost or !self.skipDeadLine(slice)) self.feedText(slice),
                 .c0 => {
@@ -334,7 +378,9 @@ pub const VtState = struct {
                 .esc => Esc.dispatch(self, slice),
                 .csi => {
                     var params: [16]CsiSeq.Param = undefined;
-                    CsiSeq.parse(slice, &params).apply(self);
+                    const seq = CsiSeq.parse(slice, &params);
+                    if (seq.final != 'm' or seq.private != 0) self.join.ok = false;
+                    seq.apply(self);
                 },
                 .osc => Osc.dispatch(self, slice),
                 .str => {
@@ -392,13 +438,22 @@ pub const VtState = struct {
             // Decode up to the real end: a malformed sequence before the CR
             // can swallow it, and then the line does not end at column 0.
             const r = SIMD.decodeUtf8Run(.printable, bytes[i..], &buf);
-            if (r.written != 0) last = @intCast(buf[r.written - 1]);
+            // Zero-width code points join a cell (or are dropped): not REP's.
+            var k = r.written;
+            while (k > 0) : (k -= 1) {
+                const cp: u21 = @intCast(buf[k - 1]);
+                if (Grapheme.props(cp).width != 0) {
+                    last = cp;
+                    break;
+                }
+            }
             i += @max(r.read, 1);
             if (i > end) return false;
         }
         g.cursor.col = 0;
         g.wrap_pending = false;
         self.last_cp = last;
+        self.join.ok = false;
         return true;
     }
 
@@ -410,7 +465,7 @@ pub const VtState = struct {
     /// UTF-8 from its first non-ASCII byte through `printUtf8` (which also
     /// takes the printable ASCII mixed into it); stray 0x80..0xBF/0xF8.. are
     /// ignored (raw 8-bit C1 controls are not recognized in UTF-8 text).
-    fn feedText(self: *VtState, bytes: []const u8) void {
+    pub fn feedText(self: *VtState, bytes: []const u8) void {
         var i: usize = 0;
         while (i < bytes.len) {
             const n = SIMD.skipOutRange(bytes[i..], 0x20, 0x7E);
@@ -443,11 +498,7 @@ pub const VtState = struct {
             while (true) {
                 const r = SIMD.decodeUtf8Run(.non_ascii, bytes[i..], &buf);
                 i += r.read;
-                for (buf[0..r.written]) |v| {
-                    const cp: u21 = @intCast(v);
-                    if (self.flags.grapheme_shaping and EastAsian.isCombining(cp)) continue;
-                    self.printCodepoint(cp);
-                }
+                for (buf[0..r.written]) |v| self.printCodepoint(@intCast(v));
                 if (r.done) return i;
             }
         }
@@ -457,70 +508,282 @@ pub const VtState = struct {
             2 => self.g2,
             3 => self.g3,
         };
+        const shaping = self.flags.grapheme_shaping;
         if (set == .dec_special) {
-            return if (self.ghost) self.printUtf8Fast(.non_ascii, false, bytes, start, &buf) else self.printUtf8Fast(.non_ascii, true, bytes, start, &buf);
+            if (shaping) return if (self.ghost) self.printUtf8Fast(.non_ascii, false, true, bytes, start, &buf) else self.printUtf8Fast(.non_ascii, true, true, bytes, start, &buf);
+            return if (self.ghost) self.printUtf8Fast(.non_ascii, false, false, bytes, start, &buf) else self.printUtf8Fast(.non_ascii, true, false, bytes, start, &buf);
         }
-        return if (self.ghost) self.printUtf8Fast(.printable, false, bytes, start, &buf) else self.printUtf8Fast(.printable, true, bytes, start, &buf);
+        if (shaping) return if (self.ghost) self.printUtf8Fast(.printable, false, true, bytes, start, &buf) else self.printUtf8Fast(.printable, true, true, bytes, start, &buf);
+        return if (self.ghost) self.printUtf8Fast(.printable, false, false, bytes, start, &buf) else self.printUtf8Fast(.printable, true, false, bytes, start, &buf);
     }
 
     /// `printUtf8` without insert mode or a single shift. `paint` false
     /// (ghost text) only moves the cursor. `.printable` needs the ASCII
     /// charset: printable ASCII is then width 1 and printed as itself.
-    inline fn printUtf8Fast(self: *VtState, comptime mode: SIMD.Utf8Mode, comptime paint: bool, bytes: []const u8, start: usize, buf: *[256]u32) usize {
+    /// Each code point costs one `Grapheme.props` lookup (width and break
+    /// class). Code points that may continue a cluster leave the loop:
+    /// without `shaping` (mode 2027) a run of zero-width ones joins the
+    /// cell just printed in one go (`joinMarks`); with it, anything that
+    /// does not break from the previous code point in every UAX #29 state
+    /// takes `printCodepoint`. The `join` state is written back only
+    /// before those calls and on return.
+    inline fn printUtf8Fast(self: *VtState, comptime mode: SIMD.Utf8Mode, comptime paint: bool, comptime shaping: bool, bytes: []const u8, start: usize, buf: *[256]u32) usize {
         var i = start;
         const cols = self.cols;
-        const shaping = self.flags.grapheme_shaping;
         var g = self.grid();
         var row_cells: [*]u64 = @ptrCast(g.cellPtr(g.cursor.row, 0));
         // The template id is fetched again after `printCodepoint`, which
         // may intern a new (erase) style and so compact the table. Ghost
         // text writes no cells and interns nothing here.
         var bits: u64 = if (paint) @bitCast(Cell{ .codepoint = 0, .style = self.penId() }) else 0;
-        // Cursor column and REP's character live in locals for the loop
-        // (cell stores through `row_cells` could alias `self`) and are
-        // written back before `printCodepoint` and on return. The fast
-        // path never reaches the last column: a character that would
-        // (or a pending wrap: `limit` 0) takes `printCodepoint`, so
-        // `wrap_pending` stays false here and is never written.
+        // The cursor column lives in a local for the loop (cell stores
+        // through `row_cells` could alias `self`) and is written back
+        // before any call and on return. The fast path never reaches the
+        // last column: a character that would (or a pending wrap: `limit`
+        // 0) takes `printCodepoint`, so `wrap_pending` stays false here
+        // and is never written.
         var col = g.cursor.col;
         var limit: u16 = if (g.wrap_pending) 0 else cols;
-        var last = self.last_cp;
-        // Column at the last flush: cells `[seg, col)` are new since then.
+        // Column at the last sync: cells `[seg, col)` are new since then,
+        // printed from this chunk, and when there are any the code point
+        // before the current one is the open cluster's base and REP's
+        // character (`last_cp`). Each chunk ends synced, so the loop keeps
+        // nothing else.
         var seg = col;
+        // Break class before the next code point (shaping only): what
+        // `alwaysBreaks` checks against.
+        var prev: Grapheme.Class = if (shaping and self.joinable()) self.join.lastProps().class else .control;
         while (true) {
             const r = SIMD.decodeUtf8Run(mode, bytes[i..], buf);
             i += r.read;
-            for (buf[0..r.written]) |cp| {
-                const v: u21 = @intCast(cp);
-                if (shaping and EastAsian.isCombining(v)) continue;
-                const w: u16 = @max(1, EastAsian.cellWidth(v));
-                if (col + w >= limit) {
+            const n = r.written;
+            var k: usize = 0;
+            chunk: while (k < n) {
+                for (buf[k..n], k..) |cp, at| {
+                    const v: u21 = @intCast(cp);
+                    const p = Grapheme.props(v);
+                    const w: u16 = p.width;
+                    const joins = if (shaping) w == 0 or !Grapheme.alwaysBreaks(prev, p.class) else w == 0;
+                    if (!joins and col + w < limit) {
+                        if (paint) {
+                            row_cells[col] = bits | v;
+                            if (w == 2) row_cells[col + 1] = bits;
+                        }
+                        col += w;
+                        if (shaping) prev = p.class;
+                        continue;
+                    }
                     g.cursor.col = col;
-                    self.last_cp = last;
-                    if (paint and col > seg) self.flushRow(col);
+                    if (col > seg) {
+                        self.syncPrinted(col, @intCast(buf[at - 1]), paint);
+                        seg = col;
+                    }
+                    if (!shaping and w == 0) {
+                        // Interning a cluster neither moves the cursor nor
+                        // changes style ids: the locals stay valid.
+                        var e = at + 1;
+                        while (e < n and Grapheme.props(@intCast(buf[e])).width == 0) e += 1;
+                        self.joinMarks(buf[at..e]);
+                        k = e;
+                        continue :chunk;
+                    }
                     self.printCodepoint(v);
                     g = self.grid();
                     row_cells = @ptrCast(g.cellPtr(g.cursor.row, 0));
                     if (paint) bits = @bitCast(Cell{ .codepoint = 0, .style = self.penId() });
                     col = g.cursor.col;
                     limit = if (g.wrap_pending) 0 else cols;
-                    last = self.last_cp;
                     seg = col;
-                    continue;
+                    if (shaping) prev = if (self.joinable()) self.join.lastProps().class else .control;
+                    k = at + 1;
+                    continue :chunk;
                 }
-                if (paint) {
-                    row_cells[col] = bits | v;
-                    if (w == 2) row_cells[col + 1] = bits;
-                }
-                col += w;
-                last = v;
+                break;
+            }
+            if (col > seg) {
+                g.cursor.col = col;
+                self.syncPrinted(col, @intCast(buf[n - 1]), paint);
+                seg = col;
             }
             if (r.done) break;
         }
-        g.cursor.col = col;
-        self.last_cp = last;
-        if (paint and col > seg) self.flushRow(col);
         return i;
+    }
+
+    /// The fast loop printed up to `col`, ending with `cp`: REP's
+    /// character, the open cluster, the written extent and dirty row.
+    inline fn syncPrinted(self: *VtState, col: u16, cp: u21, comptime paint: bool) void {
+        self.last_cp = cp;
+        self.joinLast(col, cp);
+        if (paint) self.flushRow(col);
+    }
+
+    /// The fast loop's last character `cp` ended at `col` (no pending wrap).
+    inline fn joinLast(self: *VtState, col: u16, cp: u21) void {
+        const w = Grapheme.props(cp).width;
+        self.startJoin(self.grid().cursor.row, col - w, col, false, w == 2, cp);
+    }
+
+    /// Start a cluster at `col` of `row` (the cursor is then at `cur_col`).
+    inline fn startJoin(self: *VtState, row: u16, col: u16, cur_col: u16, pending: bool, wide: bool, cp: u21) void {
+        self.join = .{
+            .ok = true,
+            .which = self.which,
+            .row = row,
+            .col = col,
+            .cur_col = cur_col,
+            .pending = pending,
+            .wide = wide,
+            .len = 1,
+            .base = cp,
+        };
+    }
+
+    /// The last printed cluster is still open: the cursor is where its
+    /// print left it and nothing but text and SGR came since.
+    pub inline fn joinable(self: *const VtState) bool {
+        const j = &self.join;
+        const g = self.gridConst();
+        return j.ok and j.which == self.which and g.cursor.row == j.row and g.cursor.col == j.cur_col and g.wrap_pending == j.pending;
+    }
+
+    /// Mode 2027 off: zero-width code points join the open cluster as they
+    /// come (VS15/VS16 only after an emoji base, as Ghostty); with none
+    /// open, or past `Clusters.max_len`, they are dropped. One intern for
+    /// the whole run.
+    fn joinMarks(self: *VtState, marks: []const u32) void {
+        if (!self.joinable()) return;
+        const j = &self.join;
+        const g = self.grid();
+        const slot = &g.cellPtr(j.row, j.col)[0];
+        var buf: [Clusters.max_len]u32 = undefined;
+        var n: usize = 0;
+        if (!self.ghost) {
+            var one: u32 = undefined;
+            const cur = self.styles.text(slot.*, &one);
+            n = @min(cur.len, buf.len);
+            @memcpy(buf[0..n], cur[0..n]);
+        }
+        const len0 = j.len;
+        var kept: u21 = 0;
+        for (marks) |m| {
+            const cp: u21 = @intCast(m);
+            if ((cp == 0xFE0E or cp == 0xFE0F) and Grapheme.props(j.base).class != .ext_pict) continue;
+            if (j.len >= Clusters.max_len) break;
+            j.len += 1;
+            kept = cp;
+            if (!self.ghost and n < buf.len) {
+                buf[n] = m;
+                n += 1;
+            }
+        }
+        if (j.len == len0) return;
+        // Without 2027 nothing reads the break state, and switching 2027
+        // (a CSI) ends the cluster; keep `last`/`state` defined anyway.
+        j.last = Grapheme.props(kept);
+        j.state = .{};
+        if (self.ghost) return;
+        slot.codepoint = self.styles.internCluster(buf[0..n]);
+        g.noteWrite(j.row, j.col + 1);
+        self.markDirty(j.row);
+    }
+
+    /// Mode 2027 on: `cp` continues the open cluster (no UAX #29 break).
+    /// Its width effect (`Grapheme.effect`) widens or narrows the cell as
+    /// Ghostty does: a narrow cluster at the last column that turns wide
+    /// moves to the next line (autowrap) or drops `cp` (no autowrap).
+    fn joinShaped(self: *VtState, cp: u21, p: Grapheme.Props) void {
+        const j = &self.join;
+        const eff = Grapheme.effect(j.lastProps(), cp, p);
+        if (eff == .ignore) return;
+        const widen = eff == .wide and !j.wide;
+        if (widen and j.col + 1 >= self.cols and (!self.flags.auto_wrap or self.cols < 2)) return;
+        // Set before `len` grows past 1, which makes them the ones read.
+        j.state = j.breakState().advance(p.class);
+        j.last = p;
+        if (j.len >= Clusters.max_len) return;
+        j.len += 1;
+        if (widen) {
+            self.widenJoin();
+        } else if (eff == .narrow and j.wide) {
+            self.narrowJoin();
+        }
+        if (self.ghost) return;
+        const g = self.grid();
+        const slot = &g.cellPtr(j.row, j.col)[0];
+        var buf: [Clusters.max_len]u32 = undefined;
+        var one: u32 = undefined;
+        const cur = self.styles.text(slot.*, &one);
+        const n: usize = @min(cur.len, buf.len - 1);
+        @memcpy(buf[0..n], cur[0..n]);
+        buf[n] = cp;
+        slot.codepoint = self.styles.internCluster(buf[0 .. n + 1]);
+        g.noteWrite(j.row, j.col + 1);
+        self.markDirty(j.row);
+    }
+
+    /// The open cluster becomes two cells wide.
+    fn widenJoin(self: *VtState) void {
+        const j = &self.join;
+        var g = self.grid();
+        if (j.col + 1 >= self.cols) {
+            // No room: blank its cell and print it again on the next line.
+            if (!self.ghost) {
+                const id = self.penId();
+                const slot = &g.cellPtr(j.row, j.col)[0];
+                const moved = slot.*;
+                slot.* = .{ .codepoint = ' ', .style = id };
+                g.cursor.col = j.col;
+                g.wrap_pending = false;
+                self.doWrap();
+                g = self.grid();
+                const row = g.cellPtr(g.cursor.row, 0);
+                row[0] = moved;
+                row[1] = .{ .codepoint = 0, .style = moved.style };
+                g.noteWrite(g.cursor.row, 2);
+                self.markDirty(g.cursor.row);
+            } else {
+                g.cursor.col = j.col;
+                g.wrap_pending = false;
+                self.doWrap();
+                g = self.grid();
+            }
+            j.row = g.cursor.row;
+            j.col = 0;
+        } else if (!self.ghost) {
+            const row = g.cellPtr(j.row, 0);
+            row[j.col + 1] = .{ .codepoint = 0, .style = row[j.col].style };
+            g.noteWrite(j.row, j.col + 2);
+            self.markDirty(j.row);
+        }
+        const end = j.col + 2;
+        if (end >= self.cols) {
+            g.cursor.col = self.cols - 1;
+            g.wrap_pending = self.flags.auto_wrap;
+        } else {
+            g.cursor.col = end;
+            g.wrap_pending = false;
+        }
+        j.ok = true;
+        j.wide = true;
+        j.cur_col = g.cursor.col;
+        j.pending = g.wrap_pending;
+    }
+
+    /// The open cluster becomes one cell wide; its second cell turns blank.
+    fn narrowJoin(self: *VtState) void {
+        const j = &self.join;
+        const g = self.grid();
+        if (!self.ghost and j.col + 1 < self.cols) {
+            const row = g.cellPtr(j.row, 0);
+            row[j.col + 1] = .{ .codepoint = ' ', .style = row[j.col].style };
+            self.markDirty(j.row);
+        }
+        g.cursor.col = @min(j.col + 1, self.cols - 1);
+        g.wrap_pending = false;
+        j.wide = false;
+        j.cur_col = g.cursor.col;
+        j.pending = false;
     }
 
     /// Record cells `[0, end)` of the cursor row as written and dirty.
@@ -640,6 +903,7 @@ pub const VtState = struct {
     pub fn resize(self: *VtState, cols: u16, rows: u16) !void {
         if (cols == 0 or rows == 0) return;
         if (cols == self.cols and rows == self.rows) return;
+        self.join.ok = false;
         const old_cols = self.cols;
         const old_rows = self.rows;
         try (&self.grids[0]).resize(self.allocator, old_cols, old_rows, cols, rows, self.grids[0].cap, true);
@@ -701,10 +965,31 @@ pub const VtState = struct {
         self.index();
     }
 
+    /// Print one code point: it joins the open cluster (`Join`) or starts
+    /// a cell. Mode 2027 off: zero-width code points join (`joinMarks`),
+    /// everything else takes its own width. Mode 2027 on: a code point
+    /// joins when UAX #29 has no break before it (`joinShaped`); a
+    /// zero-width one that breaks is dropped (as Ghostty does).
     pub fn printCodepoint(self: *VtState, cp: u21) void {
         const mapped = self.mapCp(cp);
-        if (self.flags.grapheme_shaping and EastAsian.isCombining(mapped)) return;
-        var width: u16 = @max(1, EastAsian.cellWidth(mapped));
+        const p = Grapheme.props(mapped);
+        if (self.flags.grapheme_shaping) {
+            if (self.joinable() and !Grapheme.breaks(self.join.breakState(), self.join.lastProps().class, p.class)) {
+                self.joinShaped(mapped, p);
+                return;
+            }
+            if (p.width == 0) return;
+        } else if (p.width == 0) {
+            const one = [1]u32{mapped};
+            self.joinMarks(&one);
+            return;
+        }
+        self.printCell(mapped, p);
+    }
+
+    /// `mapped` (width >= 1) in a new cell at the cursor.
+    fn printCell(self: *VtState, mapped: u21, p: Grapheme.Props) void {
+        var width: u16 = p.width;
         var g = self.grid();
 
         if (g.wrap_pending) {
@@ -746,6 +1031,7 @@ pub const VtState = struct {
             g.cellPtr(g.cursor.row, g.cursor.col + 1)[0] = .{ .codepoint = 0, .style = id };
         }
         self.markDirty(g.cursor.row);
+        const at = g.cursor.col;
         g.cursor.col += width;
         if (g.cursor.col >= self.cols) {
             g.cursor.col = self.cols - 1;
@@ -754,6 +1040,7 @@ pub const VtState = struct {
             g.wrap_pending = false;
         }
         self.last_cp = mapped;
+        self.startJoin(g.cursor.row, at, g.cursor.col, g.wrap_pending, width == 2, mapped);
     }
 
     /// Bulk `printCodepoint` for printable ASCII and space (0x20..0x7E: width 1, never
@@ -771,6 +1058,11 @@ pub const VtState = struct {
             return;
         }
         var rest = bytes;
+        // Mode 2027: ASCII only continues a cluster after Prepend (GB9b).
+        if (self.flags.grapheme_shaping and self.joinable() and self.join.lastProps().class == .prepend) {
+            self.printCodepoint(rest[0]);
+            rest = rest[1..];
+        }
         while (rest.len != 0) {
             const g = self.grid();
             if (g.wrap_pending or g.cursor.col >= self.cols) {
@@ -779,6 +1071,7 @@ pub const VtState = struct {
                 continue;
             }
             const n = @min(self.cols - g.cursor.col, rest.len);
+            const at = g.cursor.col + @as(u16, @intCast(n)) - 1;
             if (!self.ghost) {
                 const id = self.penId();
                 const cells = g.cellPtr(g.cursor.row, g.cursor.col)[0..n];
@@ -794,6 +1087,7 @@ pub const VtState = struct {
                 g.wrap_pending = false;
             }
             self.last_cp = rest[n - 1];
+            self.startJoin(g.cursor.row, at, g.cursor.col, g.wrap_pending, false, rest[n - 1]);
             rest = rest[n..];
         }
     }
@@ -1148,6 +1442,7 @@ pub const VtState = struct {
     }
 
     pub fn regionScrollUp(self: *VtState, n: u16) void {
+        self.join.ok = false;
         const g = self.grid();
         if (self.which == 0 and g.scroll_top == 0 and g.scroll_bottom + 1 == self.rows) {
             g.historyScrollUp(n, self.cols, self.rows);
@@ -1160,6 +1455,7 @@ pub const VtState = struct {
     }
 
     pub fn regionScrollDown(self: *VtState, n: u16) void {
+        self.join.ok = false;
         const g = self.grid();
         g.scrollDown(g.scroll_top, g.scroll_bottom, n, self.cols);
         self.markDirtyAll();
@@ -1359,6 +1655,7 @@ pub const VtState = struct {
         self.ss_active = false;
         self.flags.reverse_wrap = true;
         self.last_cp = ' ';
+        self.join.ok = false;
         self.resetPen();
         const g = self.grid();
         g.wrap_pending = false;
@@ -1895,6 +2192,7 @@ pub const VtState = struct {
     }
 
     fn setAlt(self: *VtState, on: bool, save: bool, wipe: bool) void {
+        self.join.ok = false;
         if (on) {
             if (self.which == 1) return;
             if (save) self.saveCursor();
@@ -1931,16 +2229,30 @@ pub const VtState = struct {
         while (y < self.rows) : (y += 1) {
             if (y != 0) try out.append(allocator, '\n');
             for (self.rowCells(y)) |c| {
-                const cp: u21 = if (c.codepoint == 0) ' ' else c.codepoint;
-                var buf: [4]u8 = undefined;
-                const n = std.unicode.utf8Encode(cp, &buf) catch {
-                    try out.append(allocator, '?');
-                    continue;
-                };
-                try out.appendSlice(allocator, buf[0..n]);
+                var one: u32 = undefined;
+                // A cluster is all its code points, in one cell.
+                for (self.styles.text(c, &one)) |v| {
+                    const cp: u21 = if (v == 0) ' ' else @intCast(v);
+                    var buf: [4]u8 = undefined;
+                    const n = std.unicode.utf8Encode(cp, &buf) catch {
+                        try out.append(allocator, '?');
+                        continue;
+                    };
+                    try out.appendSlice(allocator, buf[0..n]);
+                }
             }
         }
         return out.toOwnedSlice(allocator);
+    }
+
+    /// `U+XXXX` for a cell; a cluster as `U+XXXX+YYYY+...`.
+    fn cellName(self: *const VtState, c: Cell, buf: []u8) []const u8 {
+        var one: u32 = undefined;
+        var w: std.Io.Writer = .fixed(buf);
+        for (self.styles.text(c, &one), 0..) |v, i| {
+            w.print("{s}{X:0>4}", .{ if (i == 0) "U+" else "+", v }) catch break;
+        }
+        return w.buffered();
     }
 
     pub fn dumpCellsAlloc(self: *const VtState, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
@@ -1956,11 +2268,12 @@ pub const VtState = struct {
                 if (cellIsBlank(self.scheme, c, st)) continue;
                 var attr_buf: [9]u8 = undefined;
                 const attrs = attrLetters(st.attrs, &attr_buf);
-                var buf: [96]u8 = undefined;
-                const n = std.fmt.bufPrint(&buf, "{d} {d} U+{X:0>4} #{x:0>2}{x:0>2}{x:0>2} #{x:0>2}{x:0>2}{x:0>2} {s}\n", .{
+                var name_buf: [8 * Clusters.max_len]u8 = undefined;
+                var buf: [96 + name_buf.len]u8 = undefined;
+                const n = std.fmt.bufPrint(&buf, "{d} {d} {s} #{x:0>2}{x:0>2}{x:0>2} #{x:0>2}{x:0>2}{x:0>2} {s}\n", .{
                     y,
                     x,
-                    c.codepoint,
+                    self.cellName(c, &name_buf),
                     st.fg.r,
                     st.fg.g,
                     st.fg.b,
@@ -2439,17 +2752,6 @@ test "sgr underline color on cell" {
     try std.testing.expectEqual(@as(u8, 3), vt.styleOf(c).ul.b);
 }
 
-test "grapheme clustering skips combining" {
-    var dummy: [1]u8 = .{0};
-    var vt = try VtState.init(std.testing.allocator, 8, 1, 2, &dummy);
-    defer vt.deinit();
-    applyCsi(&vt, "\x1b[?2027h");
-    vt.printCodepoint('e');
-    vt.printCodepoint(0x0301);
-    try std.testing.expectEqual(@as(u16, 1), vt.grid().cursor.col);
-    try std.testing.expectEqual(@as(u21, 'e'), vt.grid().cellAt(0, 0).codepoint);
-    try std.testing.expectEqual(@as(u21, ' '), vt.grid().cellAt(0, 1).codepoint);
-}
 
 test "xtsmgraphics color registers" {
     var dummy: [1]u8 = .{0};
@@ -2827,11 +3129,14 @@ test "bulk UTF-8 printing matches printCodepoint" {
     };
 }
 
-/// Same characters and resolved styles (ids depend on interning order).
+/// Same characters (clusters by content) and resolved styles (ids depend
+/// on interning order).
 fn expectSameCells(va: *const VtState, want: []const Cell, vb: *const VtState, got: []const Cell) !void {
     try std.testing.expectEqual(want.len, got.len);
     for (want, got) |w, g| {
-        try std.testing.expectEqual(w.codepoint, g.codepoint);
+        var a: u32 = undefined;
+        var b: u32 = undefined;
+        try std.testing.expectEqualSlices(u32, va.styles.text(w, &a), vb.styles.text(g, &b));
         try std.testing.expectEqual(va.styleOf(w).key(), vb.styleOf(g).key());
     }
 }
@@ -3092,4 +3397,369 @@ test "skipDeadLine ends where feeding the dead line would" {
             try std.testing.expectEqual(b.grid().wrap_pending, a.grid().wrap_pending);
         }
     }
+}
+
+
+// ---------------------------------------------------------------- clusters
+
+/// A VT behind an exact ring: `feed` parses bytes like the app does.
+const TestTerm = struct {
+    ring: Ring.CircBuffer,
+    vt: VtState,
+
+    fn create(cols: u16, rows: u16) !*TestTerm {
+        const gpa = std.testing.allocator;
+        const t = try gpa.create(TestTerm);
+        errdefer gpa.destroy(t);
+        t.ring = try Ring.CircBuffer.create(gpa, 4096);
+        errdefer t.ring.destroy();
+        t.ring.exact = true;
+        t.vt = try VtState.init(gpa, cols, rows, 20, t.ring.storage);
+        return t;
+    }
+
+    fn destroy(t: *TestTerm) void {
+        t.vt.deinit();
+        t.ring.destroy();
+        std.testing.allocator.destroy(t);
+    }
+
+    fn feed(t: *TestTerm, bytes: []const u8) void {
+        var rest = bytes;
+        while (rest.len != 0) {
+            const n = @min(rest.len, 1024);
+            const at: usize = @intCast(t.ring.head & (t.ring.capacity - 1));
+            @memcpy(t.ring.storage[at..][0..n], rest[0..n]);
+            if (!t.ring.mapped) @memcpy(t.ring.storage[at + t.ring.capacity ..][0..n], rest[0..n]);
+            t.ring.head += n;
+            t.ring.drain(t.vt.sink());
+            rest = rest[n..];
+        }
+    }
+
+    /// The text of the cell at row/col (UTF-8; a spacer is "").
+    fn text(t: *TestTerm, row: u16, col: u16, buf: []u8) []const u8 {
+        var one: u32 = undefined;
+        var n: usize = 0;
+        const c = t.vt.cell(row, col);
+        if (c.codepoint == 0) return "";
+        for (t.vt.styles.text(c, &one)) |v| n += std.unicode.utf8Encode(@intCast(v), buf[n..]) catch unreachable;
+        return buf[0..n];
+    }
+
+    fn expectCell(t: *TestTerm, row: u16, col: u16, want: []const u8) !void {
+        var buf: [256]u8 = undefined;
+        const got = t.text(row, col, &buf);
+        if (!std.mem.eql(u8, want, got)) {
+            std.debug.print("cell {d},{d}: want {any} got {any}\n", .{ row, col, want, got });
+            return error.TestExpectedEqual;
+        }
+    }
+
+    fn expectCursor(t: *TestTerm, row: u16, col: u16, pending: bool) !void {
+        try std.testing.expectEqual(Cursor{ .row = row, .col = col }, t.vt.cursor());
+        try std.testing.expectEqual(pending, t.vt.grid().wrap_pending);
+    }
+};
+
+test "mode 2027 off: zero-width code points join the previous cell" {
+    const t = try TestTerm.create(8, 3);
+    defer t.destroy();
+    t.feed("e\u{301}\u{302}x");
+    try t.expectCell(0, 0, "e\u{301}\u{302}");
+    try t.expectCell(0, 1, "x");
+    try t.expectCursor(0, 2, false);
+    try std.testing.expect(t.vt.cell(0, 0).isCluster());
+    try std.testing.expect(!t.vt.cell(0, 1).isCluster());
+    // Nothing to join at the start of a line: dropped.
+    t.feed("\r\n\u{301}a");
+    try t.expectCell(1, 0, "a");
+    // Hangul V/T jamo are zero width; ZWJ joins, the next emoji is its own.
+    t.feed("\u{1100}\u{1161}\u{11a8}\u{1f468}\u{200d}\u{1f469}");
+    try t.expectCell(1, 1, "\u{1100}\u{1161}\u{11a8}");
+    try t.expectCell(1, 3, "\u{1f468}\u{200d}");
+    try t.expectCell(1, 4, "");
+    try t.expectCell(1, 5, "\u{1f469}");
+    try t.expectCursor(1, 7, false);
+    // VS16 only joins an emoji base, and changes no width here.
+    t.feed("\r\na\u{fe0f}\u{2764}\u{fe0f}b");
+    try t.expectCell(2, 0, "a");
+    try t.expectCell(2, 1, "\u{2764}\u{fe0f}");
+    try t.expectCell(2, 2, "b");
+}
+
+test "a cluster ends at any control, escape or cursor move, not at SGR" {
+    const t = try TestTerm.create(10, 4);
+    defer t.destroy();
+    t.feed("e\x1b[31m\u{301}");
+    try t.expectCell(0, 0, "e\u{301}");
+    try t.expectCursor(0, 1, false);
+    // Moved away and back: the cluster is closed.
+    t.feed("\x1b[D\x1b[C\u{302}");
+    try t.expectCell(0, 0, "e\u{301}");
+    t.feed("a\r\x1b[2C\u{302}");
+    try t.expectCell(0, 1, "a");
+    t.feed("\x1b[H\x1b[?2027hb\x1b[1m\u{301}\x1b[?2027l\u{302}");
+    try t.expectCell(0, 0, "b\u{301}");
+    // A direct cursor move (no parser in between) is noticed too.
+    t.vt.printCodepoint('q');
+    t.vt.cup(3, 3);
+    t.vt.printCodepoint(0x301);
+    try t.expectCell(0, 1, "q");
+    try t.expectCell(2, 2, " ");
+}
+
+test "a mark at the last column joins the cell under the pending wrap" {
+    const t = try TestTerm.create(4, 3);
+    defer t.destroy();
+    t.feed("abcd\u{301}");
+    try t.expectCell(0, 3, "d\u{301}");
+    try t.expectCursor(0, 3, true);
+    t.feed("e");
+    try t.expectCell(1, 0, "e");
+    // Same with 2027 and a cluster that stays narrow.
+    t.feed("\x1b[?2027h\r\nwxyz\u{301}\u{302}");
+    try t.expectCell(2, 3, "z\u{301}\u{302}");
+    try t.expectCursor(2, 3, true);
+}
+
+test "mode 2027: extended grapheme clusters and their widths" {
+    const t = try TestTerm.create(20, 6);
+    defer t.destroy();
+    t.feed("\x1b[?2027h");
+    // ZWJ sequence: one wide cell.
+    t.feed("\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}x");
+    try t.expectCell(0, 0, "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}");
+    try t.expectCell(0, 1, "");
+    try t.expectCell(0, 2, "x");
+    // Flags pair up; a third indicator starts a new cluster.
+    t.feed("\r\n\u{1f1fa}\u{1f1f8}\u{1f1eb}\u{1f1f7}\u{1f1e9}");
+    try t.expectCell(1, 0, "\u{1f1fa}\u{1f1f8}");
+    try t.expectCell(1, 2, "\u{1f1eb}\u{1f1f7}");
+    try t.expectCell(1, 4, "\u{1f1e9}");
+    try t.expectCursor(1, 6, false);
+    // Hangul L V T and LV T; skin tone modifier.
+    t.feed("\r\n\u{1100}\u{1161}\u{11a8}\u{ac00}\u{11a8}\u{1f44d}\u{1f3fd}");
+    try t.expectCell(2, 0, "\u{1100}\u{1161}\u{11a8}");
+    try t.expectCell(2, 2, "\u{ac00}\u{11a8}");
+    try t.expectCell(2, 4, "\u{1f44d}\u{1f3fd}");
+    try t.expectCursor(2, 6, false);
+    // VS16 widens a text-style emoji, VS15 narrows a wide one; a VS after
+    // a non-base is dropped.
+    t.feed("\r\n\u{2764}\u{fe0f}|\u{231a}\u{fe0e}|a\u{fe0f}|");
+    try t.expectCell(3, 0, "\u{2764}\u{fe0f}");
+    try t.expectCell(3, 1, "");
+    try t.expectCell(3, 2, "|");
+    try t.expectCell(3, 3, "\u{231a}\u{fe0e}");
+    try t.expectCell(3, 4, "|");
+    try t.expectCell(3, 5, "a");
+    try t.expectCell(3, 6, "|");
+    // Spacing mark (GB9a) and Prepend (GB9b) join and make the cluster wide
+    // (a code point with a width of its own, as Ghostty counts it).
+    t.feed("\r\n\u{915}\u{93f}|\u{600}1|");
+    try t.expectCell(4, 0, "\u{915}\u{93f}");
+    try t.expectCell(4, 2, "|");
+    try t.expectCell(4, 3, "\u{600}1");
+    try t.expectCell(4, 5, "|");
+    // GB9c: consonant + virama + consonant is one (wide) cluster.
+    t.feed("\r\n\u{915}\u{94d}\u{924}x");
+    try t.expectCell(5, 0, "\u{915}\u{94d}\u{924}");
+    try t.expectCell(5, 2, "x");
+}
+
+test "mode 2027: a cluster that turns wide at the margin moves to the next line" {
+    const t = try TestTerm.create(4, 3);
+    defer t.destroy();
+    t.feed("\x1b[?2027habc\u{2764}\u{fe0f}");
+    try t.expectCell(0, 3, " ");
+    try t.expectCell(1, 0, "\u{2764}\u{fe0f}");
+    try t.expectCell(1, 1, "");
+    try t.expectCursor(1, 2, false);
+    try std.testing.expect(t.vt.grid().wraps[t.vt.grid().lineIndex(0)] != 0);
+    // One column from the margin it fits, and the wrap is pending.
+    t.feed("\r\x1b[Kab\u{2764}\u{fe0f}");
+    try t.expectCell(1, 2, "\u{2764}\u{fe0f}");
+    try t.expectCursor(1, 3, true);
+    // Without autowrap the selector is dropped.
+    t.feed("\x1b[?7l\r\n\x1b[Kabc\u{2764}\u{fe0f}");
+    try t.expectCell(2, 3, "\u{2764}");
+    try t.expectCursor(2, 3, false);
+}
+
+test "cluster length is bounded" {
+    for ([_]bool{ false, true }) |shaping| {
+        const t = try TestTerm.create(8, 2);
+        defer t.destroy();
+        if (shaping) t.feed("\x1b[?2027h");
+        t.feed("e");
+        for (0..3 * Clusters.max_len) |_| t.feed("\u{301}");
+        t.feed("x");
+        var one: u32 = undefined;
+        const got = t.vt.styles.text(t.vt.cell(0, 0), &one);
+        try std.testing.expectEqual(@as(usize, Clusters.max_len), got.len);
+        try std.testing.expectEqual(@as(u32, 'e'), got[0]);
+        try t.expectCell(0, 1, "x");
+        try t.expectCursor(0, 2, false);
+    }
+}
+
+test "REP repeats a cluster's base character" {
+    const t = try TestTerm.create(8, 2);
+    defer t.destroy();
+    t.feed("e\u{301}\x1b[2b");
+    try t.expectCell(0, 0, "e\u{301}");
+    try t.expectCell(0, 1, "e");
+    try t.expectCell(0, 2, "e");
+    try t.expectCursor(0, 3, false);
+}
+
+test "insert, delete, erase and reflow keep clusters in their cells" {
+    const t = try TestTerm.create(6, 4);
+    defer t.destroy();
+    t.feed("ae\u{301}b\x1b[H\x1b[2@");
+    try t.expectCell(0, 3, "e\u{301}");
+    t.feed("\x1b[P");
+    try t.expectCell(0, 2, "e\u{301}");
+    t.feed("\x1b[1;2H\x1b[X");
+    try t.expectCell(0, 2, "e\u{301}");
+    t.feed("\r\nabcde\u{301}fgh");
+    try t.expectCell(1, 4, "e\u{301}");
+    try t.vt.resize(10, 4);
+    try t.expectCell(1, 4, "e\u{301}");
+    try t.expectCell(1, 7, "h");
+    try t.vt.resize(3, 6);
+    const dump = try t.vt.dumpAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(dump);
+    try std.testing.expect(std.mem.indexOf(u8, dump, "abc\nde\u{301}f\ngh") != null);
+    // Scrolled into history and back: same cell.
+    t.feed("\r\n\n\n\n\n\n");
+    try t.vt.resize(10, 4);
+    t.vt.viewScroll(10);
+    var found = false;
+    var r: u16 = 0;
+    while (r < 4) : (r += 1) {
+        var buf: [64]u8 = undefined;
+        if (std.mem.eql(u8, t.text(r, 4, &buf), "e\u{301}")) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "GraphemeBreakTest.txt clusters print as one cell each (mode 2027)" {
+    const Table = @import("type/grapheme_table.zig");
+    const gpa = std.testing.allocator;
+    var dummy: [1]u8 = .{0};
+    var checked: usize = 0;
+    cases: for (Table.break_tests) |case| {
+        // Controls are not printed, and a cluster that starts with a
+        // zero-width code point is dropped (nothing to join): skip those.
+        for (case) |v| {
+            const p = Grapheme.props(@intCast(v & 0x1FFFFF));
+            if (p.class == .control or p.class == .cr or p.class == .lf) continue :cases;
+            if (v & 0x8000_0000 != 0 and p.width == 0) continue :cases;
+        }
+        var vt = try VtState.init(gpa, 200, 1, 1, &dummy);
+        defer vt.deinit();
+        vt.flags.grapheme_shaping = true;
+        for (case) |v| vt.printCodepoint(@intCast(v & 0x1FFFFF));
+        // Expected cells: each cluster without the selectors it ignores.
+        var col: u16 = 0;
+        var i: usize = 0;
+        while (i < case.len) {
+            var want: [64]u32 = undefined;
+            var n: usize = 0;
+            var prev: Grapheme.Props = undefined;
+            var j = i;
+            while (j < case.len and (j == i or case[j] & 0x8000_0000 == 0)) : (j += 1) {
+                const cp: u21 = @intCast(case[j] & 0x1FFFFF);
+                const p = Grapheme.props(cp);
+                if (j != i and Grapheme.effect(prev, cp, p) == .ignore) continue;
+                want[n] = cp;
+                n += 1;
+                prev = p;
+            }
+            var one: u32 = undefined;
+            const c = vt.cell(0, col);
+            try std.testing.expectEqualSlices(u32, want[0..n], vt.styles.text(c, &one));
+            col += 1;
+            if (col < 200 and vt.cell(0, col).codepoint == 0) col += 1;
+            i = j;
+        }
+        try std.testing.expectEqual(col, vt.cursor().col);
+        checked += 1;
+    }
+    try std.testing.expect(checked > 300);
+}
+
+test "a tiny cluster table compacts often and every cell keeps its cluster" {
+    const pieces = [_][]const u8{
+        "e\u{301}", "a\u{302}\u{303}", "\u{1f468}\u{200d}\u{1f469}", "x", " ", "\r\n", "\n", "\x1b[2J", "\x1b[H", "\x1b[3@",
+        "\x1b[2P", "\x1b[K", "\x1b[?1049h", "\x1b[?1049l", "\x1b[?2027h", "\x1b[?2027l", "\u{2764}\u{fe0f}", "\u{1f1fa}\u{1f1f8}",
+        "\x1b[31m", "\x1b[S", "\x1b[T", "\x1b[3b", "\x1b[2J\x1b[3J", "\x1b[2J\x1b[3J",
+    };
+    var prng = std.Random.DefaultPrng.init(5);
+    const rand = prng.random();
+    for (0..6) |_| {
+        const a = try TestTerm.create(13, 6);
+        defer a.destroy();
+        const b = try TestTerm.create(13, 6);
+        defer b.destroy();
+        a.vt.styles.clusters.limit = 4;
+        var gens: u32 = 0;
+        for (0..1500) |step| {
+            var buf: [16]u8 = undefined;
+            // Mostly fresh clusters: a base and up to three random marks.
+            const piece = if (rand.uintLessThan(u8, 2) == 0) blk: {
+                var n: usize = 0;
+                buf[n] = 'a' + rand.uintLessThan(u8, 26);
+                n += 1;
+                for (0..1 + rand.uintLessThan(u8, 3)) |_| n += std.unicode.utf8Encode(0x300 + rand.uintLessThan(u21, 0x70), buf[n..]) catch unreachable;
+                break :blk buf[0..n];
+            } else pieces[rand.uintLessThan(usize, pieces.len)];
+            const gen = a.vt.styles.gen;
+            a.feed(piece);
+            b.feed(piece);
+            if (a.vt.styles.gen != gen) gens += 1;
+            if (step % 211 == 210) {
+                const cols: u16 = @intCast(8 + rand.uintLessThan(u16, 10));
+                try a.vt.resize(cols, 6);
+                try b.vt.resize(cols, 6);
+            }
+            for (0..2) |k| try expectSameCells(&b.vt, b.vt.grids[k].cells, &a.vt, a.vt.grids[k].cells);
+            try std.testing.expect(a.vt.styles.clusters.spans.items.len <= a.vt.styles.clusters.limit);
+        }
+        try std.testing.expect(gens > 10);
+    }
+}
+
+test "vt fixtures stay byte-identical" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var dir = std.Io.Dir.cwd().openDir(io, "tests/vt", .{ .iterate = true }) catch return error.SkipZigTest;
+    defer dir.close(io);
+    var it = dir.iterate();
+    var n: usize = 0;
+    while (try it.next(io)) |entry| {
+        if (!std.mem.endsWith(u8, entry.name, ".in")) continue;
+        const raw = try dir.readFileAlloc(io, entry.name, gpa, .unlimited);
+        defer gpa.free(raw);
+        const nl = std.mem.indexOfScalar(u8, raw, '\n') orelse return error.InvalidFixture;
+        var dims = std.mem.tokenizeScalar(u8, raw[0..nl], ' ');
+        const cols = try std.fmt.parseInt(u16, dims.next().?, 10);
+        const rows = try std.fmt.parseInt(u16, dims.next().?, 10);
+        const t = try TestTerm.create(cols, rows);
+        defer t.destroy();
+        t.feed(raw[nl + 1 ..]);
+        const stem = entry.name[0 .. entry.name.len - 3];
+        for ([_][]const u8{ ".dump", ".cells" }) |ext| {
+            var name_buf: [128]u8 = undefined;
+            const name = try std.fmt.bufPrint(&name_buf, "{s}{s}", .{ stem, ext });
+            const want = try dir.readFileAlloc(io, name, gpa, .unlimited);
+            defer gpa.free(want);
+            const got = if (ext[1] == 'd') try t.vt.dumpAlloc(gpa) else try t.vt.dumpCellsAlloc(gpa);
+            defer gpa.free(got);
+            try std.testing.expectEqualStrings(std.mem.trimEnd(u8, want, "\n"), std.mem.trimEnd(u8, got, "\n"));
+        }
+        n += 1;
+    }
+    try std.testing.expect(n >= 5);
 }

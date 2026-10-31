@@ -85,15 +85,117 @@ pub const Style = packed struct(u128) {
 /// any other entry, so it is not always `Style{}`).
 pub const StyleId = u32;
 
-/// 8 bytes: the character and its interned style. A wide character's
-/// second cell holds codepoint 0.
+/// `Cell.codepoint` values from here up are not code points (those end at
+/// U+10FFFF) but grapheme clusters: `cluster_base + id` in `Clusters`. So
+/// the "is a cluster" flag is the codepoint field being out of Unicode's
+/// range, and compares against real code points (`' '`, 0, < 0x20) never
+/// match a cluster.
+pub const cluster_base: u21 = 0x110000;
+
+/// 8 bytes: the character (or cluster) and its interned style. A wide
+/// character's second cell holds codepoint 0.
 pub const Cell = packed struct(u64) {
     codepoint: u21 = ' ',
     _pad: u11 = 0,
     style: StyleId = 0,
+
+    /// `codepoint` is a cluster id (see `cluster_base`).
+    pub inline fn isCluster(c: Cell) bool {
+        return c.codepoint >= cluster_base;
+    }
 };
 
-/// Interned styles shared by both grids of a terminal. The pen interns its
+/// Interned multi-codepoint grapheme clusters, deduplicated by content and
+/// shared by both grids (owned by `Styles`, which has the roots and `gen`).
+/// A cell whose character is more than one code point holds
+/// `cluster_base + id`; a single code point stays in the cell itself.
+/// Entries never change; ids are renumbered only by
+/// `Styles.compactClusters` (every id in a cell of either ring is kept and
+/// rewritten, the rest dropped, `gen` bumped), so an id a cell holds is
+/// never reused.
+pub const Clusters = struct {
+    /// Code points of every entry, back to back.
+    cps: std.ArrayListUnmanaged(u32) = .empty,
+    /// Per id: its code points in `cps`.
+    spans: std.ArrayListUnmanaged(Span) = .empty,
+    /// Ids, keyed by content.
+    map: std.HashMapUnmanaged(u32, void, IdContext, 80) = .empty,
+    limit: u32 = default_limit,
+
+    /// Longest cluster stored; printing drops code points past it.
+    pub const max_len = 32;
+    pub const default_limit: u32 = 1 << 12;
+    /// Ids fit in the code point field above `cluster_base`.
+    pub const max_ids: u32 = (1 << 21) - @as(u32, cluster_base);
+    /// `hash` is the content's: growing or rebuilding the map rehashes no
+    /// code points.
+    const Span = struct { off: u32, len: u32, hash: u64 };
+
+    const IdContext = struct {
+        c: *const Clusters,
+        pub fn hash(self: IdContext, id: u32) u64 {
+            return self.c.spans.items[id].hash;
+        }
+        pub fn eql(_: IdContext, a: u32, b: u32) bool {
+            return a == b;
+        }
+    };
+
+    /// Looks up content whose hash `h` is already computed.
+    const SliceContext = struct {
+        c: *const Clusters,
+        h: u64,
+        pub fn hash(self: SliceContext, _: []const u32) u64 {
+            return self.h;
+        }
+        pub fn eql(self: SliceContext, s: []const u32, id: u32) bool {
+            return std.mem.eql(u32, s, self.c.get(id));
+        }
+    };
+
+    fn hashCps(s: []const u32) u64 {
+        return std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(s));
+    }
+
+    pub fn deinit(self: *Clusters, allocator: std.mem.Allocator) void {
+        self.cps.deinit(allocator);
+        self.spans.deinit(allocator);
+        self.map.deinit(allocator);
+    }
+
+    /// The code points of cluster `id`.
+    pub inline fn get(self: *const Clusters, id: u32) []const u32 {
+        const s = self.spans.items[id];
+        return self.cps.items[s.off..][0..s.len];
+    }
+
+    /// The id of `s` (2..max_len code points), added if new; null when out
+    /// of memory or ids. `Styles.internCluster` compacts first when full.
+    fn intern(self: *Clusters, allocator: std.mem.Allocator, s: []const u32) ?u32 {
+        const n = self.spans.items.len;
+        const h = hashCps(s);
+        const key: SliceContext = .{ .c = self, .h = h };
+        if (n >= max_ids) return self.map.getKeyAdapted(s, key);
+        self.cps.ensureUnusedCapacity(allocator, s.len) catch return null;
+        self.spans.ensureUnusedCapacity(allocator, 1) catch return null;
+        const gop = self.map.getOrPutContextAdapted(allocator, s, key, IdContext{ .c = self }) catch return null;
+        if (gop.found_existing) return gop.key_ptr.*;
+        const id: u32 = @intCast(n);
+        self.spans.appendAssumeCapacity(.{ .off = @intCast(self.cps.items.len), .len = @intCast(s.len), .hash = h });
+        self.cps.appendSliceAssumeCapacity(s);
+        gop.key_ptr.* = id;
+        return id;
+    }
+
+    fn rebuildMap(self: *Clusters, allocator: std.mem.Allocator) void {
+        self.map.clearRetainingCapacity();
+        // The map only deduplicates: an entry it misses gets a twin later.
+        for (0..self.spans.items.len) |i| self.map.putContext(allocator, @intCast(i), {}, IdContext{ .c = self }) catch break;
+    }
+};
+
+/// Interned styles (and, in `clusters`, grapheme clusters) shared by both
+/// grids of a terminal. The pen interns its
 /// style when it prints (a small memo of recent interns makes that a
 /// compare while the pen and the erase style do not change); erase paths
 /// intern the erase style.
@@ -124,6 +226,8 @@ pub const Styles = struct {
     last: Entry = no_entry,
     /// The cell buffers whose ids `compact` keeps and rewrites, one per grid.
     roots: [2]Root = .{ .{}, .{} },
+    /// Grapheme clusters the cells refer to (same roots and `gen`).
+    clusters: Clusters = .{},
 
     pub const default_limit: u32 = 1 << 16;
     const cache_bits = 5;
@@ -147,7 +251,72 @@ pub const Styles = struct {
         const allocator = self.allocator;
         self.list.deinit(allocator);
         self.map.deinit(allocator);
+        self.clusters.deinit(allocator);
         allocator.destroy(self);
+    }
+
+    /// The code points a cell shows: its cluster's, or its own (put in
+    /// `one`).
+    pub inline fn text(self: *const Styles, c: Cell, one: *u32) []const u32 {
+        if (c.isCluster()) return self.clusters.get(c.codepoint - cluster_base);
+        one.* = c.codepoint;
+        return @as(*const [1]u32, one);
+    }
+
+    /// The first code point of a cell (a cluster's base).
+    pub inline fn base(self: *const Styles, c: Cell) u21 {
+        if (!c.isCluster()) return c.codepoint;
+        return @intCast(self.clusters.get(c.codepoint - cluster_base)[0]);
+    }
+
+    /// The codepoint field for `cps`: the code point itself when there is
+    /// one, else an interned cluster (compacting the table when it is
+    /// full). Falls back to the first code point when clusters run out.
+    pub fn internCluster(self: *Styles, cps: []const u32) u21 {
+        if (cps.len == 1) return @intCast(cps[0]);
+        const c = &self.clusters;
+        if (c.spans.items.len >= c.limit) self.compactClusters();
+        const id = c.intern(self.allocator, cps) orelse return @intCast(cps[0]);
+        return cluster_base + @as(u21, @intCast(id));
+    }
+
+    /// `compact` for clusters: drop every entry no cell refers to and
+    /// renumber the rest in order. Bumps `gen`.
+    pub fn compactClusters(self: *Styles) void {
+        const allocator = self.allocator;
+        const c = &self.clusters;
+        const n = c.spans.items.len;
+        var live = std.DynamicBitSetUnmanaged.initEmpty(allocator, n) catch return;
+        defer live.deinit(allocator);
+        const remap = allocator.alloc(u21, n) catch return;
+        defer allocator.free(remap);
+        for (self.roots) |root| {
+            for (root.cells) |cell| {
+                if (cell.isCluster()) live.set(cell.codepoint - cluster_base);
+            }
+        }
+        var next: u32 = 0;
+        var off: u32 = 0;
+        for (0..n) |i| {
+            if (!live.isSet(i)) continue;
+            const s = c.spans.items[i];
+            remap[i] = @intCast(next);
+            // Survivors keep their order, so this only moves data down.
+            std.mem.copyForwards(u32, c.cps.items[off..][0..s.len], c.cps.items[s.off..][0..s.len]);
+            c.spans.items[next] = .{ .off = off, .len = s.len, .hash = s.hash };
+            off += s.len;
+            next += 1;
+        }
+        c.spans.shrinkRetainingCapacity(next);
+        c.cps.shrinkRetainingCapacity(off);
+        for (self.roots) |root| {
+            for (root.cells) |*cell| {
+                if (cell.isCluster()) cell.codepoint = cluster_base + remap[cell.codepoint - cluster_base];
+            }
+        }
+        c.rebuildMap(allocator);
+        if (next * 2 > c.limit) c.limit = @min(c.limit * 2, Clusters.max_ids);
+        self.gen +%= 1;
     }
 
     pub inline fn get(self: *const Styles, id: StyleId) Style {
@@ -1046,4 +1215,34 @@ test "the style limit grows when every id is live" {
     for (g.cells, 0..) |*c, i| c.* = .{ .codepoint = 'x', .style = styles.intern(.{ .fg = @bitCast(@as(u32, @intCast(i + 1))) }) };
     for (g.cells, 0..) |c, i| try std.testing.expectEqual(@as(u32, @intCast(i + 1)), @as(u32, @bitCast(styles.of(c).fg)));
     try std.testing.expect(styles.limit >= 101);
+}
+
+test "cluster compaction keeps live ids' content, drops dead ones and bumps gen" {
+    const gpa = std.testing.allocator;
+    const styles = try Styles.create(gpa);
+    defer styles.destroy();
+    var g = try Grid.init(gpa, 4, 2, 3, styles, 0);
+    defer g.deinit(gpa);
+    const ab = [_]u32{ 'a', 0x301 };
+    const bc = [_]u32{ 'b', 0x302 };
+    const cd = [_]u32{ 'c', 0x303 };
+    const x = styles.internCluster(&ab);
+    const y = styles.internCluster(&bc);
+    const z = styles.internCluster(&cd);
+    try std.testing.expectEqual(x, styles.internCluster(&ab));
+    try std.testing.expect(x >= cluster_base and y != x and z != y);
+    // Only the second and third are in cells; the first dies.
+    g.cells[1].codepoint = y;
+    g.cells[6].codepoint = z;
+    const gen = styles.gen;
+    styles.compactClusters();
+    try std.testing.expect(styles.gen != gen);
+    try std.testing.expectEqual(@as(usize, 2), styles.clusters.spans.items.len);
+    var one: u32 = undefined;
+    try std.testing.expectEqualSlices(u32, &bc, styles.text(g.cells[1], &one));
+    try std.testing.expectEqualSlices(u32, &cd, styles.text(g.cells[6], &one));
+    // The dead content interns as a new entry; live ones still dedupe.
+    try std.testing.expectEqual(g.cells[6].codepoint, styles.internCluster(&cd));
+    try std.testing.expectEqual(@as(u21, cluster_base + 2), styles.internCluster(&ab));
+    try std.testing.expectEqual(@as(u21, 'q'), styles.internCluster(&[_]u32{'q'}));
 }

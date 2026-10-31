@@ -133,7 +133,8 @@ const Pair = struct {
     fn rowText(buf: []u8, cells: []const Cell) []const u8 {
         var n: usize = 0;
         for (cells) |c| {
-            const cp: u21 = if (c.codepoint < 0x20) '?' else c.codepoint;
+            // A cluster shows as its base.
+            const cp: u21 = if (c.codepoint < 0x20 or c.isCluster()) '?' else c.codepoint;
             n += std.unicode.utf8Encode(cp, buf[n..]) catch blk: {
                 buf[n] = '?';
                 break :blk 1;
@@ -144,13 +145,19 @@ const Pair = struct {
 
     fn cellStr(buf: []u8, vt: *const VtState, c: Cell) []const u8 {
         const st = vt.styleOf(c);
-        return std.fmt.bufPrint(buf, "U+{X:0>4} fg={d},{d},{d} bg={d},{d},{d} attrs=0x{x}", .{ c.codepoint, st.fg.r, st.fg.g, st.fg.b, st.bg.r, st.bg.g, st.bg.b, @as(u16, @bitCast(st.attrs)) }) catch "?";
+        var single: u32 = undefined;
+        const cps = vt.styles.text(c, &single);
+        return std.fmt.bufPrint(buf, "U+{X:0>4} (+{d} more) fg={d},{d},{d} bg={d},{d},{d} attrs=0x{x}", .{ cps[0], cps.len - 1, st.fg.r, st.fg.g, st.fg.b, st.bg.r, st.bg.g, st.bg.b, @as(u16, @bitCast(st.attrs)) }) catch "?";
     }
 
-    /// Same character and same resolved style (the two terminals intern
-    /// styles in different orders, so ids differ).
+    /// Same character (a cluster by its code points: ids differ with
+    /// interning order) and same resolved style (likewise).
     fn cellEql(va: *const VtState, ca: Cell, vb: *const VtState, cb: Cell) bool {
-        return ca.codepoint == cb.codepoint and va.styleOf(ca).key() == vb.styleOf(cb).key();
+        if (va.styleOf(ca).key() != vb.styleOf(cb).key()) return false;
+        if (!ca.isCluster() and !cb.isCluster()) return ca.codepoint == cb.codepoint;
+        var a: u32 = undefined;
+        var b: u32 = undefined;
+        return std.mem.eql(u32, va.styles.text(ca, &a), vb.styles.text(cb, &b));
     }
 
     fn rowEql(va: *const VtState, ra: []const Cell, vb: *const VtState, rb: []const Cell) bool {
@@ -737,6 +744,8 @@ test "text longer than the ring with scrolling" {
 const text_pieces = [_][]const u8{
     "hello",  " world", "A",  "X",   "0123456789012345678901234567890", "wörld", "旦海", "😀", "e\u{301}",
     "\r\n",   "\n",     "\r", "\n",  "\r\n",                            "\x08",   "\t",   "\x0b", "\x0c",
+    // grapheme clusters: a lone mark joins whatever came before
+    "\u{302}", "\u{1f468}\u{200d}\u{1f469}", "\u{2764}\u{fe0f}", "\u{1f1fa}\u{1f1f8}", "\u{1100}\u{1161}\u{11a8}",
 };
 
 const ctl_pieces = [_][]const u8{
@@ -750,6 +759,7 @@ const ctl_pieces = [_][]const u8{
     // SGR
     "\x1b[1m",      "\x1b[31m",    "\x1b[0m",      "\x1b[m",     "\x1b[38;2;1;2;3m",  "\x1b[48;5;100m",   "\x1b[4:3m",         "\x1b[7m",
     // modes
+    "\x1b[?2027h", "\x1b[?2027l",
     "\x1b[?7l",     "\x1b[?7h",    "\x1b[?6h",     "\x1b[?6l",   "\x1b[?25l",         "\x1b[?25h",        "\x1b[?1h",          "\x1b[?1l",   "\x1b[4h",
     "\x1b[4l",      "\x1b[?1s",    "\x1b[?1r",     "\x1b[?2004h", "\x1b[?5h",         "\x1b[?5l",         "\x1b[?47h",         "\x1b[?47l",  "\x1b[?1047h",
     "\x1b[?1047l",  "\x1b[?1049h", "\x1b[?1049l",  "\x1b[?1049h", "\x1b[?1049l",      "\x1b[?1070l",      "\x1b[?1070h",       "\x1b[3 q",   "\x1b[?1000h",

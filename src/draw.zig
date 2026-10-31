@@ -7,6 +7,81 @@ const Type = @import("type.zig");
 const Box = @import("draw/box.zig");
 const Select = @import("select.zig");
 const Debug = @import("debug.zig");
+const Grapheme = @import("type/grapheme.zig");
+
+/// The glyph to draw for a cluster's first code point: Hangul L V (T)
+/// jamo and LV + T compose into their precomposed syllable (the fonts have
+/// no shaping here); everything else is its first code point.
+fn clusterBase(cps: []const u32) u21 {
+    const first: u21 = @intCast(cps[0]);
+    if (cps.len >= 2) {
+        const second = cps[1];
+        const third: u32 = if (cps.len >= 3) cps[2] else 0;
+        const t: u32 = if (third > 0x11A7 and third <= 0x11C2) third - 0x11A7 else 0;
+        if (first >= 0x1100 and first <= 0x1112 and second >= 0x1161 and second <= 0x1175) {
+            return @intCast(0xAC00 + (@as(u32, first) - 0x1100) * 588 + (second - 0x1161) * 28 + t);
+        }
+        if (first >= 0xAC00 and first <= 0xD7A3 and (first - 0xAC00) % 28 == 0 and second > 0x11A7 and second <= 0x11C2) {
+            return @intCast(first + (second - 0x11A7));
+        }
+    }
+    return first;
+}
+
+/// A code point after a cluster's base that has ink of its own: marks and
+/// spacing marks, not joiners, selectors, tags or jamo already composed.
+fn drawnMark(cp: u21) bool {
+    if (cp == 0x200C or cp == 0x200D) return false;
+    if (cp >= 0xFE00 and cp <= 0xFE0F) return false;
+    if (cp >= 0xE0000) return false;
+    if (cp >= 0x1160 and cp <= 0x11FF) return false;
+    return switch (Grapheme.props(cp).class) {
+        .extend, .extend_incb, .extend_linker, .spacing_mark, .linker_spacing => true,
+        else => false,
+    };
+}
+
+/// A cluster cell (kept off the single-codepoint path): its base glyph
+/// (`clusterBase`), then, unless that is a color emoji (no shaping: an
+/// emoji ZWJ sequence, flag or modifier sequence shows its first emoji),
+/// its marks. A mark drawn left of its origin goes after the base, as fonts
+/// design them; one drawn right of it sits on the cell; spacing marks
+/// follow the base.
+noinline fn drawCluster(self: *Frame, cps: []const u32, st: Term.Style, x0: u32, y0: u32, cell_w: u32, cell_h: u32, type_ctx: ?*Type.Context, size: f32, baseline: f32, fg: u32, bg: u32, clip: Clip) void {
+    const base = clusterBase(cps);
+    if (base >= 0x80 and Box.paint(self.pixels, self.width, self.height, @intCast(x0), @intCast(y0), cell_w, cell_h, fg, bg, .{ .x0 = clip.x0, .y0 = clip.y0, .x1 = clip.x1, .y1 = clip.y1 }, base, st.attrs.bold)) return;
+    const ctx = type_ctx orelse {
+        // No fonts: the box `blitLine` draws for any character.
+        if (clip.y0 <= @as(i32, @intCast(y0)) and clip.y1 >= @as(i32, @intCast(y0 + cell_h)) and cell_w > 2 and cell_h > 2) {
+            var y: u32 = 1;
+            while (y + 1 < cell_h) : (y += 1) @memset(self.pixels[(y0 + y) * self.width + x0 + 1 ..][0 .. cell_w - 2], fg);
+        }
+        return;
+    };
+    const face = Type.Style{ .bold = st.attrs.bold, .italic = st.attrs.italic };
+    const fx0: f32 = @floatFromInt(x0);
+    const first = ctx.peekGlyphStyled(base, size, face) orelse (ctx.ensureGlyphStyled(base, size, face) catch return);
+    const oy0: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(y0)) + baseline - first.bearing_y));
+    const ox0: i32 = @intFromFloat(@round(fx0 + first.bearing_x));
+    if (first.color) {
+        blitColorGlyph(self, first, ctx.color_atlas.pixels, ctx.color_atlas.width, ox0, oy0, clip);
+        return;
+    }
+    if (base != ' ') @call(.never_inline, blitGlyph, .{ self, first, ctx.atlas.pixels, ctx.atlas.width, ox0, oy0, fg, bg, clip });
+    var pen = fx0 + first.advance;
+    for (cps[1..]) |v| {
+        const cp: u21 = @intCast(v);
+        if (!drawnMark(cp)) continue;
+        const glyph = ctx.peekGlyphStyled(cp, size, face) orelse (ctx.ensureGlyphStyled(cp, size, face) catch continue);
+        if (glyph.color) continue;
+        const spacing = Grapheme.props(cp).width != 0;
+        const origin = if (spacing or glyph.bearing_x < 0) pen else fx0;
+        const ox: i32 = @intFromFloat(@round(origin + glyph.bearing_x));
+        const oy: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(y0)) + baseline - glyph.bearing_y));
+        @call(.never_inline, blitGlyph, .{ self, glyph, ctx.atlas.pixels, ctx.atlas.width, ox, oy, fg, bg, clip });
+        if (spacing) pen += glyph.advance;
+    }
+}
 
 const vec_len = std.simd.suggestVectorLength(u32) orelse 4;
 
@@ -539,7 +614,9 @@ fn blitLine(
         const fg = packColor(painted.fg);
         const bg = packColor(painted.bg);
         const x0 = @as(u32, c) * cell_w;
-        if (!(cell.codepoint >= 0x80 and Box.paint(
+        if (cell.isCluster()) {
+            drawCluster(self, styles.clusters.get(cell.codepoint - Term.cluster_base), st, x0, y0, cell_w, cell_h, type_ctx, size, baseline, fg, bg, clip);
+        } else if (!(cell.codepoint >= 0x80 and Box.paint(
             self.pixels,
             self.width,
             self.height,
@@ -566,6 +643,7 @@ fn blitLine(
                         if (glyph.color) {
                             blitColorGlyph(self, glyph, ctx.color_atlas.pixels, ctx.color_atlas.width, ox, oy, clip);
                         } else {
+                            // `drawCluster` calls it out of line.
                             blitGlyph(self, glyph, ctx.atlas.pixels, ctx.atlas.width, ox, oy, fg, bg, clip);
                         }
                     }
@@ -1257,4 +1335,37 @@ test "a compaction that hands a dead style's id to a new one repaints" {
     frame.render(&vt, 4, 4, null, 8);
     fresh.render(&vt, 4, 4, null, 8);
     try std.testing.expectEqualSlices(u32, fresh.pixels, frame.pixels);
+}
+
+test "a combining mark draws over its base cell" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const file = std.Io.Dir.openFileAbsolute(io, "/usr/share/fonts/TTF/DejaVuSansMono.ttf", .{}) catch return error.SkipZigTest;
+    defer file.close(io);
+    const n = try file.length(io);
+    const bytes = try a.alloc(u8, n);
+    defer a.free(bytes);
+    _ = try file.readPositionalAll(io, bytes, 0);
+    var ctx = try Type.Context.init(a, .{ .atlas_width = 256, .atlas_height = 256, .cache_capacity = 64 });
+    defer ctx.deinit();
+    _ = try ctx.addFont(bytes, .{});
+    var storage: [16]u8 = undefined;
+    var vt = try Term.VtState.init(a, 4, 1, 1, &storage);
+    defer vt.deinit();
+    vt.flags.cursor_visible = false;
+    var frame = try Frame.init(a, 4 * 10, 22);
+    defer frame.deinit();
+    // "e" and "e" + acute: the accent adds ink above the e, in its cell.
+    vt.feedText("ee\u{301}");
+    try std.testing.expect(vt.cell(0, 1).isCluster());
+    frame.render(&vt, 10, 22, &ctx, 16);
+    const bg = Frame.pack(vt.scheme.bg);
+    var ink: [2]u32 = .{ 0, 0 };
+    for (0..2) |c| {
+        for (0..22) |y| for (0..10) |x| {
+            if (frame.pixels[y * frame.width + c * 10 + x] != bg) ink[c] += 1;
+        };
+    }
+    try std.testing.expect(ink[0] > 0);
+    try std.testing.expect(ink[1] > ink[0]);
 }
