@@ -1088,9 +1088,14 @@ fn parseCli(argv: []const [*:0]const u8) Cli {
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {
+    // Debug builds check for leaks; release builds use libc malloc, which
+    // reuses freed large blocks (image transfers) instead of mapping and
+    // faulting in fresh pages for each one.
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    defer if (builtin.mode == .debug) {
+        _ = gpa.deinit();
+    };
+    const allocator = if (builtin.mode == .debug) gpa.allocator() else std.heap.c_allocator;
     var args_arena = std.heap.ArenaAllocator.init(allocator);
     defer args_arena.deinit();
     const args = try init.args.toSlice(args_arena.allocator());
@@ -1268,7 +1273,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             .fd = x_fd,
             .ctx = @ptrCast(&eloop),
             .tick = EventLoop.pump,
-        }) catch {
+        }, term.sink()) catch {
             hangup = true;
         };
 
@@ -1293,9 +1298,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
             &rows,
         );
 
-        if (circbuffer.pending()) {
-            const runs = circbuffer.consumeAndGetRuns(std.math.maxInt(usize));
-            if (runs.len != 0) term.feedRuns(runs);
+        circbuffer.drain(term.sink());
+        if (circbuffer.fed) {
+            circbuffer.fed = false;
             need_draw = true;
         }
         drainHost(&window, &term, allocator);
@@ -1308,6 +1313,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
         const hold_sync = term.flags.sync_output and sync_hold < hz;
         if (need_draw and !hold_sync) {
+            term.prepareImages();
             frame.renderSel(&term, cell_w, cell_h, type_ptr, size_px, eloop.sel);
             term.clearDirty();
             eloop.presenter.present(&window, &frame, padColor(&term));

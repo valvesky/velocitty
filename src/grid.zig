@@ -54,6 +54,23 @@ pub const Rgb = packed struct {
     b: u8 = 0,
 };
 
+/// `@memset` for cells: stores four 16-byte cells per 64-byte vector
+/// (a packed-struct `@memset` compiles to two scalar stores per cell).
+pub fn fillCells(dst: []Cell, value: Cell) void {
+    const bits: u128 = @bitCast(value);
+    const lo: u64 = @truncate(bits);
+    const hi: u64 = @truncate(bits >> 64);
+    const pat: @Vector(8, u64) = .{ lo, hi, lo, hi, lo, hi, lo, hi };
+    const words: [*]u64 = @ptrCast(dst.ptr);
+    const n = dst.len * 2;
+    var i: usize = 0;
+    while (i + 8 <= n) : (i += 8) words[i..][0..8].* = pat;
+    while (i < n) : (i += 2) {
+        words[i] = lo;
+        words[i + 1] = hi;
+    }
+}
+
 pub const Cell = packed struct {
     codepoint: u21 = ' ',
     attrs: Attrs = .{},
@@ -70,9 +87,22 @@ pub const Grid = struct {
     starts: []u32,
     /// 1 if this ring row continues onto the next (DECAWM soft wrap).
     wraps: []u8,
+    /// Per ring row: cells from `extent` to the row end all equal `tail`
+    /// (the blank the row was last cleared with), so clearing it again with
+    /// the same blank only needs `[0, extent)`. `full_extent`: unknown.
+    extent: []u16,
+    tail: []u128,
+    /// Cells per row.
+    width: u16,
+    /// Use `extent` to shorten whole-row clears (tests turn it off to
+    /// compare against clearing everything).
+    lazy_clear: bool = true,
     cap: u32,
     head: u32 = 0,
     used: u32,
+    /// Absolute line number of screen row 0; grows by one per line pushed
+    /// into history. The oldest kept line is `base - (used - rows)`.
+    base: u64 = 0,
     scroll: u32 = 0,
     cursor: Cursor = .{},
     /// Last-column flag (DECAWM delayed wrap). Cursor stays on the last cell.
@@ -103,11 +133,20 @@ pub const Grid = struct {
         const wraps = try allocator.alloc(u8, cap);
         errdefer allocator.free(wraps);
         @memset(wraps, 0);
+        const extent = try allocator.alloc(u16, cap);
+        errdefer allocator.free(extent);
+        @memset(extent, 0);
+        const tail = try allocator.alloc(u128, cap);
+        errdefer allocator.free(tail);
+        @memset(tail, @as(u128, @bitCast(Cell{})));
 
         return Grid{
             .cells = cells,
             .starts = starts,
             .wraps = wraps,
+            .extent = extent,
+            .tail = tail,
+            .width = cols,
             .cap = cap,
             .used = rows,
             .scroll_bottom = rows -| 1,
@@ -118,10 +157,37 @@ pub const Grid = struct {
         allocator.free(self.cells);
         allocator.free(self.starts);
         allocator.free(self.wraps);
+        allocator.free(self.extent);
+        allocator.free(self.tail);
+    }
+
+    pub const full_extent: u16 = std.math.maxInt(u16);
+
+    /// Every row may hold anything (after resize or a whole-grid recolor).
+    pub fn markAllWritten(self: *Grid) void {
+        @memset(self.extent, full_extent);
+    }
+
+    /// Cells `[0, end)` of `row` were written by a tracked writer.
+    pub inline fn noteWrite(self: *Grid, row: u16, end: u16) void {
+        const j = self.lineIndex(row);
+        if (self.extent[j] < end) self.extent[j] = end;
+    }
+
+    /// Replace the row-tracking arrays after the ring was rebuilt.
+    fn resizeTracking(self: *Grid, allocator: std.mem.Allocator, cap: u32) std.mem.Allocator.Error!void {
+        const extent = try allocator.alloc(u16, cap);
+        errdefer allocator.free(extent);
+        const tail = try allocator.alloc(u128, cap);
+        allocator.free(self.extent);
+        allocator.free(self.tail);
+        self.extent = extent;
+        self.tail = tail;
+        self.markAllWritten();
     }
 
     pub fn setRowWrap(self: *Grid, row: u16, wrapped: bool) void {
-        self.wraps[(self.head + row) % self.cap] = if (wrapped) 1 else 0;
+        self.wraps[self.lineIndex(row)] = if (wrapped) 1 else 0;
     }
 
     /// Compact the ring onto a new cell buffer. Scrollback is kept.
@@ -186,6 +252,7 @@ pub const Grid = struct {
             new_wraps[n] = self.wraps[src_idx];
         }
 
+        try self.resizeTracking(allocator, new_cap);
         allocator.free(self.cells);
         allocator.free(self.starts);
         allocator.free(self.wraps);
@@ -193,6 +260,7 @@ pub const Grid = struct {
         self.starts = new_starts;
         self.wraps = new_wraps;
         self.cap = new_cap;
+        self.width = new_cols;
         self.head = hist;
         self.used = hist + new_rows;
         self.scroll = @min(self.scroll, hist);
@@ -320,6 +388,7 @@ pub const Grid = struct {
             new_wraps[n] = out_wraps.items[src_row];
         }
 
+        try self.resizeTracking(allocator, new_cap);
         allocator.free(self.cells);
         allocator.free(self.starts);
         allocator.free(self.wraps);
@@ -327,6 +396,7 @@ pub const Grid = struct {
         self.starts = new_starts;
         self.wraps = new_wraps;
         self.cap = new_cap;
+        self.width = new_cols;
         const view = @min(view_top -| drop, keep -| @as(u32, new_rows));
         self.head = view;
         self.used = view + new_rows;
@@ -374,7 +444,11 @@ pub const Grid = struct {
     }
 
     pub fn reset(self: *Grid, cols: u16, rows: u16, scheme: Scheme) void {
-        @memset(self.cells, Cell{ .fg = scheme.fg, .bg = scheme.bg });
+        const blank = Cell{ .fg = scheme.fg, .bg = scheme.bg };
+        fillCells(self.cells, blank);
+        @memset(self.extent, 0);
+        @memset(self.tail, @as(u128, @bitCast(blank)));
+        self.width = cols;
         for (self.starts, 0..) |*s, i| {
             s.* = @intCast(i * cols);
         }
@@ -396,24 +470,42 @@ pub const Grid = struct {
         self.scroll_bottom = rows -| 1;
     }
 
+    /// Ring index of screen row `row` (< cap): a compare instead of `%`.
+    pub inline fn lineIndex(self: *const Grid, row: u32) u32 {
+        const i = self.head + row;
+        return if (i >= self.cap) i - self.cap else i;
+    }
+
+    /// Mutable cell: the row counts as fully written. Tracked writers use
+    /// `cellPtr` + `noteWrite` instead.
     pub inline fn getCell(self: *Grid, row: u16, col: u16) *Cell {
-        const line_idx = (self.head + row) % self.cap;
+        const line_idx = self.lineIndex(row);
+        self.extent[line_idx] = full_extent;
         return &self.cells[self.starts[line_idx] + col];
     }
 
+    /// Mutable cells of `row` from `col`, without marking the row; the
+    /// caller reports what it wrote with `noteWrite`.
+    pub inline fn cellPtr(self: *Grid, row: u16, col: u16) [*]Cell {
+        const line_idx = self.lineIndex(row);
+        return self.cells[self.starts[line_idx] + col ..].ptr;
+    }
+
     pub inline fn cellAt(self: *const Grid, row: u16, col: u16) Cell {
-        const line_idx = (self.head + row) % self.cap;
+        const line_idx = self.lineIndex(row);
         return self.cells[self.starts[line_idx] + col];
     }
 
+    /// Mutable row: it counts as fully written.
     pub inline fn rowSlice(self: *Grid, row: u16, cols: u16) []Cell {
-        const line_idx = (self.head + row) % self.cap;
+        const line_idx = self.lineIndex(row);
+        self.extent[line_idx] = full_extent;
         const off = self.starts[line_idx];
         return self.cells[off .. off + cols];
     }
 
     pub inline fn rowSliceConst(self: *const Grid, row: u16, cols: u16) []const Cell {
-        const line_idx = (self.head + row) % self.cap;
+        const line_idx = self.lineIndex(row);
         const off = self.starts[line_idx];
         return self.cells[off .. off + cols];
     }
@@ -438,8 +530,10 @@ pub const Grid = struct {
     pub fn historyScrollUp(self: *Grid, n: u16, cols: u16, rows: u16) void {
         var k: u16 = 0;
         while (k < n) : (k += 1) {
-            self.head = (self.head + 1) % self.cap;
+            self.head += 1;
+            if (self.head == self.cap) self.head = 0;
             if (self.used < self.cap) self.used += 1;
+            self.base += 1;
             if (rows != 0) {
                 self.clearRange(rows - 1, 0, cols);
                 self.setRowWrap(rows - 1, false);
@@ -462,7 +556,8 @@ pub const Grid = struct {
 
     /// Primary cell mutation primitive
     pub fn writeCell(self: *Grid, row: u16, col: u16, cp: u21) void {
-        const cell = self.getCell(row, col);
+        const cell = &self.cellPtr(row, col)[0];
+        self.noteWrite(row, col + 1);
         cell.* = .{
             .codepoint = cp,
             .attrs = self.attrs,
@@ -473,19 +568,31 @@ pub const Grid = struct {
 
     /// Clear cell range [start_col, end_col) on a given row
     pub fn clearRange(self: *Grid, row: u16, start_col: u16, end_col: u16) void {
-        const line_idx = (self.head + row) % self.cap;
+        const line_idx = self.lineIndex(row);
         const row_offset = self.starts[line_idx];
         const blank = self.blankCell();
-        @memset(self.cells[row_offset + start_col .. row_offset + end_col], blank);
+        const bits: u128 = @bitCast(blank);
+        if (start_col == 0 and end_col >= self.width) {
+            // A whole row: past `extent` it already holds this blank.
+            const ext = self.extent[line_idx];
+            const n = if (self.lazy_clear and self.tail[line_idx] == bits and ext != full_extent) @min(ext, end_col) else end_col;
+            fillCells(self.cells[row_offset .. row_offset + n], blank);
+            self.extent[line_idx] = 0;
+            self.tail[line_idx] = bits;
+            return;
+        }
+        fillCells(self.cells[row_offset + start_col .. row_offset + end_col], blank);
+        if (self.extent[line_idx] < end_col) self.extent[line_idx] = end_col;
     }
 
     /// Insert blank characters at row/col, shifting existing cells right
     pub fn insertCells(self: *Grid, row: u16, col: u16, count: u16, cols: u16) void {
         if (col >= cols) return;
-        const line_idx = (self.head + row) % self.cap;
+        const line_idx = self.lineIndex(row);
         const offset = self.starts[line_idx];
         const shift_count = @min(count, cols - col);
         const copy_len = cols - col - shift_count;
+        self.extent[line_idx] = full_extent;
 
         if (copy_len > 0) {
             std.mem.copyBackwards(
@@ -494,16 +601,17 @@ pub const Grid = struct {
                 self.cells[offset + col .. offset + col + copy_len],
             );
         }
-        @memset(self.cells[offset + col .. offset + col + shift_count], self.blankCell());
+        fillCells(self.cells[offset + col .. offset + col + shift_count], self.blankCell());
     }
 
     /// Delete characters at row/col, shifting remaining cells left
     pub fn deleteCells(self: *Grid, row: u16, col: u16, count: u16, cols: u16) void {
         if (col >= cols) return;
-        const line_idx = (self.head + row) % self.cap;
+        const line_idx = self.lineIndex(row);
         const offset = self.starts[line_idx];
         const del_count = @min(count, cols - col);
         const copy_len = cols - col - del_count;
+        self.extent[line_idx] = full_extent;
 
         if (copy_len > 0) {
             std.mem.copyForwards(
@@ -512,7 +620,7 @@ pub const Grid = struct {
                 self.cells[offset + col + del_count .. offset + cols],
             );
         }
-        @memset(self.cells[offset + cols - del_count .. offset + cols], self.blankCell());
+        fillCells(self.cells[offset + cols - del_count .. offset + cols], self.blankCell());
     }
 
     /// Scroll defined region up by n lines
@@ -528,6 +636,8 @@ pub const Grid = struct {
                 self.cells[self.starts[src_idx] .. self.starts[src_idx] + cols],
             );
             self.wraps[dst_idx] = self.wraps[src_idx];
+            self.extent[dst_idx] = self.extent[src_idx];
+            self.tail[dst_idx] = self.tail[src_idx];
         }
         var clear_row: u16 = @intCast(@as(u32, bottom) + 1 - count);
         while (clear_row <= bottom) : (clear_row += 1) {
@@ -548,6 +658,8 @@ pub const Grid = struct {
                 self.cells[self.starts[src_idx] .. self.starts[src_idx] + cols],
             );
             self.wraps[dst_idx] = self.wraps[src_idx];
+            self.extent[dst_idx] = self.extent[src_idx];
+            self.tail[dst_idx] = self.tail[src_idx];
             if (i == top + count) break;
         }
         var clear_row: u16 = top;
@@ -664,4 +776,17 @@ test "reflow keeps glyphs" {
     try g.resize(std.testing.allocator, 4, 2, 6, 3, 8, true);
     try std.testing.expectEqual(@as(u21, 'A'), g.cellAt(0, 0).codepoint);
     try std.testing.expectEqual(@as(u21, 'B'), g.cellAt(0, 1).codepoint);
+}
+
+test "fillCells matches memset" {
+    var a: [11]Cell = undefined;
+    var b: [11]Cell = undefined;
+    const v: Cell = .{ .codepoint = 'q', .fg = .{ .r = 1, .g = 2, .b = 3 }, .bg = .{ .r = 4, .g = 5, .b = 6 }, .ul = .{ .r = 7 } };
+    for (0..11) |n| {
+        @memset(&a, Cell{});
+        @memset(&b, Cell{});
+        @memset(a[0..n], v);
+        fillCells(b[0..n], v);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&a), std.mem.sliceAsBytes(&b));
+    }
 }

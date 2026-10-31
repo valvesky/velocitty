@@ -14,7 +14,7 @@ pub fn dispatch(vt: *Vt, byte: u8) void {
         0x0D => vt.carriageReturn(),
         0x0E => vt.gl = 1,
         0x0F => vt.gl = 0,
-        // Run splitter treats 0x20 as C0 (outside 0x21..0x7E).
+        // Text runs print spaces in bulk; this is for direct callers.
         0x20 => vt.printCodepoint(' '),
         0x7F => {}, // DEL
         else => {},

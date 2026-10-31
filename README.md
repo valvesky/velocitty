@@ -1,9 +1,9 @@
-<p align="center">
-  <picture>
-    <source srcset="assets/wordmark.svg" media="(prefers-reduced-motion: reduce)">
-    <img src="assets/velocitty.gif" alt="Velocitty" width="960">
-  </picture>
-</p>
+<!-- <p align="center"> -->
+<!--   <picture> -->
+<!--     <source srcset="assets/wordmark.svg" media="(prefers-reduced-motion: reduce)"> -->
+<!--     <img src="assets/velocitty.gif" alt="Velocitty" width="960"> -->
+<!--   </picture> -->
+<!-- </p> -->
 
 <p align="center">
   <img src="icon.png" alt="Velocitty icon" width="128">
@@ -32,7 +32,11 @@
     <a href="#shoutouts">Shoutouts</a>
 </p>
 
-Velocitty is (not) a lightning-fast terminal for Omarchy, Windows, and macOS.
+Velocitty is a lightning-fast terminal for Omarchy. 
+
+Releases for Windows and MacOS are available.
+
+
 
 It's a streamlined version of my GPU-accelerated terminal multiplexer [VT](https://github.com/valvesky/vt).
 
@@ -95,10 +99,16 @@ See [example.config.toml](example.config.toml). The TOML subset is similar to Al
 
 Desktop notifications and kitty file/temporary-file image transfers currently use the Linux implementation. Streamed kitty graphics and sixel work across platforms; use `icat --transfer-mode=stream` on Windows/macOS.
 
+
+## Special Thanks
+- Mitchell Hashimoto 
+    1. https://x.com/mitchellh/status/2115292243443519571
+    2. 
+
 ## Shoutouts
-- [vt](https://github.com/valvesky/vt) --- older brother
-- [st](https://st.suckless.org) --- how to suck less
-- [refterm](https://github.com/cmuratori/refterm) --- how to black magic
+
+- [refterm](https://github.com/cmuratori/refterm) --- Most of the
 - [kitty](https://sw.kovidgoyal.net/kitty/) --- how to meow
 - [ghostty](https://ghostty.org) --- how to render glyph good
-- [foot](https://codeberg.org/dnkl/foot) --- how to vt parsing good
+- [foot](https://codeberg.org/dnkl/foot) --- Profile optimized glyph parsing.
+- [vt](https://github.com/valvesky/vt) --- My previous shot at a terminal.

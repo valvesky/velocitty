@@ -128,7 +128,7 @@ pub const Frame = struct {
         // Images are blitted over text: rows they cover now or covered last
         // frame are repainted; other rows keep the dirty/compare rules.
         var img_rows: [max_rows]bool = @splat(false);
-        if (screen.scrollOffset() == 0) imageRows(screen, cell_h, rows, &img_rows);
+        imageRows(screen, cell_h, rows, &img_rows);
         var scroll: i32 = 0;
         if (have_prev and mayHaveScrolled(screen, rows)) {
             scroll = scrollDelta(screen, self.prev, cols, rows);
@@ -227,9 +227,7 @@ pub const Frame = struct {
             }
             glyph_ns += @intCast(nowNs() - tg0);
         }
-        if (screen.scrollOffset() == 0) {
-            blitKitty(self, screen, cell_w, cell_h);
-        }
+        blitKitty(self, screen, cell_w, cell_h);
         if (overlay_on) {
             paintDebugOverlay(self, screen, cell_w, cell_h, cur);
             self.dirty_full = true;
@@ -611,12 +609,14 @@ fn drawUnderline(self: *Frame, x0: u32, y0: u32, cell_w: u32, cell_h: u32, color
 /// Marks screen rows covered by visible placements (same geometry as blitKitty).
 fn imageRows(screen: *const Term.Screen, cell_h: u32, rows: u16, out: *[max_rows]bool) void {
     const store = &screen.kitty;
+    const base = screen.imageBase();
     for (store.placements.items) |p| {
         if (p.screen != @as(u1, if (screen.altScreen()) 1 else 0)) continue;
         const img = store.find(p.image_id) orelse continue;
         const span: i64 = if (p.rows != 0) p.rows else (img.height + cell_h - 1) / cell_h;
-        const r0: i64 = @max(0, p.row);
-        const r1: i64 = @min(@as(i64, @min(rows, max_rows)), @as(i64, p.row) + span);
+        const row = p.row - base;
+        const r0: i64 = @max(0, row);
+        const r1: i64 = @min(@as(i64, @min(rows, max_rows)), row + span);
         var r = r0;
         while (r < r1) : (r += 1) out[@intCast(r)] = true;
     }
@@ -642,13 +642,15 @@ fn shiftRows(flags: *[max_rows]bool, k: u16, dir: Shift) void {
 fn blitKitty(self: *Frame, screen: *const Term.Screen, cell_w: u32, cell_h: u32) void {
     const store = &screen.kitty;
     if (store.placements.items.len == 0) return;
+    const base = screen.imageBase();
     for (store.placements.items) |p| {
         if (p.screen != @as(u1, if (screen.altScreen()) 1 else 0)) continue;
         const img = store.find(p.image_id) orelse continue;
+        if (img.rgba.len < @as(usize, img.width) * img.height * 4) continue;
         const dest_w: u64 = if (p.columns != 0) @as(u64, p.columns) * cell_w else img.width;
         const dest_h: u64 = if (p.rows != 0) @as(u64, p.rows) * cell_h else img.height;
         const dx: i64 = @as(i64, p.col) * cell_w;
-        const dy: i64 = @as(i64, p.row) * cell_h;
+        const dy: i64 = (p.row - base) * cell_h;
         const src_x = @min(p.src_x, img.width);
         const src_y = @min(p.src_y, img.height);
         const crop_w: u32 = if (p.src_w == 0) img.width - src_x else @min(p.src_w, img.width - src_x);
@@ -1101,6 +1103,7 @@ test "graphics repaint after deletion and clip oversized placement" {
     var frame = try Frame.init(a, 8, 8);
     defer frame.deinit();
     _ = vt.kitty.feed("\x1b_Ga=T,f=32,s=1,v=1,i=4,C=1,c=1073741824,r=1;/wAA/w==\x1b\\", .{}, 2, 2, 0);
+    vt.prepareImages();
     frame.render(&vt, 4, 4, null, 8);
     try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[0]);
     vt.clearDirty();
@@ -1152,6 +1155,7 @@ test "incremental render after multi-line scroll and image moves matches full re
         if (step.lines > 0 and step.lines <= 3 and frame.prev.len != 0) {
             try std.testing.expectEqual(@as(i32, step.lines), scrollDelta(&vt, frame.prev, 6, 6));
         }
+        vt.prepareImages();
         frame.render(&vt, 4, 4, null, 8);
         vt.clearDirty();
         fresh.invalidate();

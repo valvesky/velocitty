@@ -5,14 +5,18 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
-const CircBuffer = @import("circbuffer.zig").CircBuffer;
+const Ring = @import("circbuffer.zig");
+const CircBuffer = Ring.CircBuffer;
+const Run = Ring.Run;
 const VtState = @import("vt.zig").VtState;
 const Draw = @import("draw.zig");
 const Type = @import("type.zig");
 const Select = @import("select.zig");
 
 // Same ring, scrollback and glyph cache as main.zig.
-const ring_cap = 64 * 1024;
+const default_ring_cap = 64 * 1024;
+/// `--ring KIB` (power of two); set once in main before any section runs.
+var ring_cap: usize = default_ring_cap;
 const scrollback = 1000;
 const cache_capacity = 2048;
 const size_px: f32 = 16;
@@ -34,7 +38,9 @@ const fallback_paths = [_][]const u8{
 
 const Options = struct {
     quick: bool = false,
+    spin: bool = true,
     mib: u32 = 4,
+    ring_kib: u32 = default_ring_cap / 1024,
     burst_kib: u32 = 16,
     cols: u16 = 120,
     rows: u16 = 40,
@@ -42,6 +48,7 @@ const Options = struct {
     font: ?[]const u8 = null,
     only: ?[]const u8 = null,
     dump: ?[]const u8 = null,
+    image: ?[]const u8 = null,
     help: bool = false,
 };
 
@@ -50,16 +57,27 @@ const usage =
     \\  --quick           1 MiB per workload, 40 samples (explicit values still win)
     \\  --mib N           bytes per PTY workload in MiB (1..256; default 4)
     \\  --burst KIB       bytes read per frame (1..48; default 16)
+    \\  --ring KIB        ring size, power of two (default 64, as main.zig)
     \\  --grid COLSxROWS  pipeline/render grid (default 120x40)
     \\  --samples N       render frames / glyph batches per row (10..10000; default 200)
     \\  --font PATH       primary font (default: fc-match monospace, like main.zig)
     \\  --only A,B        sections: ascii unicode grapheme csi-short long-escape
-    \\                    kitty-image sixel glyph render
+    \\                    kitty-image sixel pi drain firehose kitten image glyph render
+    \\                    (drain/firehose plus workload names: only those workloads)
     \\  --dump DIR        write each workload (--mib, --only) to DIR/<name>.bin and exit;
     \\                    for timing other terminals with `cat`
+    \\  --image PATH      PNG for the image section (default: generated 1920x1080 noise)
+    \\  --no-spin         skip the 500 ms spin-up (for perf stat instruction counts)
     \\  --help
+    \\
+    \\Usage: velocitty-bench +terminal-stream [--data=PATH|-] [--terminal-rows=80]
+    \\                       [--terminal-cols=120] [--drop]
+    \\  Same interface and work as `ghostty-bench +terminal-stream`: read the
+    \\  file (or stdin) in 64 KiB pieces into the ring and drain it into the VT,
+    \\  every byte parsed; run once, print nothing (time it with hyperfine or
+    \\  `time`). No --data: does nothing. --drop: firehose dropping, as the app.
     \\Pipeline rows: one frame = read one burst from a real PTY (writer thread,
-    \\raw slave), consumeAndGetRuns, feedRuns, renderSel, damaged-rows copy (present).
+    \\raw slave), drain (scan + feed), renderSel, damaged-rows copy (present).
     \\io is time inside read(2); time blocked in poll(2) is io-wait, excluded.
     \\Logs: bench/<UTC>-<git12>[-dirty].txt and last_bench.
     \\
@@ -74,6 +92,11 @@ fn parseOptions(args: []const [*:0]const u8) !Options {
         const arg = std.mem.span(args[i]);
         const eq = std.mem.indexOfScalar(u8, arg, '=');
         const name = arg[0 .. eq orelse arg.len];
+        if (std.mem.eql(u8, name, "--no-spin")) {
+            if (eq != null) return error.UnexpectedValue;
+            opt.spin = false;
+            continue;
+        }
         if (std.mem.eql(u8, name, "--quick") or std.mem.eql(u8, name, "--help") or std.mem.eql(u8, name, "-h")) {
             if (eq != null) return error.UnexpectedValue;
             if (name[2] == 'q') opt.quick = true else opt.help = true;
@@ -88,6 +111,9 @@ fn parseOptions(args: []const [*:0]const u8) !Options {
         if (std.mem.eql(u8, name, "--mib")) {
             opt.mib = try count(value, 1, 256);
             seen_mib = true;
+        } else if (std.mem.eql(u8, name, "--ring")) {
+            opt.ring_kib = try count(value, 4, 65536);
+            if (!std.math.isPowerOfTwo(opt.ring_kib)) return error.InvalidCount;
         } else if (std.mem.eql(u8, name, "--burst")) {
             opt.burst_kib = try count(value, 1, 48);
         } else if (std.mem.eql(u8, name, "--samples")) {
@@ -101,6 +127,8 @@ fn parseOptions(args: []const [*:0]const u8) !Options {
             opt.font = value;
         } else if (std.mem.eql(u8, name, "--only")) {
             opt.only = value;
+        } else if (std.mem.eql(u8, name, "--image")) {
+            opt.image = value;
         } else if (std.mem.eql(u8, name, "--dump")) {
             opt.dump = value;
         } else return error.UnknownOption;
@@ -147,6 +175,10 @@ const Env = struct {
 };
 
 pub fn main(init: std.process.Init.Minimal) !void {
+    const argv = init.args.vector;
+    if (argv.len >= 2 and std.mem.eql(u8, std.mem.span(argv[1]), "+terminal-stream")) {
+        return terminalStream(argv[2..]);
+    }
     const opt = parseOptions(init.args.vector) catch |err| {
         std.debug.print("bench: invalid arguments: {s}\n{s}", .{ @errorName(err), usage });
         return err;
@@ -155,11 +187,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
         std.debug.print("{s}", .{usage});
         return;
     }
-    const gpa = std.heap.page_allocator;
+    // Same allocator as a release main.zig.
+    const gpa = std.heap.c_allocator;
     var threaded = std.Io.Threaded.init(gpa, .{ .environ = init.environ });
     defer threaded.deinit();
     const io = threaded.io();
     if (opt.dump) |dir| return dumpWorkloads(io, gpa, opt, dir);
+    ring_cap = @as(usize, opt.ring_kib) * 1024;
     var log: Log = .{ .buffer = .init(gpa) };
     defer log.buffer.deinit();
 
@@ -216,13 +250,42 @@ pub fn main(init: std.process.Init.Minimal) !void {
     try log.print("size_px={d} cell={d}x{d} glyph-cache={d} atlas=1024x1024 ring={d}\n", .{ size_px, env.cell_w, env.cell_h, cache_capacity, ring_cap });
     try log.print("p50/p95 are nearest-rank over frames (pipeline/render) or 64-lookup batches (glyph).\n", .{});
 
-    spinUp();
+    if (opt.spin) spinUp();
+    // Workload names next to drain/firehose select those sections' workloads.
+    const sections_only = opt.only != null and (wanted(opt, "drain") or wanted(opt, "firehose") or wanted(opt, "kitten"));
     for (workloads) |wl| {
-        if (!wanted(opt, wl.name)) continue;
+        if (!wanted(opt, wl.name) or (sections_only and opt.only.?.len != 0 and !wanted(opt, "pipeline"))) continue;
         const bytes = try generate(gpa, wl, @as(usize, opt.mib) << 20);
         defer gpa.free(bytes);
         try runPipeline(&log, &env, wl, bytes);
     }
+    if (wanted(opt, "drain")) {
+        try log.print("\ndrain: {d} MiB/workload (4x --mib) from memory into the {d} KiB ring, drained at a quarter free; no PTY or render. fed = input bytes that reached the VT\n", .{ opt.mib * 4, ring_cap / 1024 });
+        try log.print("  {s:<12} {s:>8} {s:>8} {s:>8} {s:>8} {s:>8} {s:>8}\n", .{ "workload", "total ms", "scan", "vt", "scan ns/B", "vt ns/B", "fed" });
+        var named = false;
+        for (workloads) |wl| named = named or (opt.only != null and wanted(opt, wl.name));
+        for (workloads) |wl| {
+            if (named and !wanted(opt, wl.name)) continue;
+            const bytes = try generate(gpa, wl, @as(usize, opt.mib) << 22);
+            defer gpa.free(bytes);
+            try runDrain(&log, &env, wl, bytes);
+        }
+    }
+    if (wanted(opt, "firehose")) {
+        try log.print("\nfirehose: {d} MiB/workload (16x --mib) through a PTY, read like main.zig (readSource {d} Hz, then consume+vt+render once); screen/images = final visible state equals a full parse\n", .{ opt.mib * 16, hz });
+        try log.print("  {s:<12} {s:>8} {s:>8} {s:>8} {s:>8} {s:>7} {s:>9} {s:>5} {s:>6}\n", .{ "workload", "wall ms", "drain", "vt", "render", "frames", "MiB/s", "scrn", "images" });
+        var named = false;
+        for (workloads) |wl| named = named or (opt.only != null and wanted(opt, wl.name));
+        for (workloads) |wl| {
+            // `--only firehose,ascii` restricts the section to those workloads.
+            if (named and !wanted(opt, wl.name)) continue;
+            const bytes = try generate(gpa, wl, @as(usize, opt.mib) << 24);
+            defer gpa.free(bytes);
+            try runFirehose(&log, &env, wl, bytes);
+        }
+    }
+    if (wanted(opt, "kitten")) try kittenSuite(&log, &env);
+    if (wanted(opt, "image")) try imageSuite(&log, &env);
     if (env.ctx != null and wanted(opt, "glyph")) try glyphSuite(&log, &env);
     if (wanted(opt, "render")) {
         try renderSuite(&log, &env, opt.cols, opt.rows, opt.samples);
@@ -245,6 +308,24 @@ fn dumpWorkloads(io: std.Io, gpa: std.mem.Allocator, opt: Options, dir: []const 
         try cwd.writeFile(io, .{ .sub_path = path, .data = bytes });
         std.debug.print("wrote {s} ({d} bytes)\n", .{ path, bytes.len });
     }
+    // kitten-<name>.bin: the `kitten` section's exact byte stream (--mib
+    // repetitions), e.g. for `ghostty-bench +terminal-stream --data=FILE`.
+    if (opt.only != null and wanted(opt, "kitten")) for (kitten_names) |name| {
+        var g: Gen = .{ .gpa = gpa };
+        defer g.out.deinit(gpa);
+        try kittenData(&g, name);
+        var stream: std.ArrayList(u8) = .empty;
+        defer stream.deinit(gpa);
+        try stream.appendSlice(gpa, "\x1b[?2026h");
+        for (0..@max(1, opt.mib)) |_| {
+            try stream.appendSlice(gpa, g.out.items);
+            try stream.appendSlice(gpa, "\x1b[?2026l\x1b[?2026h");
+        }
+        var name_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrint(&name_buf, "{s}/kitten-{s}.bin", .{ dir, name });
+        try cwd.writeFile(io, .{ .sub_path = path, .data = stream.items });
+        std.debug.print("wrote {s} ({d} bytes)\n", .{ path, stream.items.len });
+    };
 }
 
 // ---------------------------------------------------------------- statistics
@@ -301,6 +382,7 @@ const workloads = [_]Workload{
     .{ .name = "long-escape", .about = "truecolor+underline SGR, OSC 8 long URLs, OSC 0/7/133, OSC 52 1-3 KiB", .unit = genLongEscape },
     .{ .name = "kitty-image", .about = "kitty APC a=T f=32 64x64 RGBA, 4096-byte base64 chunks, ids 1..16", .unit = genKitty },
     .{ .name = "sixel", .about = "DCS q 64x64, 8-color palette, RLE bands", .unit = genSixel },
+    .{ .name = "pi", .about = "alt-screen TUI frames: sync, d=a, 2J, CUP rows, 256x256 PNG (stored deflate) a=T f=100 random i=", .unit = genPi },
 };
 
 const Gen = struct {
@@ -484,6 +566,95 @@ fn genSixel(g: *Gen) !void {
     for (0..4) |_| try genAscii(g);
 }
 
+/// One pi-style frame (pi 1.4 tui.ts full redraw): delete placements, clear,
+/// then every row as CUP + EL + text, one row carrying a fresh chunked PNG.
+fn genPi(g: *Gen) !void {
+    const side = 256;
+    if (g.n == 0) try g.put("\x1b[?1049h");
+    try g.put("\x1b[?2026h\x1b_Ga=d,d=a,q=2\x1b\\\x1b[2J");
+    const rows = 40;
+    const img_row = 4 + g.n % 20;
+    for (0..rows) |row| {
+        try g.fmt("\x1b[{d};1H\x1b[2K", .{row + 1});
+        if (row == img_row) {
+            const png = try pngNoise(g, side, side);
+            defer g.gpa.free(png);
+            const enc = try g.gpa.alloc(u8, std.base64.standard.Encoder.calcSize(png.len));
+            defer g.gpa.free(enc);
+            const b64 = std.base64.standard.Encoder.encode(enc, png);
+            const id: u32 = @truncate(g.next() | 1);
+            var off: usize = 0;
+            while (off < b64.len) {
+                const end = @min(off + 4096, b64.len);
+                const more: u8 = if (end < b64.len) 1 else 0;
+                if (off == 0) {
+                    try g.fmt("\x1b_Ga=T,f=100,q=2,C=1,c=30,r=15,i={d},m={d};", .{ id, more });
+                } else try g.fmt("\x1b_Gm={d};", .{more});
+                try g.put(b64[off..end]);
+                try g.put("\x1b\\");
+                off = end;
+            }
+        } else {
+            try g.fmt("\x1b[38;5;{d}m frame {d} row {d} \x1b[0m", .{ (g.n + row) % 256, g.n, row });
+        }
+    }
+    try g.put("\x1b[?25l\x1b[?2026l");
+}
+
+/// RGBA noise PNG with stored (uncompressed) deflate blocks, so the payload
+/// size is predictable: ~side*side*4 bytes.
+fn pngNoise(g: *Gen, w: u32, h: u32) ![]u8 {
+    const gpa = g.gpa;
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(gpa);
+    for (0..h) |_| {
+        try raw.append(gpa, 0);
+        for (0..w) |_| {
+            const v = g.next();
+            try raw.appendSlice(gpa, &.{ @truncate(v), @truncate(v >> 8), @truncate(v >> 16), 255 });
+        }
+    }
+    var z: std.ArrayList(u8) = .empty;
+    defer z.deinit(gpa);
+    try z.appendSlice(gpa, &.{ 0x78, 0x01 });
+    var off: usize = 0;
+    while (off < raw.items.len) {
+        const n = @min(65535, raw.items.len - off);
+        const final: u8 = @intFromBool(off + n == raw.items.len);
+        const len: u16 = @intCast(n);
+        try z.appendSlice(gpa, &.{ final, @truncate(len), @truncate(len >> 8), @truncate(~len), @truncate(~len >> 8) });
+        try z.appendSlice(gpa, raw.items[off..][0..n]);
+        off += n;
+    }
+    var be: [4]u8 = undefined;
+    std.mem.writeInt(u32, &be, std.hash.Adler32.hash(raw.items), .big);
+    try z.appendSlice(gpa, &be);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, "\x89PNG\r\n\x1a\n");
+    var ihdr: [13]u8 = undefined;
+    std.mem.writeInt(u32, ihdr[0..4], w, .big);
+    std.mem.writeInt(u32, ihdr[4..8], h, .big);
+    ihdr[8..13].* = .{ 8, 6, 0, 0, 0 };
+    try pngChunk(gpa, &out, "IHDR", &ihdr);
+    try pngChunk(gpa, &out, "IDAT", z.items);
+    try pngChunk(gpa, &out, "IEND", "");
+    return out.toOwnedSlice(gpa);
+}
+
+fn pngChunk(gpa: std.mem.Allocator, out: *std.ArrayList(u8), tag: *const [4]u8, data: []const u8) !void {
+    var be: [4]u8 = undefined;
+    std.mem.writeInt(u32, &be, @intCast(data.len), .big);
+    try out.appendSlice(gpa, &be);
+    try out.appendSlice(gpa, tag);
+    try out.appendSlice(gpa, data);
+    var crc = std.hash.Crc32.init();
+    crc.update(tag);
+    crc.update(data);
+    std.mem.writeInt(u32, &be, crc.final(), .big);
+    try out.appendSlice(gpa, &be);
+}
+
 fn sixelBits(band: usize, x: usize, color: usize, seed: usize) u6 {
     var bits: u6 = 0;
     for (0..6) |dy| {
@@ -512,13 +683,16 @@ const Pty = struct {
         if (linux.errno(s) != .SUCCESS) return error.PtyOpen;
         const slave: linux.fd_t = @intCast(s);
         errdefer _ = linux.close(slave);
-        var t = try posix.tcgetattr(slave);
+        // Raw syscalls: std.posix.tcsetattr trips a safety check in
+        // ReleaseSafe builds of this harness.
+        var t: linux.termios = undefined;
+        if (linux.errno(linux.tcgetattr(slave, &t)) != .SUCCESS) return error.PtyOpen;
         t.iflag = .{};
         t.oflag = .{};
         t.lflag = .{};
         t.cflag.CSIZE = .CS8;
         t.cflag.PARENB = false;
-        try posix.tcsetattr(slave, .NOW, t);
+        if (linux.errno(linux.tcsetattr(slave, .NOW, &t)) != .SUCCESS) return error.PtyOpen;
         return .{ .master = master, .slave = slave };
     }
 };
@@ -651,14 +825,16 @@ fn runPipeline(log: *Log, env: *Env, wl: Workload, bytes: []const u8) !void {
             }
         }
         fed += want;
+        var timed = TimedSink{ .term = &p.term };
         const t0 = nowNs();
-        const r = p.ring.consumeAndGetRuns(std.math.maxInt(usize));
-        runs += r.len;
-        const t1 = nowNs();
-        if (r.len != 0) p.term.feedRuns(r);
+        p.ring.drain(timed.sink());
         const t2 = nowNs();
+        // scan = drain minus the time spent feeding the VT.
+        const t1 = t2 - timed.ns;
+        runs += timed.runs;
         p.drainHost();
         const t3 = nowNs();
+        p.term.prepareImages();
         p.frame.renderSel(&p.term, env.cell_w, env.cell_h, env.ctx, size_px, .{});
         p.term.clearDirty();
         const t4 = nowNs();
@@ -697,6 +873,532 @@ fn runPipeline(log: *Log, env: *Env, wl: Workload, bytes: []const u8) !void {
         @as(f64, @floatFromInt(wait_ns)) / @as(f64, @floatFromInt(frames)) / 1000, misses, p.term.kitty.images.items.len, p.term.kitty.placements.items.len,
         hashTerm(&p.term) ^ hashBytes(std.mem.sliceAsBytes(p.frame.pixels)),
     });
+}
+
+/// Forwards a drain to the VT and records how long the VT took.
+const TimedSink = struct {
+    term: *VtState,
+    ns: u64 = 0,
+    runs: u64 = 0,
+    /// Bytes covered by the fed runs.
+    bytes: u64 = 0,
+    /// From the drain's view() call to the end of its feed: the whole drain.
+    drain_ns: u64 = 0,
+    t_view: u64 = 0,
+
+    fn sink(self: *TimedSink) Ring.Sink {
+        return .{ .ctx = self, .feed = feed, .view = view };
+    }
+    fn feed(ctx: *anyopaque, runs: []const Run, spill: []const u8, owner: *CircBuffer) void {
+        const self: *TimedSink = @ptrCast(@alignCast(ctx));
+        const t0 = nowNs();
+        self.term.feedOwned(runs, spill, owner);
+        const t1 = nowNs();
+        self.ns += t1 - t0;
+        self.drain_ns += t1 - self.t_view;
+        self.runs += runs.len;
+        for (runs) |run| self.bytes += run.len;
+    }
+    fn view(ctx: *anyopaque) Ring.View {
+        const self: *TimedSink = @ptrCast(@alignCast(ctx));
+        self.t_view = nowNs();
+        const s = self.term.sink();
+        return s.view(s.ctx);
+    }
+};
+
+// ---------------------------------------------------------------- drain
+
+/// CPU-only drain cost: fill the ring the way readSource does (all free
+/// space, drain at a quarter free) from memory. No PTY, no render.
+fn runDrain(log: *Log, env: *Env, wl: Workload, bytes: []const u8) !void {
+    const gpa = env.gpa;
+    var ring = try CircBuffer.create(gpa, ring_cap);
+    defer ring.destroy();
+    var term = try VtState.init(gpa, env.opt.cols, env.opt.rows, scrollback, ring.storage);
+    defer term.deinit();
+    var timed = TimedSink{ .term = &term };
+    var copy_ns: u64 = 0;
+    const t_start = nowNs();
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const c0 = nowNs();
+        const free: usize = @intCast(ring.capacity - (ring.head - ring.tail));
+        const n = @min(free, bytes.len - off);
+        const at: usize = @intCast(ring.head & (ring.capacity - 1));
+        @memcpy(ring.storage[at..][0..n], bytes[off..][0..n]);
+        if (!ring.mapped) mirror(&ring, at, n);
+        ring.head += n;
+        off += n;
+        copy_ns += nowNs() - c0;
+        if (ring.capacity - (ring.head - ring.tail) < ring.capacity / 4) ring.drain(timed.sink());
+    }
+    ring.drain(timed.sink());
+    const total = nowNs() - t_start - copy_ns;
+    const scan = total -| timed.ns;
+    const nb: f64 = @floatFromInt(bytes.len);
+    try log.print("  {s:<12} {d:>8.1} {d:>8.1} {d:>8.1} {d:>8.2} {d:>8.2} {d:>7.2}%\n", .{
+        wl.name,
+        @as(f64, @floatFromInt(total)) / 1e6,
+        @as(f64, @floatFromInt(scan)) / 1e6,
+        @as(f64, @floatFromInt(timed.ns)) / 1e6,
+        @as(f64, @floatFromInt(scan)) / nb,
+        @as(f64, @floatFromInt(timed.ns)) / nb,
+        @as(f64, @floatFromInt(timed.bytes)) / nb * 100,
+    });
+}
+
+// ---------------------------------------------------------------- +terminal-stream
+
+const StreamOptions = struct {
+    data: ?[:0]const u8 = null,
+    rows: u16 = 80,
+    cols: u16 = 120,
+    drop: bool = false,
+};
+
+fn parseStreamOptions(args: []const [*:0]const u8) !StreamOptions {
+    var opt: StreamOptions = .{};
+    for (args) |raw| {
+        const arg = std.mem.span(raw);
+        if (std.mem.eql(u8, arg, "--drop")) {
+            opt.drop = true;
+            continue;
+        }
+        const eq = std.mem.indexOfScalar(u8, arg, '=') orelse return error.UnknownOption;
+        const name = arg[0..eq];
+        const value = arg[eq + 1 .. :0];
+        if (std.mem.eql(u8, name, "--data")) {
+            opt.data = value;
+        } else if (std.mem.eql(u8, name, "--terminal-rows")) {
+            opt.rows = @intCast(try count(value, 1, 1000));
+        } else if (std.mem.eql(u8, name, "--terminal-cols")) {
+            opt.cols = @intCast(try count(value, 1, 1000));
+        } else return error.UnknownOption;
+    }
+    return opt;
+}
+
+/// `ghostty-bench +terminal-stream` counterpart: input to terminal state
+/// through the same ring + drain + VT path as main.zig, nothing else.
+fn terminalStream(args: []const [*:0]const u8) !void {
+    const opt = parseStreamOptions(args) catch |err| {
+        std.debug.print("bench: invalid arguments: {s}\n{s}", .{ @errorName(err), usage });
+        return err;
+    };
+    const path = opt.data orelse return;
+    const fd: linux.fd_t = if (std.mem.eql(u8, path, "-")) 0 else blk: {
+        const rc = linux.open(path.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(rc) != .SUCCESS) {
+            std.debug.print("bench: cannot open {s}\n", .{path});
+            return error.OpenFailed;
+        }
+        break :blk @intCast(rc);
+    };
+    defer if (fd != 0) {
+        _ = linux.close(fd);
+    };
+    const gpa = std.heap.c_allocator;
+    var ring = try CircBuffer.create(gpa, default_ring_cap);
+    defer ring.destroy();
+    ring.exact = !opt.drop;
+    var term = try VtState.init(gpa, opt.cols, opt.rows, scrollback, ring.storage);
+    defer term.deinit();
+    var stream = StreamSink{ .term = &term };
+    const sink = stream.sink();
+    // `readSource` like main.zig: ring reads, and straight into the spill
+    // buffer while a string is open.
+    while (true) {
+        ring.readSource(StreamSource{ .fd = fd }, 1_000_000_000, null, sink) catch break;
+    }
+    ring.drain(sink);
+    std.mem.doNotOptimizeAway(term.cursor());
+}
+
+/// Blocking file/pipe reads of at most 64 KiB, like Ghostty's IO thread and
+/// this ring; end of input is a zero read (readSource's Hangup).
+const StreamSource = struct {
+    fd: linux.fd_t,
+
+    pub fn read(self: StreamSource, dest: []u8) error{ ReadFailed, WouldBlock }!usize {
+        while (true) {
+            const rc = linux.read(self.fd, dest.ptr, @min(dest.len, 64 * 1024));
+            switch (linux.errno(rc)) {
+                .SUCCESS => return rc,
+                .INTR => continue,
+                else => return error.ReadFailed,
+            }
+        }
+    }
+
+    pub fn wait(self: StreamSource, event_fd: ?c_int, timeout_ms: c_int) void {
+        _ = self;
+        _ = event_fd;
+        _ = timeout_ms;
+    }
+};
+
+/// The VT as a sink that drops its replies after every drain.
+const StreamSink = struct {
+    term: *VtState,
+
+    fn sink(self: *StreamSink) Ring.Sink {
+        return .{ .ctx = self, .feed = feed, .view = view };
+    }
+    fn feed(ctx: *anyopaque, runs: []const Run, spill: []const u8, owner: *CircBuffer) void {
+        const self: *StreamSink = @ptrCast(@alignCast(ctx));
+        self.term.feedOwned(runs, spill, owner);
+        self.term.reply.clearRetainingCapacity();
+    }
+    fn view(ctx: *anyopaque) Ring.View {
+        const self: *StreamSink = @ptrCast(@alignCast(ctx));
+        const s = self.term.sink();
+        return s.view(s.ctx);
+    }
+};
+
+/// A nonblocking in-memory source: `read` copies at most 64 KiB (like a
+/// PTY) and counts the time spent copying, which timed rows subtract.
+const MemSource = struct {
+    data: []const u8,
+    pos: usize = 0,
+    copy_ns: u64 = 0,
+
+    pub fn read(self: *MemSource, dest: []u8) error{ WouldBlock, Unused }!usize {
+        if (self.pos >= self.data.len) return error.WouldBlock;
+        const c0 = nowNs();
+        const n = @min(@min(dest.len, 64 * 1024), self.data.len - self.pos);
+        @memcpy(dest[0..n], self.data[self.pos..][0..n]);
+        self.pos += n;
+        self.copy_ns += nowNs() - c0;
+        return n;
+    }
+
+    pub fn wait(self: *MemSource, event_fd: ?c_int, timeout_ms: c_int) void {
+        _ = self;
+        _ = event_fd;
+        _ = timeout_ms;
+    }
+};
+
+// ---------------------------------------------------------------- kitten
+
+// The six `kitten __benchmark__` payloads (kitty tools/cmd/benchmark),
+// parsed headless with every byte fed (`exact`), as in the Ghostty
+// comparison. Throughput is bytes / time to drain them all.
+const kitten_ascii = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ  `~!@#$%^&*()_+-=[]{}\\|;:'\",<.>/?";
+const kitten_ctrl = "\n\t";
+const kitten_cjk = "旦海司有幼雞讀松鼻種比門真目怪少：扒裝虎怕您跑綠蝶黃，位香法士錯乙音造活羽詞坡村目園尺封鳥朋；法松夕點我冬停雪因科對只貓息加黃住蝶，明鴨乾春呢風乙時昔孝助？小紅女父故去。飯躲裝個哥害共買去隻把氣年，己你校跟飛百拉！快石牙飽知唱想土人吹象毛吉每浪四又連見、欠耍外豆雞秋鼻。住步帶。打六申幾麼：或皮又荷隻乙犬孝習秋還何氣；幾裏活打能花是入海乙山節會。種第共後陽沒喜姐三拍弟海肖，行知走亮包，他字幾，的木卜流旦乙左杯根毛。您皮買身苦八手牛目地止哥彩第合麻讀午。原朋河乾種果「才波久住這香松」兄主衣快他玉坐要羽和亭但小山吉也吃耳怕，也爪斗斥可害朋許波怎祖葉卜。行花兩耍許車丟學「示想百吃門高事」不耳見室九星枝買裝，枝十新央發旁品丁青給，科房火；事出出孝肉古：北裝愛升幸百東鼻到從會故北「可休笑物勿三游細斗」娘蛋占犬。我羊波雨跳風。牛大燈兆新七馬，叫這牙後戶耳、荷北吃穿停植身玩間告或西丟再呢，他禾七愛干寺服石安：他次唱息它坐屋父見這衣發現來，苗會開條弓世者吃英定豆哭；跳風掃叫美神。寸再了耍休壯植己，燈錯和，蝶幾欠雞定和愛，司紅後弓第樹會金拉快喝夕見往，半瓜日邊出讀雞苦歌許開；發火院爸乙；四帶亮錯鳥洋個讀。";
+const kitten_misc = "‘’“”‹›«»‚„ 😀😛😇😈😉😍😎😮👍👎 —–§¶†‡©®™ →⇒•·°±−×÷¼½½¾…µ¢£€¿¡¨´¸ˆ˜ ÀÁÂÃÄÅÆÇÈÉÊË ÌÍÎÏÐÑÒÓÔÕÖØ ŒŠÙÚÛÜÝŸÞßàá âãäåæçèéêëìíîïðñòóôõöøœš ùúûüýÿþªºαΩ∞ ū̀n̂o᷵H̨a̠b̡͓̐c̡͓̐X̡͓̐";
+
+fn kittenRandom(g: *Gen, n: usize, alphabet: []const u8) !void {
+    for (0..n) |_| try g.out.append(g.gpa, alphabet[g.below(alphabet.len)]);
+}
+
+fn kittenData(g: *Gen, name: []const u8) !void {
+    const all = kitten_ascii ++ kitten_ctrl;
+    if (std.mem.eql(u8, name, "ascii")) {
+        try kittenRandom(g, 1024 * 2048 + 13, all);
+    } else if (std.mem.eql(u8, name, "unicode")) {
+        for (0..1024) |_| try g.put(kitten_cjk ++ kitten_misc ++ kitten_ctrl);
+    } else if (std.mem.eql(u8, name, "unique_unicode")) {
+        var buf: [4]u8 = undefined;
+        for (0..256 * 1024) |q| {
+            try g.out.append(g.gpa, 'a');
+            var v = q;
+            for (0..3) |_| {
+                const n = std.unicode.utf8Encode(@intCast(0x300 + v % 0x70), &buf) catch unreachable;
+                try g.put(buf[0..n]);
+                v /= 0x70;
+            }
+        }
+    } else if (std.mem.eql(u8, name, "csi")) {
+        const start = g.out.items.len;
+        while (g.out.items.len - start < 1024 * 1024 + 17) {
+            const q = g.below(100);
+            if (q < 10) {
+                try kittenRandom(g, g.below(72) + 1, all);
+            } else try g.put(if (q < 30) "\x1b[m\x1b[?1h\x1b[H" else if (q < 40) "\x1b[1;2;3;4:3;31m" else if (q < 50) "\x1b[38:5:24;48:2:125:136:147m" else if (q < 60) "\x1b[58;5;44;2m" else if (q < 80) "\x1b[m\x1b[10A\x1b[3E\x1b[2K" else "\x1b[39m\x1b[10`a\x1b[100b\x1b[?1l");
+        }
+        try g.put("\x1b[m");
+    } else if (std.mem.eql(u8, name, "long_escape_codes")) {
+        const s0 = g.out.items.len;
+        try kittenRandom(g, 8024, kitten_ascii);
+        const body = try g.gpa.dupe(u8, g.out.items[s0..]);
+        defer g.gpa.free(body);
+        g.out.shrinkRetainingCapacity(s0);
+        for (0..1024) |_| {
+            try g.put("\x1b]6;");
+            try g.put(body);
+            try g.put("\x07");
+        }
+    } else if (std.mem.eql(u8, name, "images")) {
+        // 1024x1024 RGBA zeros, raw base64 in 128 KiB chunks, then d=I.
+        const raw = try g.gpa.alloc(u8, 4 * 1024 * 1024);
+        defer g.gpa.free(raw);
+        @memset(raw, 0);
+        const enc = std.base64.standard_no_pad.Encoder;
+        const b64 = try g.gpa.alloc(u8, enc.calcSize(raw.len));
+        defer g.gpa.free(b64);
+        _ = enc.encode(b64, raw);
+        var off: usize = 0;
+        while (off < b64.len) {
+            const end = @min(off + 128 * 1024, b64.len);
+            const more: u8 = @intFromBool(end < b64.len);
+            if (off == 0) {
+                try g.fmt("\x1b_Gq=2,m={d},s=1024,v=1024,i=12345;", .{more});
+            } else try g.fmt("\x1b_Gq=2,m={d};", .{more});
+            try g.put(b64[off..end]);
+            try g.put("\x1b\\");
+            off = end;
+        }
+        try g.put("\x1b_Ga=d,q=2,d=I,i=12345\x1b\\");
+    } else if (std.mem.eql(u8, name, "single_image")) {
+        // 3840x2160 RGBA zeros as ONE APC string (no m=1 chunks, ~44 MB of
+        // base64, far larger than the ring), transmitted only, then d=I.
+        const raw = try g.gpa.alloc(u8, 4 * 3840 * 2160);
+        defer g.gpa.free(raw);
+        @memset(raw, 0);
+        const enc = std.base64.standard.Encoder;
+        const b64 = try g.gpa.alloc(u8, enc.calcSize(raw.len));
+        defer g.gpa.free(b64);
+        _ = enc.encode(b64, raw);
+        try g.put("\x1b_Gq=2,f=32,s=3840,v=2160,i=12346;");
+        try g.put(b64);
+        try g.put("\x1b\\");
+        try g.put("\x1b_Ga=d,q=2,d=I,i=12346\x1b\\");
+    } else unreachable;
+}
+
+const kitten_names = [_][]const u8{ "ascii", "unicode", "unique_unicode", "csi", "images", "long_escape_codes", "single_image" };
+
+fn kittenSuite(log: *Log, env: *Env) !void {
+    const gpa = env.gpa;
+    const reps: usize = @max(1, env.opt.mib);
+    try log.print("\nkitten: kitty `kitten __benchmark__` payloads x{d} (--mib), headless 120x80, exact (every byte parsed), synchronized output on; MB = 2^20 bytes\n", .{reps});
+    try log.print("  {s:<18} {s:>9} {s:>9} {s:>10}\n", .{ "benchmark", "MiB", "ms", "MB/s" });
+    var named = false;
+    for (kitten_names) |name| named = named or (env.opt.only != null and wanted(env.opt, name));
+    for (kitten_names) |name| {
+        if (named and !wanted(env.opt, name)) continue;
+        var g: Gen = .{ .gpa = gpa };
+        defer g.out.deinit(gpa);
+        try kittenData(&g, name);
+        const unit = try gpa.dupe(u8, g.out.items);
+        defer gpa.free(unit);
+        var ring = try CircBuffer.create(gpa, ring_cap);
+        defer ring.destroy();
+        ring.exact = true;
+        var term = try VtState.init(gpa, 120, 80, scrollback, ring.storage);
+        defer term.deinit();
+        const sink = term.sink();
+        var copy_ns: u64 = 0;
+        var total: usize = 0;
+        const t0 = nowNs();
+        for (0..reps) |rep| {
+            const pieces = [_][]const u8{ if (rep == 0) "\x1b[?2026h" else "", unit, "\x1b[?2026l\x1b[?2026h" };
+            for (pieces) |piece| {
+                // readSource like main.zig: ring reads, then straight into the
+                // spill buffer while a string is open. The copy stands in for
+                // read(2) and is not timed.
+                var src = MemSource{ .data = piece };
+                while (src.pos < piece.len) ring.readSource(&src, 1_000_000_000, null, sink) catch unreachable;
+                copy_ns += src.copy_ns;
+                total += piece.len;
+            }
+            term.reply.clearRetainingCapacity();
+        }
+        ring.drain(sink);
+        const ns = nowNs() - t0 - copy_ns;
+        const mib = @as(f64, @floatFromInt(total)) / (1024 * 1024);
+        try log.print("  {s:<18} {d:>9.1} {d:>9.1} {d:>10.1}\n", .{ name, mib, @as(f64, @floatFromInt(ns)) / 1e6, mib / (@as(f64, @floatFromInt(ns)) / 1e9) });
+    }
+}
+
+// ---------------------------------------------------------------- image
+
+/// One large PNG sent like pi (a=T,f=100, 4096-byte base64 chunks, scaled
+/// to the grid): transfer (drain + vt), decode on first draw, first frame,
+/// steady frames with the image on screen, and a frame after scrolling.
+fn imageSuite(log: *Log, env: *Env) !void {
+    const gpa = env.gpa;
+    const opt = env.opt;
+    const png = if (opt.image) |path| try loadFile(env.io, gpa, path) else blk: {
+        var g: Gen = .{ .gpa = gpa };
+        defer g.out.deinit(gpa);
+        break :blk try pngNoise(&g, 1920, 1080);
+    };
+    defer gpa.free(png);
+    const enc = try gpa.alloc(u8, std.base64.standard.Encoder.calcSize(png.len));
+    defer gpa.free(enc);
+    const b64 = std.base64.standard.Encoder.encode(enc, png);
+    var stream: std.ArrayList(u8) = .empty;
+    defer stream.deinit(gpa);
+    var off: usize = 0;
+    while (off < b64.len) {
+        const end = @min(off + 4096, b64.len);
+        const more: u8 = @intFromBool(end < b64.len);
+        if (off == 0) {
+            try stream.print(gpa, "\x1b[H\x1b_Ga=T,f=100,q=2,C=1,c={d},r={d},i=77,m={d};", .{ opt.cols, opt.rows - 1, more });
+        } else try stream.print(gpa, "\x1b_Gm={d};", .{more});
+        try stream.appendSlice(gpa, b64[off..end]);
+        try stream.appendSlice(gpa, "\x1b\\");
+        off = end;
+    }
+
+    var p = try Pipeline.init(env, opt.cols, opt.rows);
+    defer p.deinit(gpa);
+    const t0 = nowNs();
+    off = 0;
+    while (off < stream.items.len) {
+        const free: usize = @intCast(p.ring.capacity - (p.ring.head - p.ring.tail));
+        const n = @min(free, stream.items.len - off);
+        const at: usize = @intCast(p.ring.head & (p.ring.capacity - 1));
+        @memcpy(p.ring.storage[at..][0..n], stream.items[off..][0..n]);
+        if (!p.ring.mapped) mirror(&p.ring, at, n);
+        p.ring.head += n;
+        off += n;
+        if (p.ring.capacity - (p.ring.head - p.ring.tail) < p.ring.capacity / 4) p.ring.drain(p.term.sink());
+    }
+    p.ring.drain(p.term.sink());
+    const t1 = nowNs();
+    p.term.prepareImages();
+    const t2 = nowNs();
+    p.frame.renderSel(&p.term, env.cell_w, env.cell_h, env.ctx, size_px, .{});
+    p.term.clearDirty();
+    const t3 = nowNs();
+    const img = p.term.kitty.find(77) orelse return error.ImageDropped;
+    const steady = try gpa.alloc(u64, 20);
+    defer gpa.free(steady);
+    for (steady) |*v| {
+        // A one-cell change, as a cursor blink or a typed key would make.
+        p.term.printCodepoint('x');
+        const a = nowNs();
+        p.term.prepareImages();
+        p.frame.renderSel(&p.term, env.cell_w, env.cell_h, env.ctx, size_px, .{});
+        p.term.clearDirty();
+        v.* = nowNs() - a;
+    }
+    const st = percentiles(steady);
+    const mib = @as(f64, @floatFromInt(png.len)) / (1024 * 1024);
+    try log.print("\nimage: {d}x{d} PNG {d:.1} MiB ({d:.1} MiB base64) as pi sends it, scaled to {d}x{d} cells ({d}x{d} px)\n", .{
+        img.width, img.height, mib, @as(f64, @floatFromInt(b64.len)) / (1024 * 1024), opt.cols, opt.rows - 1, p.frame.width, p.frame.height,
+    });
+    try log.print("  transfer (drain+vt) {d:.2} ms  {d:.0} MiB/s\n", .{ @as(f64, @floatFromInt(t1 - t0)) / 1e6, @as(f64, @floatFromInt(stream.items.len)) / (1024 * 1024) / (@as(f64, @floatFromInt(t1 - t0)) / 1e9) });
+    try log.print("  decode (first draw) {d:.2} ms\n", .{@as(f64, @floatFromInt(t2 - t1)) / 1e6});
+    try log.print("  first frame         {d:.2} ms\n", .{@as(f64, @floatFromInt(t3 - t2)) / 1e6});
+    try log.print("  steady frame        p50 {d:.2} ms  p95 {d:.2} ms (one cell changes)\n", .{ st.p50 / 1e6, st.p95 / 1e6 });
+}
+
+// ---------------------------------------------------------------- firehose
+
+/// What main.zig does under sustained output: `readSource` greedily until
+/// EAGAIN + 1/hz (or EOF), then consume, feed and render once. The final
+/// visible screen and image placements are compared with a reference that
+/// parses every byte.
+fn runFirehose(log: *Log, env: *Env, wl: Workload, bytes: []const u8) !void {
+    const gpa = env.gpa;
+    const opt = env.opt;
+    const want = try referenceState(env, bytes);
+
+    var p = try Pipeline.init(env, opt.cols, opt.rows);
+    defer p.deinit(gpa);
+    const pty = try Pty.open();
+    var write_failed = false;
+    const writer = try std.Thread.spawn(.{}, writerMain, .{ pty.slave, bytes, &write_failed });
+    // The slave stays open until the end: Linux may drop unread master data
+    // on slave hangup. The reader stops once every byte has arrived.
+    defer {
+        _ = linux.close(pty.master);
+        writer.join();
+        _ = linux.close(pty.slave);
+    }
+
+    var frames: u64 = 0;
+    var render_ns: u64 = 0;
+    var timed = TimedSink{ .term = &p.term };
+    const t_start = nowNs();
+    var last_head: u64 = 0;
+    var last_progress = t_start;
+    var done = false;
+    while (!done) {
+        p.ring.readSource(FirehoseSource{ .fd = pty.master }, hz, null, timed.sink()) catch return error.PtyRead;
+        if (write_failed) return error.PtyWrite;
+        done = p.ring.head >= bytes.len;
+        if (p.ring.head != last_head) {
+            last_head = p.ring.head;
+            last_progress = nowNs();
+        } else if (!done and nowNs() - last_progress > 3 * std.time.ns_per_s) {
+            std.debug.print("firehose stalled: head={d} tail={d} len={d} hold={d} open={} write_failed={}\n", .{ p.ring.head, p.ring.tail, bytes.len, p.ring.hold_at_head, p.ring.open != null, write_failed });
+            return error.PtyStalled;
+        }
+        p.ring.drain(timed.sink());
+        p.drainHost();
+        const t1 = nowNs();
+        p.term.prepareImages();
+        p.frame.renderSel(&p.term, env.cell_w, env.cell_h, env.ctx, size_px, .{});
+        p.term.clearDirty();
+        p.presentDamage();
+        const t2 = nowNs();
+        render_ns += t2 - t1;
+        frames += 1;
+    }
+    const wall = nowNs() - t_start;
+    if (write_failed) return error.PtyWrite;
+    const got = visibleState(&p.term);
+    const mib = @as(f64, @floatFromInt(bytes.len)) / (1024 * 1024);
+    try log.print("  {s:<12} {d:>8.1} {d:>8.1} {d:>8.1} {d:>8.1} {d:>7} {d:>9.1} {s:>5} {s:>6}\n", .{
+        wl.name, @as(f64, @floatFromInt(wall)) / 1e6, @as(f64, @floatFromInt(timed.drain_ns)) / 1e6, @as(f64, @floatFromInt(timed.ns)) / 1e6, @as(f64, @floatFromInt(render_ns)) / 1e6,
+        frames, mib / (@as(f64, @floatFromInt(wall)) / 1e9), if (got.screen == want.screen) "yes" else "NO", if (got.images == want.images) "yes" else "NO",
+    });
+}
+
+const hz = 60;
+
+const FirehoseSource = struct {
+    fd: linux.fd_t,
+    pub fn read(self: FirehoseSource, dest: []u8) !usize {
+        return posix.read(self.fd, dest);
+    }
+    pub fn wait(self: FirehoseSource, event_fd: ?c_int, timeout_ms: c_int) void {
+        _ = event_fd;
+        var pfd = [1]linux.pollfd{.{ .fd = self.fd, .events = linux.POLL.IN, .revents = 0 }};
+        _ = linux.poll(&pfd, 1, timeout_ms);
+    }
+};
+
+const Visible = struct { screen: u64, images: u64 };
+
+/// Visible cells + cursor, and visible placements by position and size
+/// (ids are not compared: sixel ids depend on how many were decoded).
+fn visibleState(term: *const VtState) Visible {
+    var h: u64 = 0;
+    const base = term.imageBase();
+    const which: u1 = if (term.altScreen()) 1 else 0;
+    for (term.kitty.placements.items) |pl| {
+        if (pl.screen != which) continue;
+        const row = pl.row - base;
+        const span: i64 = @max(1, pl.rows);
+        if (row + span <= 0 or row >= term.rows) continue;
+        const img = term.kitty.find(pl.image_id) orelse continue;
+        var key = [_]u64{ @bitCast(row), @bitCast(@as(i64, pl.col)), pl.columns, pl.rows, img.width, img.height };
+        h = (h *% 0x100000001b3) ^ hashBytes(std.mem.sliceAsBytes(&key));
+    }
+    return .{ .screen = hashTerm(term) ^ (@as(u64, which) << 63), .images = h };
+}
+
+fn referenceState(env: *const Env, bytes: []const u8) !Visible {
+    const cap = std.math.ceilPowerOfTwo(usize, bytes.len + 1) catch return error.TooLarge;
+    var ring = try CircBuffer.create(env.gpa, cap);
+    defer ring.destroy();
+    var term = try VtState.init(env.gpa, env.opt.cols, env.opt.rows, scrollback, ring.storage);
+    defer term.deinit();
+    @memcpy(ring.storage[0..bytes.len], bytes);
+    if (!ring.mapped) mirror(&ring, 0, bytes.len);
+    ring.head = bytes.len;
+    ring.exact = true;
+    ring.drain(term.sink());
+    return visibleState(&term);
 }
 
 // Same as CircBuffer.syncMirror for the unmapped fallback.
@@ -1190,7 +1892,7 @@ test "benchmark workloads parse completely and images reach the store" {
             if (!ring.mapped) mirror(&ring, at, n);
             ring.head += n;
             off += n;
-            term.feedRuns(ring.consumeAndGetRuns(std.math.maxInt(usize)));
+            ring.drain(term.sink());
         }
         try std.testing.expectEqual(ring.head, ring.tail);
         if (std.mem.eql(u8, wl.name, "kitty-image") or std.mem.eql(u8, wl.name, "sixel")) {
@@ -1208,4 +1910,36 @@ test "benchmark PTY pipeline delivers every byte" {
     defer log.buffer.deinit();
     try runPipeline(&log, &env, workloads[0], bytes);
     try std.testing.expect(std.mem.indexOf(u8, log.buffer.writer.buffered(), "pipeline ascii") != null);
+}
+
+test "firehose drain keeps the final screen and images exact" {
+    const gpa = std.testing.allocator;
+    for (workloads) |wl| {
+        const bytes = try generate(gpa, wl, 1 << 20);
+        defer gpa.free(bytes);
+        const env: Env = .{ .gpa = gpa, .io = std.Io.Threaded.global_single_threaded.io(), .opt = .{}, .ctx = null, .cell_w = 8, .cell_h = 16, .emoji = false };
+        var ring = try CircBuffer.create(gpa, ring_cap);
+        defer ring.destroy();
+        var term = try VtState.init(gpa, env.opt.cols, env.opt.rows, scrollback, ring.storage);
+        defer term.deinit();
+        // Fill the ring the way readSource does: drain at a quarter free.
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const free = ring.capacity - (ring.head - ring.tail);
+            const n = @min(@min(4093, bytes.len - off), free);
+            const at: usize = @intCast(ring.head & (ring.capacity - 1));
+            @memcpy(ring.storage[at..][0..n], bytes[off..][0..n]);
+            if (!ring.mapped) mirror(&ring, at, n);
+            ring.head += n;
+            off += n;
+            if (ring.capacity - (ring.head - ring.tail) < ring.capacity / 4) ring.drain(term.sink());
+        }
+        ring.drain(term.sink());
+        const want = try referenceState(&env, bytes);
+        const got = visibleState(&term);
+        std.testing.expectEqual(want, got) catch |err| {
+            std.debug.print("workload {s}: screen {} images {}\n", .{ wl.name, want.screen == got.screen, want.images == got.images });
+            return err;
+        };
+    }
 }

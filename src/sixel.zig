@@ -21,6 +21,16 @@ pub const Params = struct {
 };
 
 pub fn decode(allocator: std.mem.Allocator, body: []const u8, params: Params) error{InvalidSixel}!Bitmap {
+    return walk(true, allocator, body, params);
+}
+
+/// The size `decode` would return, without painting (the palette is left
+/// untouched). `rgba` is empty.
+pub fn measure(body: []const u8, params: Params) Bitmap {
+    return walk(false, undefined, body, params) catch .{ .width = 1, .height = 1, .rgba = &.{} };
+}
+
+fn walk(comptime paint: bool, allocator: std.mem.Allocator, body: []const u8, params: Params) error{InvalidSixel}!Bitmap {
     var pal = params.palette.*;
     var x: u32 = 0;
     var y: u32 = 0;
@@ -33,9 +43,10 @@ pub fn decode(allocator: std.mem.Allocator, body: []const u8, params: Params) er
     var h: u32 = 6;
     var i: usize = 0;
 
-    var pix = allocator.alloc(u32, @as(usize, w) * h) catch return error.InvalidSixel;
-    errdefer allocator.free(pix);
-    @memset(pix, fillFor(params, &pal));
+    var pix: []u32 = &.{};
+    if (paint) pix = allocator.alloc(u32, @as(usize, w) * h) catch return error.InvalidSixel;
+    errdefer if (paint) allocator.free(pix);
+    if (paint) @memset(pix, fillFor(params, &pal));
 
     while (i < body.len) {
         const c = body[i];
@@ -58,7 +69,7 @@ pub fn decode(allocator: std.mem.Allocator, body: []const u8, params: Params) er
                 if (ph > 0 or pv > 0) {
                     const nw = if (ph > 0) @min(ph, params.max_w) else w;
                     const nh = if (pv > 0) @min(pv, params.max_h) else h;
-                    pix = grow(allocator, pix, w, h, nw, nh, fillFor(params, &pal)) catch return error.InvalidSixel;
+                    if (paint) pix = try grow(allocator, pix, w, h, nw, nh, fillFor(params, &pal));
                     w = nw;
                     h = nh;
                 }
@@ -75,7 +86,7 @@ pub fn decode(allocator: std.mem.Allocator, body: []const u8, params: Params) er
                     const py = readNum(body, &i);
                     skipSemi(body, &i);
                     const pz = readNum(body, &i);
-                    if (color_i < pal.len) {
+                    if (paint and color_i < pal.len) {
                         pal[color_i] = if (pu == 1) hls(px, py, pz) else rgb100(px, py, pz);
                     }
                 }
@@ -86,7 +97,7 @@ pub fn decode(allocator: std.mem.Allocator, body: []const u8, params: Params) er
                 y += 6;
                 if (y + 6 > h) {
                     const nh = @min(y + 6, params.max_h);
-                    pix = grow(allocator, pix, w, h, w, nh, fillFor(params, &pal)) catch return error.InvalidSixel;
+                    if (paint) pix = try grow(allocator, pix, w, h, w, nh, fillFor(params, &pal));
                     h = nh;
                 }
             },
@@ -98,8 +109,17 @@ pub fn decode(allocator: std.mem.Allocator, body: []const u8, params: Params) er
                 if (bits != 0 or !params.transparent) {
                     if (y + 6 > h and h < params.max_h) {
                         const nh = @min(@max(h * 2, y + 6), params.max_h);
-                        pix = grow(allocator, pix, w, h, w, nh, fillFor(params, &pal)) catch return error.InvalidSixel;
+                        if (paint) pix = try grow(allocator, pix, w, h, w, nh, fillFor(params, &pal));
                         h = nh;
+                    }
+                    if (!paint) {
+                        // Same growth as below (w doubles when x reaches it), without pixels.
+                        const target = @min(x +| n, params.max_w);
+                        while (w < target) w = @min(w * 2, params.max_w);
+                        x = @max(x, target);
+                        max_x = @max(max_x, x);
+                        max_y = @max(max_y, y + 6);
+                        continue;
                     }
                     const packed_c = pack(pal[@min(color_i, pal.len - 1)]);
                     const rows: u32 = @min(6, h -| y);
@@ -108,10 +128,10 @@ pub fn decode(allocator: std.mem.Allocator, body: []const u8, params: Params) er
                         if (x >= params.max_w) break;
                         if (x >= w) {
                             const nw = @min(@max(w * 2, x + 1), params.max_w);
-                            pix = grow(allocator, pix, w, h, nw, h, fillFor(params, &pal)) catch return error.InvalidSixel;
+                            if (paint) pix = try grow(allocator, pix, w, h, nw, h, fillFor(params, &pal));
                             w = nw;
                         }
-                        if (bits != 0) {
+                        if (paint and bits != 0) {
                             var idx = @as(usize, y) * w + x;
                             var b: u32 = 0;
                             while (b < rows) : (b += 1) {
@@ -131,9 +151,10 @@ pub fn decode(allocator: std.mem.Allocator, body: []const u8, params: Params) er
         }
     }
 
-    params.palette.* = pal;
     const out_w = @max(1, @min(w, if (max_x == 0) w else max_x));
     const out_h = @max(1, @min(h, if (max_y == 0) h else max_y));
+    if (!paint) return .{ .width = out_w, .height = out_h, .rgba = &.{} };
+    params.palette.* = pal;
     const rgba = allocator.alloc(u8, @as(usize, out_w) * out_h * 4) catch {
         allocator.free(pix);
         return error.InvalidSixel;
@@ -282,4 +303,23 @@ test "sixel non-transparent keeps earlier color passes in a band" {
     try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255 }, bmp.rgba[bmp.width * 4 ..][0..4]);
     // untouched pixel is opaque background (palette 0)
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, bmp.rgba[bmp.width * 2 * 4 ..][0..4]);
+}
+
+test "measure matches decode size" {
+    const gpa = std.testing.allocator;
+    var pal = defaultPalette();
+    const bodies = [_][]const u8{
+        "#1~~~~-#2!10~",
+        "\"1;1;30;20#3!40?",
+        "#0;2;100;0;0~~$~~-~-~",
+        "!700~-!3~$!2000?~",
+        "\"1;1;3;3!9~",
+    };
+    for (bodies) |body| {
+        const m = measure(body, .{ .palette = &pal });
+        const bmp = try decode(gpa, body, .{ .palette = &pal });
+        defer gpa.free(bmp.rgba);
+        try std.testing.expectEqual(bmp.width, m.width);
+        try std.testing.expectEqual(bmp.height, m.height);
+    }
 }

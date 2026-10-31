@@ -53,7 +53,7 @@ pub fn build(b: *std.Build) void {
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("src/bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = b.option(std.builtin.OptimizeMode, "bench-optimize", "Bench optimize mode (default ReleaseFast)") orelse .ReleaseFast,
         .link_libc = true,
     });
     addStbTrueType(bench_mod, b);
@@ -67,6 +67,8 @@ pub fn build(b: *std.Build) void {
     bench_run.addPassthruArgs();
     const bench_step = b.step("bench", "Run PTY pipeline, glyph cache and render benchmarks (ReleaseFast)");
     bench_step.dependOn(&bench_run.step);
+    const bench_install = b.step("bench-install", "Install velocitty-bench to zig-out/bin (for +terminal-stream and scripts)");
+    bench_install.dependOn(&b.addInstallArtifact(bench_exe, .{}).step);
 
     // Each OS uses its native SDK; Linux hosts can also build Windows directly.
     const release_step = b.step("release", "Build ReleaseFast binaries for available target SDKs");

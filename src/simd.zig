@@ -90,3 +90,21 @@ pub inline fn skipUntil(
 
     return offset;
 }
+
+/// Index of the first byte that equals any of `set` (or `slice.len`).
+pub inline fn skipToAny(slice: []const u8, comptime set: []const u8) u32 {
+    var offset: u32 = 0;
+    const slice_len: u32 = @intCast(slice.len);
+    while (offset + vec_len <= slice_len) {
+        const chunk: Vec = slice[offset..][0..vec_len].*;
+        var matches: @Vector(vec_len, bool) = @splat(false);
+        inline for (set) |b| matches = matches | (chunk == @as(Vec, @splat(b)));
+        const mask: Mask = @bitCast(matches);
+        if (mask != 0) return offset + @ctz(mask);
+        offset += vec_len;
+    }
+    while (offset < slice_len) : (offset += 1) {
+        inline for (set) |b| if (slice[offset] == b) return offset;
+    }
+    return offset;
+}
