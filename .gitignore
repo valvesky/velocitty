@@ -5,13 +5,13 @@ zig-out/
 
 # Release tarballs (`zig build package`)
 /packages/
+/dist/
 
 # Fetched package cache
 zig-pkg/
 
-# Local bench dumps 
+# Local bench dumps
 /bench
-/last_bench
 
 # Compiled leftovers
 *.o
@@ -29,6 +29,9 @@ a.out
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Local agent worktrees (managed by git worktree)
+/.claude/worktrees/
 
 # Editors
 *.swp

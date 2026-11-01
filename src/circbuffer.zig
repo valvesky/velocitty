@@ -1,15 +1,5 @@
-//! Mirrored circular buffer for dealing with firehose PTY input.
-//!
-//! The mirrored buffer is also responsible for preparsing
-//! and splitting the input into lines and then into runs
-//! of easy to parse sequences.
-//!
-//! Keeping everything here guarrantees that the lines and runs
-//! indeed point to the correct buffer.
-//!
-//! Obviously, we want to reduce runtime allocations to close to
-//! zero. Runs and Lines are stored in dynamic arrays that only
-//! grow and double and size.
+//! Mirrored circular buffer for handling input.
+//! Owns byte/stream storage and a preparser for run classification and draining.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -17,59 +7,74 @@ const builtin = @import("builtin");
 const assert = std.debug.assert;
 const posix = std.posix;
 
-const SIMD = @import("simd.zig");
+const Preparse = @import("preparser.zig");
+const stEnd = Preparse.stringEnd;
 
-pub const Line = packed struct {
-    off: u32,
-    len: u32,
-    esc: bool,
+pub const Run = Preparse.Run;
+pub const Role = Preparse.Role;
+pub const View = Preparse.View;
+
+/// Receives the runs of a drain, in byte order. `stream` backs runs with
+/// `Run.Flags.stream` set; `owner` is the buffer they come from, for
+/// `takeStream` (valid only during the call). Return the number of runs
+/// consumed; with `retain_live` the consumer may stop before a live text/LF.
+pub const Sink = struct {
+    ctx: *anyopaque,
+    feed: *const fn (ctx: *anyopaque, runs: []const Run, stream: []const u8, owner: *CircBuffer) usize,
+    view: *const fn (ctx: *anyopaque) View,
 };
 
-pub const Run = struct {
-    pub const Kind = enum {
-        c0,
-        c1,
-        esc,
-        csi,
-        osc,
-        str,
-        esc_kitty,
-        esc_sixel,
-        plain,
-        utf8,
-    };
+/// Default stream cap (as kitty's largest image); a longer string is
+/// discarded through its terminator.
+pub const default_max_stream: usize = 320 * 1024 * 1024;
+/// Stream capacity kept between strings; larger buffers are freed.
+const stream_keep: usize = 1024 * 1024;
 
-    kind: Kind,
-    off: u32,
-    len: u32,
+const StreamState = struct {
+    kind: Run.Kind,
+    /// Where the open string starts in `stream`.
+    base: usize,
+    /// The last byte appended was ESC: `\` completes ST.
+    esc: bool = false,
+    discard: bool = false,
+    /// `readSource` read the terminator straight into `stream`: the string is
+    /// complete and the next drain emits it as a run, before the ring.
+    closed: bool = false,
 };
 
 pub const CircBuffer = struct {
+    pub const default_capacity = 1024 * 1024;
+
     allocator: std.mem.Allocator,
     storage: []u8,
     capacity: usize,
     mapped: bool,
     head: u64 = 0,
     tail: u64 = 0,
-    /// `head` when an incomplete ESC/CSI/OSC/UTF-8 run was parked at the end.
+    /// `head` when an incomplete ESC/CSI/UTF-8 run was parked at the end.
     /// `pending` stays false until more bytes arrive so we do not spin.
     hold_at_head: u64 = 0,
-    epoch: u64 = 0,
-    lines: std.ArrayListUnmanaged(Line) = .empty,
-    runs: std.ArrayListUnmanaged(Run) = .empty,
-
+    /// A drain fed runs since the flag was last cleared.
+    fed: bool = false,
+    /// Feed everything, dead or not (reference parses and debugging).
+    exact: bool = false,
+    /// During pressure consumption, stop before cell work still needed as
+    /// lookahead. Normal frame drains and minimum reader progress consume it.
+    retain_live: bool = false,
+    /// Pressure hysteresis: release at least a quarter-ring before pausing,
+    /// not just enough bytes to cross back under the 75% trigger.
+    pause_tail: u64 = 0,
+    preparser: Preparse.Preparser,
+    stream: std.ArrayListUnmanaged(u8) = .empty,
+    max_stream: usize = default_max_stream,
+    open: ?StreamState = null,
     /// Create circular buffer
     pub fn create(allocator: std.mem.Allocator, capacity: usize) std.mem.Allocator.Error!CircBuffer {
         assert(capacity > 0);
         assert(std.math.isPowerOfTwo(capacity));
 
-        var lines: std.ArrayListUnmanaged(Line) = .empty;
-        try lines.ensureTotalCapacity(allocator, 256);
-        errdefer lines.deinit(allocator);
-
-        var runs: std.ArrayListUnmanaged(Run) = .empty;
-        try runs.ensureTotalCapacity(allocator, 1024);
-        errdefer runs.deinit(allocator);
+        var preparser = try Preparse.Preparser.init(allocator);
+        errdefer preparser.deinit();
 
         if (mapMirror(capacity)) |storage| {
             return .{
@@ -77,8 +82,7 @@ pub const CircBuffer = struct {
                 .storage = storage,
                 .capacity = capacity,
                 .mapped = true,
-                .lines = lines,
-                .runs = runs,
+                .preparser = preparser,
             };
         }
 
@@ -88,8 +92,7 @@ pub const CircBuffer = struct {
             .storage = storage,
             .capacity = capacity,
             .mapped = false,
-            .lines = lines,
-            .runs = runs,
+            .preparser = preparser,
         };
     }
 
@@ -103,32 +106,13 @@ pub const CircBuffer = struct {
         } else {
             self.allocator.free(self.storage);
         }
-        self.lines.deinit(self.allocator);
-        self.runs.deinit(self.allocator);
+        self.preparser.deinit();
+        self.stream.deinit(self.allocator);
         self.* = undefined;
     }
 
-    /// Consume everything and return runs.
-    pub fn consumeAndGetRuns(self: *CircBuffer, nlines: usize) []Run {
-        self.consumeAndPreparse();
-        if (self.lines.items.len == 0) {
-            self.finishConsume(0);
-            return &.{};
-        }
-        const all = nlines >= self.lines.items.len;
-        const lines = self.getLastNLines(nlines);
-        if (lines.len == 0) {
-            self.finishConsume(0);
-            return &.{};
-        }
-        self.splitIntoRuns(lines);
-        var held: u32 = 0;
-        if (all) held = self.trimIncomplete();
-        self.finishConsume(held);
-        return self.runs.items;
-    }
-
     pub fn pending(self: *const CircBuffer) bool {
+        if (self.open) |sp| if (sp.closed) return true;
         if (self.head == self.tail) return false;
         if (self.hold_at_head != 0 and self.head == self.hold_at_head) return false;
         return true;
@@ -137,43 +121,63 @@ pub const CircBuffer = struct {
     /// The circular buffer read directly from the PTY using
     /// it's very particular logic.
     ///
-    /// 1. We are allowed to truncate data and to delete old data.
-    /// That's the purpose of a circular buffer in the first place.
-    /// Meaning that if we recieve firehose input it will be trucated
-    /// by this function to the size of the circular buffer.
+    /// 1. Bytes are never overwritten before they are consumed. Below a
+    /// quarter free, `drain(sink, true)` consumes complete spans. Only painting
+    /// proven obsolete by `preparser.isSpanObsolete` may be omitted during
+    /// consumption. State and graphics stay ordered.
+    /// Without a sink reading stops under pressure.
     ///
     /// 2. So as to not completely freeze the program, we will
     /// return on EAGAIN IF AND ONLY IF 1/hz has passed. By default
     /// hz should be 30.
-    ///
-    /// To agents and humans: DO NOT CHANGE THIS COMMENT and do not
-    /// break this logic.
     pub const Pump = struct {
         fd: c_int,
         ctx: *anyopaque,
         tick: *const fn (*anyopaque) void,
     };
 
-    pub fn readPTY(self: *CircBuffer, pty: posix.fd_t, hz: u32) error{Hangup}!void {
-        return self.readPTYPump(pty, hz, null);
+    pub fn readPTY(self: *CircBuffer, pty: posix.fd_t, hz: u32, sink: ?Sink) error{Hangup}!void {
+        return self.readPTYPump(pty, hz, null, sink);
     }
 
     /// Same return rules as `readPTY`. `pump` is ticked when its fd wakes during the EAGAIN wait
     /// so window events are not frozen for 1/hz.
-    pub fn readPTYPump(self: *CircBuffer, pty: posix.fd_t, hz: u32, pump: ?Pump) error{Hangup}!void {
-        return self.readSource(FdSource{ .fd = pty }, hz, pump);
+    pub fn readPTYPump(self: *CircBuffer, pty: posix.fd_t, hz: u32, pump: ?Pump, sink: ?Sink) error{Hangup}!void {
+        return self.readSource(FdSource{ .fd = pty }, hz, pump, sink);
     }
 
-    /// A nonblocking source retains the same firehose/EOF/EAGAIN contract on every OS.
-    pub fn readSource(self: *CircBuffer, source: anytype, hz: u32, pump: ?Pump) error{Hangup}!void {
+    /// Source read contract.
+    pub fn readSource(self: *CircBuffer, source: anytype, hz: u32, pump: ?Pump, sink: ?Sink) error{Hangup}!void {
         const rate: u32 = if (hz == 0) 30 else hz;
         const period_ns: i128 = @divTrunc(1_000_000_000, rate);
         const start_ns = nowNs();
         const mask = self.capacity - 1;
 
         while (true) {
-            const off: usize = @intCast(self.head & mask);
-            const dest = self.storage[off..][0..self.capacity];
+
+            // NOTE(vasco): Above 75% occupancy, consume complete runs from
+            // the oldest roughly quarter-buffer, judging obsolete painting
+            // with the newer runs as lookahead. Keep those newer runs queued;
+            // an immediate full drain here would defeat the dead-zone trim.
+            if (self.capacity - (self.head - self.tail) < self.capacity / 4) {
+                const s = sink orelse return;
+
+                self.drain(s, true);
+            }
+
+            // A string left open by the drain takes the read directly (the
+            // ring is empty then).
+            const direct = self.directDest();
+            var off: usize = 0;
+            var dest: []u8 = undefined;
+            if (direct) |d| {
+                dest = d;
+            } else {
+                const free: usize = @intCast(self.capacity - (self.head - self.tail));
+                if (free == 0) return;
+                off = @intCast(self.head & mask);
+                dest = self.storage[off..][0..free];
+            }
             const n = source.read(dest) catch |err| switch (err) {
                 error.WouldBlock => {
                     const elapsed = nowNs() - start_ns;
@@ -203,9 +207,82 @@ pub const CircBuffer = struct {
                 else => return error.Hangup,
             };
             if (n == 0) return error.Hangup;
+            if (direct != null) {
+                self.streamRead(n);
+                continue;
+            }
             self.syncMirror(off, n);
             self.head += n;
         }
+    }
+
+    /// Spare capacity of the open string's stream buffer to read into, or null
+    /// when reads go to the ring (no open string, one that is already
+    /// complete or discarded, or unconsumed bytes in the ring).
+    fn directDest(self: *CircBuffer) ?[]u8 {
+        const sp = &(self.open orelse return null);
+        if (sp.closed or sp.discard or self.head != self.tail) return null;
+        const len = self.stream.items.len - sp.base;
+        // One read more than fits is enough to know the string is over the cap;
+        // never more than the ring holds, so the bytes after the terminator
+        // always fit back into it. A read is also no larger than what the
+        // string already holds (at least 4 KiB): the bytes after the
+        // terminator are copied back, which must stay small next to the
+        // string (a short string that merely straddles a drain).
+        const room = self.max_stream -| len +| 2;
+        const want = @min(@min(room, self.capacity), @max(len, 4096));
+        if (self.stream.capacity - self.stream.items.len < want) {
+            const grown = @min(@max(self.stream.items.len + want, self.stream.capacity *| 2), self.stream.items.len + room);
+            self.stream.ensureTotalCapacityPrecise(self.allocator, grown) catch return null;
+        }
+        return self.stream.unusedCapacitySlice()[0..want];
+    }
+
+    /// `n` bytes were read into the spare capacity of `stream`: keep them up
+    /// to the terminator (as `continueStream` does for ring bytes) and return
+    /// the rest to the ring.
+    fn streamRead(self: *CircBuffer, n: usize) void {
+        const sp = &self.open.?;
+        const at = self.stream.items.len;
+        const new = self.stream.unusedCapacitySlice()[0..n];
+        const end: ?usize = if (sp.esc and new[0] == '\\') 1 else stEnd(new, 0);
+        const take = end orelse n;
+        sp.esc = end == null and new[n - 1] == 0x1B;
+        if (at - sp.base + take > self.max_stream) {
+            sp.discard = true;
+            self.stream.shrinkRetainingCapacity(sp.base);
+        } else {
+            self.stream.items.len = at + take;
+        }
+        const e = end orelse return;
+        if (sp.discard) self.open = null else sp.closed = true;
+        // `new` is still intact past `take`: back into the (empty) ring.
+        const rest = new[e..];
+        if (rest.len == 0) return;
+        const off: usize = @intCast(self.head & (self.capacity - 1));
+        @memcpy(self.storage[off..][0..rest.len], rest);
+        self.syncMirror(off, rest.len);
+        self.head += rest.len;
+    }
+
+    /// Take the stream buffer itself, for the consumer of the run at
+    /// `off..off + len` in it (during `Sink.feed`). Only a run that ends the
+    /// buffer, longer than half a ring (smaller strings are cheaper to copy
+    /// than to keep a buffer for), with no string open behind it. The
+    /// caller owns the whole returned allocation, which holds the run at
+    /// `off` (free it with the `allocator` given, which must be the one the
+    /// ring uses), and no slice into the stream may be used afterwards.
+    pub fn takeStream(self: *CircBuffer, allocator: std.mem.Allocator, off: usize, len: usize) ?[]u8 {
+        if (self.open != null or len < self.capacity / 2) return null;
+        if (off + len != self.stream.items.len) return null;
+        if (allocator.ptr != self.allocator.ptr or allocator.vtable != self.allocator.vtable) return null;
+        var buf = self.stream.allocatedSlice();
+        self.stream = .empty;
+        // Give back growth slack when it is cheap (realloc in place).
+        if (buf.len - (off + len) > buf.len / 8) {
+            if (allocator.remap(buf, off + len)) |small| buf = small;
+        }
+        return buf;
     }
 
     fn syncMirror(self: *CircBuffer, off: usize, n: usize) void {
@@ -222,234 +299,147 @@ pub const CircBuffer = struct {
         }
     }
 
-    /// Consume all the bytes. Will be a maximum of the size
-    /// of the buffer since data is meant to be truncated.
-    /// This function will preparse input into lines.
-    ///
-    /// Needs a terminal to apply a few "whitelisted"
-    /// sequences that could effect the final screen.
-    pub fn consumeAndPreparse(self: *CircBuffer) void {
+    /// Pressure drains retain the live suffix as lookahead; normal frame
+    /// drains consume it. Metadata is a bounded, reused workset in both cases.
+    /// Unprovable input still makes progress rather than filling the ring.
+    pub fn drain(self: *CircBuffer, sink: Sink, skipText: bool) void {
         assert(self.tail <= self.head);
-
-        // NOTE(vasco): indices are monotonic and keep growing forever
-        // therefore we must make sure the head hasn't skipped too far
-        // ahead of tail.
-        if ((self.head - self.tail) > self.capacity)
-            self.tail = self.head - self.capacity;
-        splitIntoLines(self);
+        self.retain_live = skipText and !self.exact and self.underPressure();
+        self.pause_tail = self.tail + self.capacity / 4;
+        defer {
+            self.retain_live = false;
+            self.pause_tail = 0;
+        }
+        while (self.pending()) {
+            const result = self.scan(sink.view(sink.ctx), skipText);
+            const runs = self.preparser.runs.items;
+            if (runs.len != 0) {
+                const consumed = sink.feed(sink.ctx, runs, self.stream.items, self);
+                assert(consumed <= runs.len);
+                self.fed = self.fed or consumed != 0;
+                if (consumed < runs.len) {
+                    assert(self.retain_live);
+                    const next = runs[consumed];
+                    assert(!next.flags.stream);
+                    const start: usize = @intCast(self.tail & (self.capacity - 1));
+                    self.tail += (@as(usize, next.off) -% start) & (self.capacity - 1);
+                    self.hold_at_head = 0;
+                    self.tidyStream();
+                    if (consumed == 0) {
+                        assert(!self.underPressure());
+                        return;
+                    }
+                    if (!result.retry and !self.underPressure()) return;
+                    // Reframe only the retained bytes, against the VT's now
+                    // current view. Their storage has not moved or been freed.
+                    continue;
+                }
+            }
+            // Do not stream out a future string until every preceding run
+            // was consumed. Otherwise a retained live suffix would be fed
+            // back as continuation bytes of that later string.
+            if (result.stream) |run| self.openStream(self.storage[run.off..][0..run.len], run.kind);
+            self.tail = self.head - result.held;
+            self.hold_at_head = if (result.held != 0 and !result.retry) self.head else 0;
+            self.tidyStream();
+            if (!result.retry) return;
+        }
     }
 
-    fn finishConsume(self: *CircBuffer, held: u32) void {
-        if (held == 0 or held > self.head - self.tail) {
-            self.tail = self.head;
-            self.hold_at_head = 0;
+    /// Scheduling only: can the consumer stop before this ring-backed span
+    /// after releasing a quarter-ring? Unprovable cell work before that point
+    /// is consumed normally in the same pass. This hysteresis avoids repeated
+    /// lookahead scans on each small PTY read just above the pressure trigger.
+    pub fn canPauseBefore(self: *const CircBuffer, run: Run) bool {
+        assert(!run.flags.stream);
+        const start: usize = @intCast(self.tail & (self.capacity - 1));
+        const before = (@as(usize, run.off) -% start) & (self.capacity - 1);
+        return self.tail + @as(u64, before) >= self.pause_tail;
+    }
+
+    fn underPressure(self: *const CircBuffer) bool {
+        return self.capacity - (self.head - self.tail) < self.capacity / 4;
+    }
+
+    fn tidyStream(self: *CircBuffer) void {
+        if (self.open == null) {
+            if (self.stream.capacity > stream_keep) self.stream.clearAndFree(self.allocator) else self.stream.clearRetainingCapacity();
+        } else {
+            // Strings completed by this drain were fed; only the open one
+            // stays, at the start of the buffer, before it grows by reads.
+            self.compactStream();
+        }
+    }
+
+    /// Move the open string to the start of `stream`.
+    fn compactStream(self: *CircBuffer) void {
+        const st = &(self.open orelse return);
+        if (st.base == 0) return;
+        const rest = self.stream.items[st.base..];
+        @memmove(self.stream.items[0..rest.len], rest);
+        self.stream.shrinkRetainingCapacity(rest.len);
+        st.base = 0;
+    }
+
+    /// Frame input, completing any earlier stream string before ring spans.
+    fn scan(self: *CircBuffer, view: View, skipText: bool) Preparse.Result {
+        const to_read: u32 = @intCast(self.head - self.tail);
+        const start: u32 = @intCast(self.tail & (self.capacity - 1));
+        const slice = self.storage[start..][0..to_read];
+        const previous: StreamResult = if (self.open != null) self.continueStream(slice) else .{};
+        // Continuation bytes are now owned by stream storage (or discarded),
+        // even if consumption stops before the first remaining ring span.
+        self.tail += previous.consumed;
+        return self.preparser.prepare(slice[previous.consumed..], start + previous.consumed, view, self.exact or !skipText, previous.initial);
+    }
+
+    const StreamResult = struct {
+        consumed: u32 = 0,
+        initial: ?Preparse.Initial = null,
+    };
+
+    /// Append through the terminator; return consumed bytes and, if complete,
+    /// a borrowed stream run for the preparser to classify before ring input.
+    fn continueStream(self: *CircBuffer, slice: []const u8) StreamResult {
+        const sp = &self.open.?;
+        if (sp.closed) {
+            // Read directly into `stream`; the terminator is already in.
+            return .{ .initial = self.finishStream() };
+        }
+        const end: ?usize = if (sp.esc and slice.len != 0 and slice[0] == '\\') 1 else stEnd(slice, 0);
+        const take = end orelse slice.len;
+        sp.esc = end == null and slice.len != 0 and slice[slice.len - 1] == 0x1B;
+        self.appendStream(slice[0..take]);
+        if (end == null) return .{ .consumed = @intCast(slice.len) };
+        return .{ .consumed = @intCast(take), .initial = self.finishStream() };
+    }
+
+    /// The open string is complete: its run is the tag, pointing into `stream`.
+    fn finishStream(self: *CircBuffer) ?Preparse.Initial {
+        const done = self.open.?;
+        self.open = null;
+        if (done.discard) return null;
+        const bytes = self.stream.items[done.base..];
+        return .{ .run = .{ .kind = done.kind, .flags = .{ .stream = true }, .off = @intCast(done.base), .len = @intCast(bytes.len) }, .bytes = bytes };
+    }
+
+    fn openStream(self: *CircBuffer, bytes: []const u8, kind: Run.Kind) void {
+        self.open = .{ .kind = kind, .base = self.stream.items.len };
+        self.open.?.esc = bytes[bytes.len - 1] == 0x1B;
+        self.appendStream(bytes);
+    }
+
+    fn appendStream(self: *CircBuffer, bytes: []const u8) void {
+        const sp = &self.open.?;
+        if (sp.discard) return;
+        if (self.stream.items.len - sp.base + bytes.len > self.max_stream) {
+            sp.discard = true;
+            self.stream.shrinkRetainingCapacity(sp.base);
             return;
         }
-        self.tail = self.head - held;
-        self.hold_at_head = self.head;
-    }
-
-    fn trimIncomplete(self: *CircBuffer) u32 {
-        if (self.runs.items.len == 0) return 0;
-        const last = self.runs.items[self.runs.items.len - 1];
-        const bytes = self.storage[last.off .. last.off + last.len];
-        if (runIsComplete(last.kind, bytes)) return 0;
-        _ = self.runs.pop();
-        return last.len;
-    }
-
-    /// Get last N lines of input. May be less than expected.
-    pub fn getLastNLines(self: CircBuffer, n: usize) []Line {
-        const len = self.lines.items.len;
-        const min = @min(n, len);
-        return self.lines.items[len - min ..];
-    }
-
-    /// Vectorized loop that splits circular buffer into lines
-    fn splitIntoLines(self: *CircBuffer) void {
-
-        // NOTE(vasco): again, because this is a mapped
-        // circular buffed, we can also read without
-        // wrapping without any worries
-        assert(std.math.isPowerOfTwo(self.capacity));
-        assert(self.tail <= self.head);
-
-        self.lines.clearRetainingCapacity();
-
-        const to_read: u32 = @intCast(self.head - self.tail);
-        const start: u32 = @intCast(self.tail & (self.capacity - 1)); // same as %
-        const end = start + to_read;
-        const slice = self.storage[start..end];
-
-        var i: u32 = 0;
-        var line_start: u32 = 0;
-        var esc: bool = false;
-
-        while (i < to_read) {
-
-            // NOTE(vasco): The only thing we need to look
-            // for is ESC and LF. "Offscreen" escape sequences
-            // may change the end result on the screen. They
-            // may also contain newline bytes that aren't meant
-            // to split the screen.
-
-            i += SIMD.skipEqualEither(slice[i..], 0x0A, 0x1B);
-            if (i >= to_read) break;
-
-            switch (slice[i]) {
-                0x0A => {
-                    self.pushLine(.{
-                        .off = start + line_start,
-                        .len = i - line_start + 1,
-                        .esc = esc,
-                    });
-                    esc = false;
-                    i += 1;
-                    line_start = i;
-                },
-                0x1B => {
-                    esc = true;
-                    i += 1;
-                    // TODO: some actual parsing
-                    // for the sake of correctness
-                },
-                else => unreachable,
-            }
-        }
-
-        // push trailing line
-        if (line_start < to_read) {
-            self.pushLine(.{
-                .off = start + line_start,
-                .len = to_read - line_start,
-                .esc = esc,
-            });
-        }
-    }
-
-    pub fn splitIntoRuns(self: *CircBuffer, lines: []Line) void {
-
-        // NOTE(vasco): Splitting into Runs should be
-        // pretty simple: scan for <= SPC and >= DEL
-        // Once we know if we have either we can
-        // use a pretty simple switch to and determine
-        // the run type.
-
-        // NOTE(vasco): We want to parse lines as if they are contiguous
-        // while also taking advantage of flags like .esc
-        // of each line for an easier time parsing.
-
-        self.runs.clearRetainingCapacity();
-
-        const start = lines[0].off;
-        const last_line = lines[lines.len - 1];
-        const end = last_line.off + last_line.len;
-        const to_read: u32 = end - start;
-        const slice = self.storage[start..end];
-
-        var i: u32 = 0;
-        var run_start: u32 = 0;
-
-        while (i < to_read) {
-            // NOTE(vasco): fast forward ascii
-            i += SIMD.skipOutRange(slice[i..], 0x21, 0x7E);
-
-            if (i >= to_read) break;
-
-            const c = slice[i];
-
-            if (i > run_start) {
-                self.pushRun(.{
-                    .off = start + run_start,
-                    .len = i - run_start,
-                    .kind = .plain,
-                });
-            }
-
-            var kind: Run.Kind = .c0;
-            var seq_len: u32 = 1;
-
-            if (c == 0x1B) { // ESC sequence family
-                if (i + 1 < to_read) {
-                    const next = slice[i + 1];
-                    switch (next) {
-                        '[' => {
-                            kind = .csi;
-                            seq_len = @intCast(skipCsi(slice[i..]));
-                        },
-                        ']' => {
-                            kind = .osc;
-                            seq_len = @intCast(skipOsc(slice[i..]));
-                        },
-                        'P' => { // DCS (Sixel / Kitty graphics)
-                            seq_len = @intCast(skipDcs(slice[i..]));
-                            if (std.mem.startsWith(u8, slice[i..], "\x1bPq")) {
-                                kind = .esc_sixel;
-                            } else if (std.mem.startsWith(u8, slice[i..], "\x1bP_G")) {
-                                kind = .esc_kitty;
-                            } else {
-                                kind = .str;
-                            }
-                        },
-                        '_', '^', 'X' => { // APC / PM / SOS
-                            kind = .str;
-                            seq_len = @intCast(skipStTerminated(slice[i..]));
-                        },
-                        else => {
-                            kind = .esc;
-                            seq_len = @intCast(skipEsc(slice[i..]));
-                        },
-                    }
-                } else {
-                    kind = .esc;
-                    seq_len = 1;
-                }
-            } else if (c >= 0x80) { // High-bit (UTF-8 or C1 control)
-                const utf8_len = std.unicode.utf8ByteSequenceLength(c) catch 1;
-                if (utf8_len > 1) {
-                    kind = .utf8;
-                    if (i + utf8_len <= to_read) {
-                        seq_len = @intCast(utf8_len);
-                    } else {
-                        seq_len = to_read - i;
-                    }
-                } else {
-                    kind = .c1;
-                    seq_len = 1;
-                }
-            } else { // C0 control byte (0x0A '\n', 0x0D '\r', 0x09 '\t', 0x20 ' ', etc.)
-                kind = .c0;
-                seq_len = 1;
-            }
-
-            self.pushRun(.{
-                .off = start + i,
-                .len = seq_len,
-                .kind = kind,
-            });
-
-            i += seq_len;
-            run_start = i;
-        }
-
-        if (to_read > run_start) {
-            self.pushRun(.{
-                .off = start + run_start,
-                .len = to_read - run_start,
-                .kind = .plain,
-            });
-        }
-    }
-
-    inline fn pushRun(self: *CircBuffer, run: Run) void {
-        self.runs.append(self.allocator, run) catch {
-            // wow
-        };
-    }
-
-    inline fn pushLine(self: *CircBuffer, line: Line) void {
-        self.lines.append(self.allocator, line) catch {
-            // wow
+        self.stream.appendSlice(self.allocator, bytes) catch {
+            sp.discard = true;
+            self.stream.shrinkRetainingCapacity(sp.base);
         };
     }
 
@@ -459,7 +449,7 @@ pub const CircBuffer = struct {
         const fd = posix.memfd_create("zt-ring", 0) catch return null;
         defer _ = std.os.linux.close(fd);
         if (std.os.linux.errno(std.os.linux.ftruncate(fd, @intCast(size))) != .SUCCESS) return null;
-        const none = posix.mmap(
+        const reserved = posix.mmap(
             null,
             size * 2,
             .{},
@@ -467,7 +457,7 @@ pub const CircBuffer = struct {
             -1,
             0,
         ) catch return null;
-        const half: [*]align(std.heap.page_size_min) u8 = @ptrCast(none.ptr);
+        const half: [*]align(std.heap.page_size_min) u8 = @ptrCast(reserved.ptr);
         _ = posix.mmap(
             half,
             size,
@@ -476,7 +466,7 @@ pub const CircBuffer = struct {
             fd,
             0,
         ) catch {
-            posix.munmap(none);
+            posix.munmap(reserved);
             return null;
         };
         const rest: [*]align(std.heap.page_size_min) u8 = @alignCast(half + size);
@@ -488,82 +478,12 @@ pub const CircBuffer = struct {
             fd,
             0,
         ) catch {
-            posix.munmap(none);
+            posix.munmap(reserved);
             return null;
         };
-        return none;
+        return reserved;
     }
 };
-
-fn runIsComplete(kind: Run.Kind, bytes: []const u8) bool {
-    if (bytes.len == 0) return true;
-    switch (kind) {
-        .c0, .c1, .plain => return true,
-        .utf8 => {
-            const need = std.unicode.utf8ByteSequenceLength(bytes[0]) catch return true;
-            return bytes.len >= need;
-        },
-        .esc => {
-            if (bytes.len < 2) return false;
-            const last = bytes[bytes.len - 1];
-            return last < 0x20 or last > 0x2F;
-        },
-        .csi => {
-            if (bytes.len < 3) return false;
-            const last = bytes[bytes.len - 1];
-            return last >= 0x40 and last <= 0x7E;
-        },
-        .osc, .str, .esc_kitty, .esc_sixel => {
-            if (bytes[bytes.len - 1] == 0x07) return true;
-            if (bytes.len >= 2 and bytes[bytes.len - 2] == 0x1b and bytes[bytes.len - 1] == '\\') return true;
-            return false;
-        },
-    }
-}
-
-inline fn skipEsc(slice: []const u8) usize {
-    if (slice.len < 2) return slice.len;
-    var i: usize = 1;
-    while (i < slice.len and slice[i] >= 0x20 and slice[i] <= 0x2F) i += 1;
-    if (i < slice.len) return i + 1;
-    return slice.len;
-}
-
-inline fn skipCsi(slice: []const u8) usize {
-    if (slice.len < 3) return slice.len;
-    const offset = 2 + SIMD.skipInRange(slice[2..], 0x40, 0x7E);
-    if (offset < slice.len) {
-        return offset + 1;
-    }
-    return slice.len;
-}
-
-inline fn skipOsc(slice: []const u8) usize {
-    if (slice.len < 3) return slice.len;
-    return skipStTerminated(slice);
-}
-
-inline fn skipDcs(slice: []const u8) usize {
-    return skipStTerminated(slice);
-}
-
-inline fn skipStTerminated(slice: []const u8) usize {
-    var idx: usize = 2;
-    while (idx < slice.len) {
-        idx += SIMD.skipEqualEither(slice[idx..], 0x07, 0x1B);
-        if (idx >= slice.len) break;
-
-        if (slice[idx] == 0x07) return idx + 1;
-
-        if (slice[idx] == 0x1B) {
-            if (idx + 1 < slice.len and slice[idx + 1] == '\\') {
-                return idx + 2;
-            }
-            idx += 1;
-        }
-    }
-    return slice.len;
-}
 
 fn nowNs() i128 {
     return @intCast(std.Io.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .awake).nanoseconds);
@@ -594,200 +514,676 @@ fn waitReadable2(a: posix.fd_t, b: posix.fd_t, timeout_ms: i32) void {
     _ = posix.poll(&fds, timeout_ms) catch {};
 }
 
-inline fn skipAsciiPrintable(slice: []const u8) usize {
-    return SIMD.skipOutRange(slice, 0x20, 0x7E);
-}
+// ------------------------------------------------------------------ tests
 
-inline fn skipHighBit(slice: []const u8) usize {
-    return SIMD.skipToLowerThan(slice, 0x80);
-}
+/// Records the runs a drain feeds and the bytes it paints (ghost text is
+/// fed but paints nothing).
+const TestSink = struct {
+    gpa: std.mem.Allocator,
+    view_: View,
+    bytes: std.ArrayListUnmanaged(u8) = .empty,
+    runs: std.ArrayListUnmanaged(Run) = .empty,
+    storage: []const u8,
 
-test "correct line split" {}
+    fn deinit(self: *TestSink) void {
+        self.bytes.deinit(self.gpa);
+        self.runs.deinit(self.gpa);
+    }
+    fn sink(self: *TestSink) Sink {
+        return .{ .ctx = self, .feed = feed, .view = view };
+    }
+    fn feed(ctx: *anyopaque, runs: []const Run, stream: []const u8, owner: *CircBuffer) usize {
+        const self: *TestSink = @ptrCast(@alignCast(ctx));
+        var obsolete_prefix = false;
+        for (runs, 0..) |input, index| {
+            var r = input;
+            r.flags.ghost = owner.preparser.isSpanObsolete(index);
+            if (owner.retain_live) {
+                if (!r.flags.ghost and (r.kind == .text or r.role == .lf) and
+                    (obsolete_prefix or owner.canPauseBefore(r))) return index;
+                obsolete_prefix = obsolete_prefix or r.flags.ghost;
+            }
+            const src = if (r.flags.stream) stream else self.storage;
+            if (!(r.flags.ghost and r.kind == .text)) self.bytes.appendSlice(self.gpa, src[r.off..][0..r.len]) catch unreachable;
+            self.runs.append(self.gpa, r) catch unreachable;
+        }
+        return runs.len;
+    }
+    fn view(ctx: *anyopaque) View {
+        const self: *TestSink = @ptrCast(@alignCast(ctx));
+        return self.view_;
+    }
+};
 
-test "hardware level mirroring" {
-    const gpa = std.testing.allocator;
-    const cap = std.heap.pageSize();
-    var buf = try CircBuffer.create(gpa, cap);
-    defer buf.destroy();
-    if (buf.mapped) return;
-
-    // We should be able to write capacity bytes
-    // at any point in time and have it wrap
-    // automagically
-    //
-    // read(1234)
-    // |12340000|mmmmmm|
-    //      ^head
-    //
-    // read(12345678)
-    // |56781234|mmmmmm|
-    //                 ^head
-    //
-    // |1234xxxx|
-}
-
-// NOTE(vasco): The circular buffer must be fed in a very particular way.
-// We must guarrantee that circbuffer.readPTY(); will read until one of two
-// conditions are met:
-// 1. EOF
-// 2. EAGAIN and 1/hz time has passed since the first read.
-//    Meaning that once we start reading we will be updating the
-//    screen (aka consuming)
-test "correct circular buffer feed" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-
-    const gpa = std.testing.allocator;
-    const cap = std.heap.pageSize();
-    var buf = try CircBuffer.create(gpa, cap);
-    defer buf.destroy();
-
-    var fds: [2]i32 = undefined;
-    const pipe_rc = std.os.linux.pipe2(&fds, .{ .NONBLOCK = true, .CLOEXEC = true });
-    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(pipe_rc));
-    defer _ = std.os.linux.close(fds[0]);
-
-    const t0 = nowNs();
-    try buf.readPTY(fds[0], 1000);
-    try std.testing.expect(nowNs() - t0 >= 500_000);
-    try std.testing.expect(!buf.pending());
-
-    const msg = "hello\nworld";
-    const wr = std.os.linux.write(fds[1], msg.ptr, msg.len);
-    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(wr));
-    _ = std.os.linux.close(fds[1]);
-
-    try std.testing.expectError(error.Hangup, buf.readPTY(fds[0], 1000));
-    try std.testing.expect(buf.pending());
-    try std.testing.expectEqual(@as(u64, msg.len), buf.head - buf.tail);
-}
-
-fn append(buf: *CircBuffer, src: []const u8) void {
+/// Test input helper: use the same mirror synchronization as PTY reads.
+pub fn append(buf: *CircBuffer, src: []const u8) void {
     const cap = buf.capacity;
     const off: usize = @intCast(buf.head & (cap - 1));
+    assert(src.len <= cap - (buf.head - buf.tail));
     @memcpy(buf.storage[off..][0..src.len], src);
     buf.syncMirror(off, src.len);
     buf.head += src.len;
 }
 
-test "firehose overrun drops oldest bytes and retains only ring capacity" {
+test "test input wraps in an allocator-backed ring" {
     const gpa = std.testing.allocator;
-    // A small capacity exercises heap mirroring; a page-sized capacity also
-    // exercises hardware mirroring when it is available.
-    for ([_]usize{ 64, std.heap.pageSize() }) |cap| {
-        var buf = try CircBuffer.create(gpa, cap);
-        defer buf.destroy();
-        const old = try gpa.alloc(u8, cap);
-        defer gpa.free(old);
-        @memset(old, 'Z');
-        const latest = try gpa.alloc(u8, cap);
-        defer gpa.free(latest);
-        for (latest, 0..) |*byte, i| {
-            byte.* = if (i % 17 == 0) '\n' else 'a' + @as(u8, @intCast(i % 26));
+    const cap = 16;
+    var buf: CircBuffer = .{
+        .allocator = gpa,
+        .storage = try gpa.alloc(u8, cap * 2),
+        .capacity = cap,
+        .mapped = false,
+        .preparser = try Preparse.Preparser.init(gpa),
+    };
+    defer buf.destroy();
+    const bytes = "0123456789abcdef";
+    for (0..cap) |off| {
+        for (1..cap + 1) |len| {
+            @memset(buf.storage, 0);
+            buf.head = off;
+            buf.tail = off;
+            append(&buf, bytes[0..len]);
+            try std.testing.expectEqual(off + len, buf.head);
+            try std.testing.expectEqualStrings(bytes[0..len], buf.storage[off..][0..len]);
+            for (bytes[0..len], 0..) |byte, i| {
+                const at = (off + i) & (cap - 1);
+                try std.testing.expectEqual(byte, buf.storage[at]);
+                try std.testing.expectEqual(byte, buf.storage[at + cap]);
+            }
         }
-
-        // Do not consume between writes. More than two ringfuls arrive, and
-        // the final ringful starts at a nonzero offset and crosses the mirror.
-        append(&buf, old);
-        append(&buf, old[0 .. cap - 7]);
-        append(&buf, latest);
-        const written: u64 = @intCast(cap * 3 - 7);
-        try std.testing.expectEqual(written, buf.head);
-        try std.testing.expectEqual(@as(u64, 0), buf.tail);
-        try std.testing.expect(buf.pending());
-
-        buf.consumeAndPreparse();
-        try std.testing.expectEqual(written - cap, buf.tail);
-        try std.testing.expectEqual(@as(u64, @intCast(cap)), buf.head - buf.tail);
-        var line_bytes: usize = 0;
-        for (buf.lines.items) |line| line_bytes += line.len;
-        try std.testing.expectEqual(cap, line_bytes);
-
-        const runs = buf.consumeAndGetRuns(std.math.maxInt(usize));
-        var fed: usize = 0;
-        for (runs) |run| {
-            try std.testing.expect(fed + run.len <= latest.len);
-            try std.testing.expectEqualSlices(u8, latest[fed..][0..run.len], buf.storage[run.off..][0..run.len]);
-            fed += run.len;
-        }
-        try std.testing.expectEqual(cap, fed);
-        try std.testing.expectEqual(cap, buf.capacity);
-        try std.testing.expectEqual(cap * 2, buf.storage.len);
-        try std.testing.expectEqual(buf.head, buf.tail);
-        try std.testing.expect(!buf.pending());
     }
 }
 
-test "firehose readPTY drains past capacity until EOF" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const cap = 64;
-    var buf = try CircBuffer.create(std.testing.allocator, cap);
+test "framing defers obsolescence to span consumption" {
+    const gpa = std.testing.allocator;
+    var buf = try CircBuffer.create(gpa, 4096);
     defer buf.destroy();
+    var ts = TestSink{ .gpa = gpa, .view_ = .{ .rows = 2, .alt = false }, .storage = buf.storage };
+    defer ts.deinit();
+    const bytes = "a\x1b[31mb\x1b[32mc\x1b[33md\x1b[34me\x1b[35mf\x1b[36mg\x1b[37mh\x1b[0mi\x1b[2JX";
+    append(&buf, bytes);
+    _ = buf.scan(ts.view_, true);
+    for (buf.preparser.runs.items) |run| try std.testing.expect(!run.flags.ghost);
+    try std.testing.expect(!buf.preparser.visibility_ready);
+    try std.testing.expectEqual(@as(usize, 0), ts.bytes.items.len);
+    const sink = ts.sink();
+    _ = sink.feed(sink.ctx, buf.preparser.runs.items, buf.stream.items, &buf);
+    try std.testing.expect(buf.preparser.visibility_ready);
+    try std.testing.expect(std.mem.indexOf(u8, ts.bytes.items, "a") == null);
+    try std.testing.expect(std.mem.endsWith(u8, ts.bytes.items, "\x1b[2JX"));
+    try std.testing.expectEqual(@as(usize, 9), std.mem.count(u8, ts.bytes.items, "\x1b["));
+}
 
-    var fds: [2]i32 = undefined;
-    const pipe_rc = std.os.linux.pipe2(&fds, .{ .NONBLOCK = true, .CLOEXEC = true });
-    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(pipe_rc));
-    defer _ = std.os.linux.close(fds[0]);
-    var writer_open = true;
-    defer if (writer_open) {
-        _ = std.os.linux.close(fds[1]);
-    };
+test "held input and open stream strings survive until complete spans can be consumed" {
+    const gpa = std.testing.allocator;
+    var buf = try CircBuffer.create(gpa, 4096);
+    defer buf.destroy();
+    var ts = TestSink{ .gpa = gpa, .view_ = .{ .rows = 4, .alt = false }, .storage = buf.storage };
+    defer ts.deinit();
+    append(&buf, "A\x1b[3");
+    buf.drain(ts.sink(), true);
+    try std.testing.expect(!buf.pending());
+    append(&buf, "1mB");
+    buf.drain(ts.sink(), true);
+    try std.testing.expectEqualStrings("A\x1b[31mB", ts.bytes.items);
+    append(&buf, "\x1b]0;open");
+    buf.drain(ts.sink(), true);
+    try std.testing.expect(buf.open != null);
+    append(&buf, "\x07END");
+    buf.drain(ts.sink(), true);
+    try std.testing.expect(buf.open == null);
+    try std.testing.expectEqualStrings("A\x1b[31mB\x1b]0;open\x07END", ts.bytes.items);
+}
 
-    // Fit in a pipe without a reader thread, but require many ringful reads.
-    var payload: [1024]u8 = undefined;
-    for (&payload, 0..) |*byte, i| byte.* = 'a' + @as(u8, @intCast(i % 26));
-    const written = std.os.linux.write(fds[1], &payload, payload.len);
-    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(written));
-    try std.testing.expectEqual(payload.len, written);
-    _ = std.os.linux.close(fds[1]);
-    writer_open = false;
+test "exact consumption writes all text and obsolete checks retain visible text" {
+    const gpa = std.testing.allocator;
+    var buf = try CircBuffer.create(gpa, 4096);
+    defer buf.destroy();
+    var ts = TestSink{ .gpa = gpa, .view_ = .{ .rows = 4, .alt = false }, .storage = buf.storage };
+    defer ts.deinit();
+    const cleared = "a\x1b[31mb\x1b[2JX";
+    buf.exact = true;
+    append(&buf, cleared);
+    buf.drain(ts.sink(), true);
+    try std.testing.expectEqualStrings(cleared, ts.bytes.items);
+    ts.bytes.clearRetainingCapacity();
+    buf.exact = false;
+    append(&buf, cleared);
+    buf.drain(ts.sink(), false); // Normal frame consumption keeps all writes.
+    try std.testing.expectEqualStrings(cleared, ts.bytes.items);
+    try std.testing.expect(!buf.preparser.visibility_ready);
+    ts.bytes.clearRetainingCapacity();
+    const visible = "a\x1b[31mb\x1b[32mc";
+    append(&buf, visible);
+    buf.drain(ts.sink(), true);
+    try std.testing.expectEqualStrings(visible, ts.bytes.items);
+}
 
-    try std.testing.expectError(error.Hangup, buf.readPTY(fds[0], 1000));
-    try std.testing.expectEqual(@as(u64, payload.len), buf.head);
-    try std.testing.expectEqual(@as(u64, 0), buf.tail);
-    const runs = buf.consumeAndGetRuns(std.math.maxInt(usize));
-    try std.testing.expectEqual(@as(usize, 1), runs.len);
-    try std.testing.expectEqual(@as(u32, cap), runs[0].len);
-    try std.testing.expectEqualSlices(u8, payload[payload.len - cap ..], buf.storage[runs[0].off..][0..cap]);
+test "metadata allocation failure never drops runs during pressure consumption" {
+    const gpa = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(gpa, .{});
+    var buf = try CircBuffer.create(failing.allocator(), 4096);
+    defer buf.destroy();
+    buf.exact = true;
+    var ts = TestSink{ .gpa = gpa, .view_ = .{ .rows = 4, .alt = false }, .storage = buf.storage };
+    defer ts.deinit();
+    failing.fail_index = failing.alloc_index;
+    var input: [4096]u8 = undefined;
+    @memset(&input, '\n');
+    append(&buf, &input);
+    buf.drain(ts.sink(), true);
+    try std.testing.expectEqualStrings(&input, ts.bytes.items);
     try std.testing.expectEqual(buf.head, buf.tail);
+}
+
+test "run stays small" {
+    try std.testing.expectEqual(@as(usize, 12), @sizeOf(Run));
+}
+
+test "text that scrolls off is fed as ghost text" {
+    const gpa = std.testing.allocator;
+    var buf = try CircBuffer.create(gpa, std.heap.pageSize());
+    defer buf.destroy();
+    var ts = TestSink{ .gpa = gpa, .view_ = .{ .rows = 3, .alt = false }, .storage = buf.storage };
+    defer ts.deinit();
+    // Four LFs could leave a line on a 3-row screen (from the top row they
+    // scroll only twice); 2 * 3 - 1 = 5 scroll everything out.
+    append(&buf, "a\r\nb\r\nc\r\nd\r\ne");
+    buf.drain(ts.sink(), true);
+    try std.testing.expectEqualStrings("a\r\nb\r\nc\r\nd\r\ne", ts.bytes.items);
+    ts.bytes.clearRetainingCapacity();
+    ts.runs.clearRetainingCapacity();
+    append(&buf, "a\r\nb\r\nc\r\nd\r\ne\r\nf\r\ng");
+    buf.drain(ts.sink(), true);
+    // a and b only move the cursor; every LF is still fed.
+    try std.testing.expectEqualStrings("\n\nc\r\nd\r\ne\r\nf\r\ng", ts.bytes.items);
+    try std.testing.expect(ts.runs.items[0].flags.ghost);
+    try std.testing.expect(!ts.runs.items[ts.runs.items.len - 1].flags.ghost);
     try std.testing.expect(!buf.pending());
 }
 
-test "hold incomplete csi until final" {
-    const gpa = std.testing.allocator;
-    const cap = std.heap.pageSize();
-    var buf = try CircBuffer.create(gpa, cap);
-    defer buf.destroy();
-
-    append(&buf, "\x1b[31");
-    try std.testing.expect(buf.pending());
-    const first = buf.consumeAndGetRuns(std.math.maxInt(usize));
-    try std.testing.expectEqual(@as(usize, 0), first.len);
-    try std.testing.expect(!buf.pending());
-
-    append(&buf, "mX");
-    try std.testing.expect(buf.pending());
-    const second = buf.consumeAndGetRuns(std.math.maxInt(usize));
-    try std.testing.expectEqual(@as(usize, 2), second.len);
-    try std.testing.expectEqual(Run.Kind.csi, second[0].kind);
-    try std.testing.expectEqual(Run.Kind.plain, second[1].kind);
-    try std.testing.expect(!buf.pending());
+fn drainAll(buf: *CircBuffer, ts: *TestSink, bytes: []const u8) void {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const free: usize = @intCast(buf.capacity - (buf.head - buf.tail));
+        const n = @min(free, bytes.len - off);
+        append(buf, bytes[off..][0..n]);
+        off += n;
+        if (buf.capacity - (buf.head - buf.tail) < buf.capacity / 4) buf.drain(ts.sink(), true);
+    }
+    buf.drain(ts.sink(), true);
 }
 
-test "hold lone ESC then CSI" {
+fn lines(gpa: std.mem.Allocator, n: usize) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    for (0..n) |i| try out.print(gpa, "line {d}\r\n", .{i});
+    return out.toOwnedSlice(gpa);
+}
+
+test "a dead region feeds every run but text" {
     const gpa = std.testing.allocator;
-    const cap = std.heap.pageSize();
-    var buf = try CircBuffer.create(gpa, cap);
+    var buf = try CircBuffer.create(gpa, std.heap.pageSize());
     defer buf.destroy();
+    var ts = TestSink{ .gpa = gpa, .view_ = .{ .rows = 2, .alt = false }, .storage = buf.storage };
+    defer ts.deinit();
+    append(&buf, "\x1b[?2004hA\r\n\x1b[cB\x1b[1mC\x1b[?2004l\x1b]2;one\x07\x1b]2;two\x07D\r\nE\r\nF\r\nG");
+    buf.drain(ts.sink(), true);
+    const got = ts.bytes.items;
+    // Text before the cut paints nothing; every escape is still parsed.
+    try std.testing.expect(std.mem.indexOfScalar(u8, got, 'A') == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, got, 'D') == null);
+    for ([_][]const u8{ "\x1b[?2004h", "\x1b[c", "\x1b[1m", "\x1b[?2004l", "one", "two" }) |want| {
+        try std.testing.expect(std.mem.indexOf(u8, got, want) != null);
+    }
+    try std.testing.expect(std.mem.endsWith(u8, got, "\nE\r\nF\r\nG"));
+}
 
-    append(&buf, "\x1b");
-    const first = buf.consumeAndGetRuns(std.math.maxInt(usize));
-    try std.testing.expectEqual(@as(usize, 0), first.len);
+test "clear is a barrier; upward motion keeps earlier lines" {
+    const gpa = std.testing.allocator;
+    var buf = try CircBuffer.create(gpa, std.heap.pageSize());
+    defer buf.destroy();
+    var ts = TestSink{ .gpa = gpa, .view_ = .{ .rows = 2, .alt = false }, .storage = buf.storage };
+    defer ts.deinit();
+    append(&buf, "old\r\nold\x1b[H\x1b[2Jnew");
+    buf.drain(ts.sink(), true);
+    try std.testing.expectEqualStrings("\n\x1b[H\x1b[2Jnew", ts.bytes.items);
+
+    ts.bytes.clearRetainingCapacity();
+    append(&buf, "a\r\nb\r\nc\x1b[3Ad");
+    buf.drain(ts.sink(), true);
+    try std.testing.expectEqualStrings("a\r\nb\r\nc\x1b[3Ad", ts.bytes.items);
+
+    // ED 3 only clears the scrollback; under DECOM home is the region's top.
+    for ([_][]const u8{ "keep\x1b[3J", "keep\x1b[2;3r\x1b[?6h\x1b[H\x1b[J\x1b[?6l" }) |in| {
+        ts.bytes.clearRetainingCapacity();
+        append(&buf, in);
+        buf.drain(ts.sink(), true);
+        try std.testing.expectEqualStrings(in, ts.bytes.items);
+    }
+}
+
+test "only entering 1049 from the primary screen clears the alt screen" {
+    const gpa = std.testing.allocator;
+    var buf = try CircBuffer.create(gpa, std.heap.pageSize());
+    defer buf.destroy();
+    var ts = TestSink{ .gpa = gpa, .view_ = .{ .rows = 2, .alt = false }, .storage = buf.storage };
+    defer ts.deinit();
+    // Leaving keeps the alt screen; 47 and 1047 never clear it.
+    for ([_][]const u8{ "prompt\x1b[?1049hTUI\x1b[?1049lback", "\x1b[?1049hA\x1b[?1049l\x1b[?47hB\x1b[?47l", "\x1b[?1047hA\x1b[?1047l\x1b[?1047hB\x1b[?1047l" }) |in| {
+        ts.bytes.clearRetainingCapacity();
+        append(&buf, in);
+        buf.drain(ts.sink(), true);
+        try std.testing.expectEqualStrings(in, ts.bytes.items);
+    }
+    ts.bytes.clearRetainingCapacity();
+    append(&buf, "\x1b[?1049hA\x1b[?1049l\x1b[?1049hB");
+    buf.drain(ts.sink(), true);
+    try std.testing.expectEqualStrings("\x1b[?1049h\x1b[?1049l\x1b[?1049hB", ts.bytes.items);
+}
+
+test "strings longer than the ring arrive whole through the stream buffer" {
+    const gpa = std.testing.allocator;
+    var buf = try CircBuffer.create(gpa, std.heap.pageSize());
+    defer buf.destroy();
+    var ts = TestSink{ .gpa = gpa, .view_ = .{ .rows = 4, .alt = false }, .storage = buf.storage };
+    defer ts.deinit();
+    var osc: std.ArrayListUnmanaged(u8) = .empty;
+    defer osc.deinit(gpa);
+    try osc.appendSlice(gpa, "\x1b]52;c;");
+    try osc.appendNTimes(gpa, 'Q', 5 * std.heap.pageSize());
+    try osc.appendSlice(gpa, "\x1b\\after");
+    drainAll(&buf, &ts, osc.items);
+    try std.testing.expectEqualStrings(osc.items, ts.bytes.items);
+    var streamed = false;
+    for (ts.runs.items) |r| streamed = streamed or r.flags.stream;
+    try std.testing.expect(streamed);
+    // Idle stream memory is released.
+    try std.testing.expect(buf.open == null);
+}
+
+/// A nonblocking source that hands out `data` in odd-sized reads, never
+/// crossing a `cuts` offset (reads end exactly there), and counts the reads
+/// that landed outside the ring.
+const PieceSource = struct {
+    data: []const u8,
+    cuts: []const usize = &.{},
+    ring: []const u8,
+    pos: usize = 0,
+    step: usize = 0,
+    direct: usize = 0,
+
+    pub fn read(self: *PieceSource, dest: []u8) error{ WouldBlock, Unused }!usize {
+        if (self.pos >= self.data.len) return error.WouldBlock;
+        const sizes = [_]usize{ 1, 7, 4093, 13, 509, 3001, 65 };
+        var n = @min(@min(dest.len, self.data.len - self.pos), sizes[self.step % sizes.len]);
+        self.step += 1;
+        for (self.cuts) |c| if (c > self.pos and c < self.pos + n) {
+            n = c - self.pos;
+        };
+        const d = @intFromPtr(dest.ptr);
+        const r = @intFromPtr(self.ring.ptr);
+        if (d < r or d >= r + self.ring.len) self.direct += 1;
+        @memcpy(dest[0..n], self.data[self.pos..][0..n]);
+        self.pos += n;
+        return n;
+    }
+
+    pub fn wait(self: *PieceSource, event_fd: ?c_int, timeout_ms: c_int) void {
+        _ = self;
+        _ = event_fd;
+        _ = timeout_ms;
+    }
+};
+
+fn expectSameRuns(a: []const Run, b: []const Run) !void {
+    try std.testing.expectEqual(a.len, b.len);
+    for (a, b) |x, y| {
+        try std.testing.expectEqual(x.kind, y.kind);
+        try std.testing.expectEqual(x.role, y.role);
+        try std.testing.expectEqual(x.flags, y.flags);
+        try std.testing.expectEqual(x.len, y.len);
+    }
+}
+
+test "readSource pressure leaves the final input for normal span consumption" {
+    const gpa = std.testing.allocator;
+    var buf = try CircBuffer.create(gpa, 4096);
+    defer buf.destroy();
+    var ts = TestSink{ .gpa = gpa, .view_ = .{ .rows = 4, .alt = false }, .storage = buf.storage };
+    defer ts.deinit();
+    var input: [8315]u8 = undefined;
+    @memset(&input, 'x');
+    var src = PieceSource{ .data = &input, .cuts = &.{}, .ring = buf.storage };
+    try buf.readSource(&src, 1_000_000_000, null, ts.sink());
+    try std.testing.expectEqual(input.len, src.pos);
+    try std.testing.expect(!buf.preparser.exact);
+    const remaining = buf.head - buf.tail;
+    try std.testing.expect(remaining > 0 and remaining <= buf.capacity - buf.capacity / 4);
+    try std.testing.expectEqual(@as(u64, input.len), ts.bytes.items.len + remaining);
+    buf.drain(ts.sink(), true);
+    try std.testing.expectEqualStrings(&input, ts.bytes.items);
+    try std.testing.expectEqual(buf.head, buf.tail);
+}
+
+test "readSource reads open strings straight into the stream buffer" {
+    const gpa = std.testing.allocator;
+    var ref = try CircBuffer.create(gpa, std.heap.pageSize());
+    defer ref.destroy();
+    var buf = try CircBuffer.create(gpa, std.heap.pageSize());
+    defer buf.destroy();
+    var ts_ref = TestSink{ .gpa = gpa, .view_ = .{ .rows = 4, .alt = false }, .storage = ref.storage };
+    defer ts_ref.deinit();
+    var ts = TestSink{ .gpa = gpa, .view_ = .{ .rows = 4, .alt = false }, .storage = buf.storage };
+    defer ts.deinit();
+
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    defer input.deinit(gpa);
+    var cuts: std.ArrayListUnmanaged(usize) = .empty;
+    defer cuts.deinit(gpa);
+    try input.appendSlice(gpa, "head\r\n\x1b]0;small\x07");
+    // ST split between its ESC and its backslash.
+    try input.appendSlice(gpa, "\x1b_Gq=2;");
+    try input.appendNTimes(gpa, 'Q', 5 * std.heap.pageSize() + 123);
+    try cuts.append(gpa, input.items.len + 1);
+    try input.appendSlice(gpa, "\x1b\\after one\r\n");
+    // BEL-terminated OSC, then an ESC that is not an ST.
+    try input.appendSlice(gpa, "\x1b]52;c;");
+    try input.appendNTimes(gpa, 'R', 3 * std.heap.pageSize());
+    try input.appendSlice(gpa, "\x07after two");
+    // Terminator right at the end of a read, and a string with no more data.
+    try input.appendSlice(gpa, "\x1bPq");
+    try input.appendNTimes(gpa, '~', 2 * std.heap.pageSize());
+    try cuts.append(gpa, input.items.len + 2);
+    try input.appendSlice(gpa, "\x1b\\tail");
+
+    drainAll(&ref, &ts_ref, input.items);
+    var src = PieceSource{ .data = input.items, .cuts = cuts.items, .ring = buf.storage };
+    while (src.pos < input.items.len) try buf.readSource(&src, 1_000_000_000, null, ts.sink());
+    buf.drain(ts.sink(), true);
+
+    try std.testing.expectEqualStrings(input.items, ts.bytes.items);
+    try std.testing.expectEqualStrings(ts_ref.bytes.items, ts.bytes.items);
+    try expectSameRuns(ts_ref.runs.items, ts.runs.items);
+    // The bulk of the strings went straight to the stream buffer.
+    try std.testing.expect(src.direct > 4);
+    try std.testing.expect(buf.open == null);
+}
+
+test "readSource: stream over the cap is discarded, also when read directly" {
+    const gpa = std.testing.allocator;
+    var buf = try CircBuffer.create(gpa, 64 * 1024);
+    defer buf.destroy();
+    buf.max_stream = 1024 * 1024;
+    var ts = TestSink{ .gpa = gpa, .view_ = .{ .rows = 4, .alt = false }, .storage = buf.storage };
+    defer ts.deinit();
+    const big = try gpa.alloc(u8, buf.max_stream + 100_000);
+    defer gpa.free(big);
+    @memset(big, 'Q');
+    @memcpy(big[0..4], "\x1bPq#");
+    @memcpy(big[big.len - 6 ..], "\x1b\\done");
+    var src = PieceSource{ .data = big, .ring = buf.storage };
+    while (src.pos < big.len) try buf.readSource(&src, 1_000_000_000, null, ts.sink());
+    buf.drain(ts.sink(), true);
+    try std.testing.expectEqualStrings("done", ts.bytes.items);
+    try std.testing.expect(buf.open == null);
+    try std.testing.expect(buf.stream.capacity <= stream_keep);
+}
+
+test "takeStream hands over a buffer that ends in the run, once" {
+    const gpa = std.testing.allocator;
+    var buf = try CircBuffer.create(gpa, std.heap.pageSize());
+    defer buf.destroy();
+    const Taker = struct {
+        taken: ?[]u8 = null,
+        off: usize = 0,
+        len: usize = 0,
+        gpa: std.mem.Allocator,
+        fn sink(self: *@This()) Sink {
+            return .{ .ctx = self, .feed = feed, .view = view };
+        }
+        fn feed(ctx: *anyopaque, runs: []const Run, stream: []const u8, owner: *CircBuffer) usize {
+            _ = stream;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            for (runs) |r| if (r.flags.stream) {
+                self.off = r.off;
+                self.len = r.len;
+                self.taken = owner.takeStream(self.gpa, r.off, r.len);
+                // Nothing is left to take.
+                std.debug.assert(owner.takeStream(self.gpa, r.off, r.len) == null);
+            };
+            return runs.len;
+        }
+        fn view(ctx: *anyopaque) View {
+            _ = ctx;
+            return .{ .rows = 4, .alt = false };
+        }
+    };
+    var tk = Taker{ .gpa = gpa };
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    defer input.deinit(gpa);
+    try input.appendSlice(gpa, "\x1b_Gq=2;");
+    try input.appendNTimes(gpa, 'Q', 4 * std.heap.pageSize());
+    try input.appendSlice(gpa, "\x1b\\");
+    var src = PieceSource{ .data = input.items, .ring = buf.storage };
+    while (src.pos < input.items.len) try buf.readSource(&src, 1_000_000_000, null, tk.sink());
+    buf.drain(tk.sink(), true);
+    const taken = tk.taken orelse return error.NotTaken;
+    defer gpa.free(taken);
+    try std.testing.expectEqualStrings(input.items, taken[tk.off..][0..tk.len]);
+    try std.testing.expectEqual(@as(usize, 0), buf.stream.capacity);
+}
+
+test "stream over the cap is discarded through its terminator" {
+    const gpa = std.testing.allocator;
+    var buf = try CircBuffer.create(gpa, 64 * 1024);
+    defer buf.destroy();
+    buf.max_stream = 4 * 1024 * 1024;
+    var ts = TestSink{ .gpa = gpa, .view_ = .{ .rows = 4, .alt = false }, .storage = buf.storage };
+    defer ts.deinit();
+    const big = try gpa.alloc(u8, buf.max_stream + 1024);
+    defer gpa.free(big);
+    @memset(big, 'Q');
+    @memcpy(big[0..4], "\x1bPq#");
+    @memcpy(big[big.len - 6 ..], "\x1b\\done");
+    drainAll(&buf, &ts, big);
+    try std.testing.expectEqualStrings("done", ts.bytes.items);
+    try std.testing.expect(buf.stream.capacity <= stream_keep);
+}
+
+test "incomplete CSI and UTF-8 are held until the rest arrives" {
+    const gpa = std.testing.allocator;
+    var buf = try CircBuffer.create(gpa, std.heap.pageSize());
+    defer buf.destroy();
+    var ts = TestSink{ .gpa = gpa, .view_ = .{ .rows = 4, .alt = false }, .storage = buf.storage };
+    defer ts.deinit();
+    append(&buf, "x\x1b[3");
+    buf.drain(ts.sink(), true);
+    try std.testing.expectEqualStrings("x", ts.bytes.items);
     try std.testing.expect(!buf.pending());
+    append(&buf, "1my\xc3");
+    buf.drain(ts.sink(), true);
+    try std.testing.expectEqualStrings("x\x1b[31my", ts.bytes.items);
+    append(&buf, "\xa9");
+    buf.drain(ts.sink(), true);
+    try std.testing.expectEqualStrings("x\x1b[31my\xc3\xa9", ts.bytes.items);
+}
 
-    append(&buf, "[7m");
-    const second = buf.consumeAndGetRuns(std.math.maxInt(usize));
-    try std.testing.expectEqual(@as(usize, 1), second.len);
-    try std.testing.expectEqual(Run.Kind.csi, second[0].kind);
-    const bytes = buf.storage[second[0].off .. second[0].off + second[0].len];
-    try std.testing.expectEqualStrings("\x1b[7m", bytes);
+test "dead kitty transfers are fed" {
+    const gpa = std.testing.allocator;
+    var buf = try CircBuffer.create(gpa, std.heap.pageSize());
+    defer buf.destroy();
+    var ts = TestSink{ .gpa = gpa, .view_ = .{ .rows = 2, .alt = false }, .storage = buf.storage };
+    defer ts.deinit();
+    // A dead placement still moves the cursor, replaces ids and is freed
+    // with its line, so every graphics command reaches the VT.
+    const in = "\x1b_Ga=T,i=5,m=1;AAAA\x1b\\\x1b_Ga=q,i=6;AAAA\x1b\\\x1b_Gm=0;AAAA\x1b\\" ++
+        "\x1b_Ga=T,i=9;AAAA\x1b\\\x1b_Ga=T;AAAA\x1b\\\r\n\r\n\r\n\x1b_Ga=t,i=9;BBBB\x1b\\";
+    append(&buf, in);
+    buf.drain(ts.sink(), true);
+    try std.testing.expectEqual(@as(usize, 6), std.mem.count(u8, ts.bytes.items, "\x1b_G"));
+}
+
+test "text pruning always applies SGRs in order including before resets and pen readers" {
+    const gpa = std.testing.allocator;
+    var buf = try CircBuffer.create(gpa, std.heap.pageSize());
+    defer buf.destroy();
+    var ts = TestSink{ .gpa = gpa, .view_ = .{ .rows = 2, .alt = false }, .storage = buf.storage };
+    defer ts.deinit();
+    append(&buf, "\x1b[1m\x1b[31m\x1b[0m\x1b[32mA\r\nB\r\nC\r\nD");
+    buf.drain(ts.sink(), true);
+    try std.testing.expect(std.mem.startsWith(u8, ts.bytes.items, "\x1b[1m\x1b[31m\x1b[0m\x1b[32m"));
+
+    ts.bytes.clearRetainingCapacity();
+    append(&buf, "\x1b[1m\x1b[31m\x1b7\x1b[m\x1b[32mA\r\nB\r\nC\r\nD");
+    buf.drain(ts.sink(), true);
+    try std.testing.expect(std.mem.startsWith(u8, ts.bytes.items, "\x1b[1m\x1b[31m\x1b7\x1b[m\x1b[32m"));
+}
+
+test "the scanner's CSI parse is what the VT applies" {
+    var buf = try CircBuffer.create(std.testing.allocator, 4096);
+    defer buf.destroy();
+    // Bytes a CSI cannot hold make the VT ignore it: not a clear.
+    append(&buf, "\x1b[2\x01Jx\x1b[2J\x1b[38:2:1:2:3;1m\x1b[1;2");
+    const result = buf.scan(.{ .rows = 4, .alt = false }, true);
+    try std.testing.expectEqual(@as(u32, 5), result.held);
+    const runs = buf.preparser.runs.items;
+    try std.testing.expectEqual(@as(usize, 4), runs.len);
+    try std.testing.expectEqual(Role.ordered, runs[0].role);
+    try std.testing.expectEqual(Role.barrier, runs[2].role);
+    try std.testing.expectEqual(Role.sgr, runs[3].role);
+    try std.testing.expectEqual(@as(usize, 3), buf.preparser.csis.items.len);
+    try std.testing.expectEqual(@as(u8, 0), buf.preparser.csiAt(0).final);
+    try std.testing.expectEqual(@as(u8, 'J'), buf.preparser.csiAt(1).final);
+    try std.testing.expectEqual(@as(u32, 2), buf.preparser.csiAt(1).value(0));
+    const sgr = buf.preparser.csiAt(2);
+    try std.testing.expectEqual(@as(usize, 2), sgr.params.len);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 1, 2, 3 }, sgr.subsOf(sgr.params[0]));
+    try std.testing.expectEqual(@as(u32, 1), sgr.value(1));
+}
+
+test "pressure retains live lookahead across reads instead of painting each suffix" {
+    const gpa = std.testing.allocator;
+    var buf = try CircBuffer.create(gpa, 4096);
+    defer buf.destroy();
+    var ts = TestSink{ .gpa = gpa, .view_ = .{ .rows = 4, .alt = false }, .storage = buf.storage };
+    defer ts.deinit();
+    var input: [3900]u8 = undefined;
+    for (0..650) |i| @memcpy(input[i * 6 ..][0..6], "line\r\n");
+    append(&buf, &input);
+    buf.drain(ts.sink(), true);
+    try std.testing.expect(buf.pending());
+    try std.testing.expect(!buf.retain_live);
+    try std.testing.expect(buf.head - buf.tail > 0 and buf.head - buf.tail <= 48);
+    const at: usize = @intCast(buf.tail & (buf.capacity - 1));
+    const saved = try gpa.dupe(u8, buf.storage[at..][0..@intCast(buf.head - buf.tail)]);
+    defer gpa.free(saved);
+    for (0..650) |i| @memcpy(input[i * 6 ..][0..6], "next\r\n");
+    append(&buf, &input);
+    try std.testing.expectEqualStrings(saved, buf.storage[at..][0..saved.len]);
+    buf.drain(ts.sink(), true);
+    for (ts.runs.items) |run| {
+        if (run.kind == .text) try std.testing.expect(run.flags.ghost);
+    }
+    try std.testing.expect(buf.head - buf.tail > 0 and buf.head - buf.tail <= 48);
+    buf.drain(ts.sink(), false);
+    try std.testing.expectEqual(buf.head, buf.tail);
+    try std.testing.expect(std.mem.endsWith(u8, ts.bytes.items, "next\r\n"));
+}
+
+test "pressure without an obsolete prefix makes progress" {
+    const gpa = std.testing.allocator;
+    var buf = try CircBuffer.create(gpa, 4096);
+    defer buf.destroy();
+    var ts = TestSink{ .gpa = gpa, .view_ = .{ .rows = 4, .alt = false }, .storage = buf.storage };
+    defer ts.deinit();
+    var input: [4096]u8 = undefined;
+    @memset(&input, 'x');
+    append(&buf, &input);
+    buf.drain(ts.sink(), true);
+    try std.testing.expectEqual(buf.head, buf.tail);
+    try std.testing.expectEqualStrings(&input, ts.bytes.items);
+    try std.testing.expect(!buf.retain_live);
+}
+
+test "a future open string stays behind retained live text" {
+    const gpa = std.testing.allocator;
+    var buf = try CircBuffer.create(gpa, 4096);
+    defer buf.destroy();
+    var ts = TestSink{ .gpa = gpa, .view_ = .{ .rows = 4, .alt = false }, .storage = buf.storage };
+    defer ts.deinit();
+    var input: [3600]u8 = undefined;
+    for (0..600) |i| @memcpy(input[i * 6 ..][0..6], "line\r\n");
+    append(&buf, &input);
+    append(&buf, "visible\x1b]0;unfinished");
+    buf.drain(ts.sink(), true);
+    try std.testing.expect(buf.pending());
+    try std.testing.expect(buf.open == null);
+    buf.drain(ts.sink(), false);
+    try std.testing.expect(buf.open != null);
+    try std.testing.expectEqual(buf.head, buf.tail);
+    append(&buf, "\x07after");
+    buf.drain(ts.sink(), false);
+    try std.testing.expect(buf.open == null);
+    try std.testing.expect(std.mem.endsWith(u8, ts.bytes.items, "visible\x1b]0;unfinished\x07after"));
+}
+
+test "stream completion across the mirror survives partial pressure consumption" {
+    const gpa = std.testing.allocator;
+    var buf = try CircBuffer.create(gpa, 4096);
+    defer buf.destroy();
+    var ts = TestSink{ .gpa = gpa, .view_ = .{ .rows = 4, .alt = false }, .storage = buf.storage };
+    defer ts.deinit();
+    buf.head = 4090;
+    buf.tail = 4090;
+    append(&buf, "\x1b]0;");
+    buf.drain(ts.sink(), false);
+    try std.testing.expect(buf.open != null);
+    append(&buf, "payload\x07");
+    var input: [3600]u8 = undefined;
+    for (0..600) |i| @memcpy(input[i * 6 ..][0..6], "line\r\n");
+    append(&buf, &input);
+    buf.drain(ts.sink(), true);
+    try std.testing.expect(buf.open == null);
+    try std.testing.expect(buf.tail <= buf.head);
+    try std.testing.expect(buf.head - buf.tail > 0 and buf.head - buf.tail <= 48);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ts.bytes.items, "\x1b]0;payload\x07"));
+    buf.drain(ts.sink(), false);
+    try std.testing.expectEqual(buf.head, buf.tail);
+}
+
+test "unprovable pressure has quarter-ring hysteresis rather than one-read rescans" {
+    const gpa = std.testing.allocator;
+    var buf = try CircBuffer.create(gpa, 4096);
+    defer buf.destroy();
+    var ts = TestSink{ .gpa = gpa, .view_ = .{ .rows = 4, .alt = false }, .storage = buf.storage };
+    defer ts.deinit();
+    var input: [3200]u8 = undefined;
+    for (0..800) |i| @memcpy(input[i * 4 ..][0..4], "\x1b[mX");
+    append(&buf, &input);
+    buf.drain(ts.sink(), true);
+    try std.testing.expect(buf.tail >= buf.capacity / 4);
+    try std.testing.expect(buf.pending());
+    append(&buf, "Y");
+    try std.testing.expect(!buf.underPressure());
+    buf.drain(ts.sink(), false);
+    try std.testing.expectEqualStrings(&input, ts.bytes.items[0..input.len]);
+    try std.testing.expectEqual(@as(u8, 'Y'), ts.bytes.items[input.len]);
+}
+
+test "dense obsolete lines keep lookahead across metadata windows before the progress floor" {
+    const gpa = std.testing.allocator;
+    var buf = try CircBuffer.create(gpa, 64 * 1024);
+    defer buf.destroy();
+    var ts = TestSink{ .gpa = gpa, .view_ = .{ .rows = 4, .alt = false }, .storage = buf.storage };
+    defer ts.deinit();
+    var input: [60000]u8 = undefined;
+    for (0..30000) |i| @memcpy(input[i * 2 ..][0..2], "X\n");
+    append(&buf, &input);
+    buf.drain(ts.sink(), true);
+    for (ts.runs.items) |run| {
+        if (run.kind == .text) try std.testing.expect(run.flags.ghost);
+    }
+    try std.testing.expect(buf.head - buf.tail > 0 and buf.head - buf.tail <= 16);
+    buf.drain(ts.sink(), false);
+    try std.testing.expectEqual(buf.head, buf.tail);
 }

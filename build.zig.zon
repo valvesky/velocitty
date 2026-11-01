@@ -1,6 +1,6 @@
 .{
     .name = .Velocitty,
-    .version = "1.2.1",
+    .version = "1.3.0",
     .fingerprint = 0x63301961c26f0d7f, // Changing this has security and trust implications.
     .minimum_zig_version = "0.17.0",
     .dependencies = .{},
@@ -12,13 +12,8 @@
         "tests",
         "LICENSE",
         "example.config.toml",
-        "velocitty.desktop",
-        "velocitty.manifest",
-        "velocitty.rc",
+        "assets",
         "velocitty.1",
-        "icon.png",
-        "icon.ico",
-        "icon.icns",
         "lib",
         "vendor/godstack",
     },

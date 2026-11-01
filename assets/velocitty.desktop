@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Name=Velocitty
+GenericName=Terminal emulator
+Comment=Lightning-fast, CPU-rendered terminal emulator
+TryExec=velocitty
+Exec=velocitty
+Icon=velocitty
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=shell;prompt;command;commandline;terminal;
+StartupNotify=true
+StartupWMClass=velocitty
+X-TerminalArgExec=-e
+X-TerminalArgTitle=--title=
+X-TerminalArgAppId=--class=
+X-TerminalArgDir=--working-directory=

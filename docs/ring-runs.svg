@@ -1,0 +1,103 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 72 920 772" width="920" height="772" font-family="sans-serif" font-size="14" aria-labelledby="title desc" role="img">
+  <title id="title">Ring buffer and pre-parser overview</title>
+  <desc id="desc">Ordered runs reference a mirrored input ring or temporary stream storage. Pressure enables a visibility proof for obsolete cell writes; graphics payloads move into a separate image store.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#a89984"/>
+    </marker>
+    <style>
+      .heading { fill: #d79921; font-size: 17px; font-weight: bold; }
+      .text { fill: #ebdbb2; }
+      .muted { fill: #bdae93; font-size: 13px; }
+      .mono { fill: #ebdbb2; font-family: monospace; font-size: 13px; }
+      .function { fill: #0f0; font-family: monospace; }
+      .reference { fill: none; stroke: #a89984; stroke-width: 1.5; stroke-dasharray: 1 5; stroke-linecap: round; }
+      .pressure { fill: #d79921; }
+      .box { fill: none; stroke: #665c54; }
+      .link { fill: none; stroke: #a89984; stroke-width: 1.5; marker-end: url(#arrow); }
+    </style>
+  </defs>
+
+  <!-- Occupancy is measured from tail; the cutoff is 75% of capacity. -->
+  <text class="mono" x="32" y="140">PTY <tspan class="function">read()</tspan></text>
+  <path class="link" d="M120,135 H170"/>
+  <rect class="box" x="180" y="112" width="640" height="46"/>
+  <rect class="box" x="820" y="112" width="68" height="46" stroke-dasharray="5 4"/>
+  <g fill-opacity="0.2">
+    <rect x="180" y="113" width="110" height="44" fill="#458588" stroke="#458588"/>
+    <rect x="290" y="113" width="110" height="44" fill="#458588" stroke="#458588"/>
+    <rect x="400" y="113" width="70" height="44" fill="#a89984" stroke="#a89984"/>
+    <rect x="470" y="113" width="80" height="44" fill="#d79921" stroke="#d79921"/>
+    <rect x="550" y="113" width="134" height="44" fill="#d65d0e" stroke="#d65d0e"/>
+  </g>
+  <text class="muted" x="752" y="140" text-anchor="middle">free</text>
+  <path d="M180,106 V170 M684,106 V170" fill="none" stroke="#ebdbb2" stroke-width="2"/>
+  <text class="mono" x="180" y="190">tail</text>
+  <text class="mono" x="684" y="190" text-anchor="middle">head</text>
+  <path d="M660,100 V170" fill="none" stroke="#d79921" stroke-width="2" stroke-dasharray="5 3"/>
+  <text x="660" y="96" text-anchor="middle" fill="#d79921" font-size="14">75% cutoff</text>
+
+  <!-- drain calls scan, which asks the pre-parser to fill its reusable runs. -->
+  <path class="link" d="M420,158 V318"/>
+  <text class="text" x="440" y="214">Drain on EOF, frame tick (1/hz), or &gt;75% full.</text>
+  <text class="function" x="440" y="240">CircBuffer.drain()</text>
+
+  <text class="function" x="32" y="315">Preparser.prepare()</text>
+  <rect x="48" y="342" width="110" height="40" rx="3" fill="#458588" fill-opacity="0.2" stroke="#458588"/>
+  <rect x="166" y="342" width="110" height="40" rx="3" fill="#458588" fill-opacity="0.2" stroke="#458588"/>
+  <rect x="284" y="342" width="90" height="40" rx="3" fill="#a89984" fill-opacity="0.2" stroke="#a89984"/>
+  <rect x="382" y="342" width="90" height="40" rx="3" fill="#a89984" fill-opacity="0.2" stroke="#a89984"/>
+  <rect x="480" y="342" width="100" height="40" rx="3" fill="#d79921" fill-opacity="0.2" stroke="#d79921"/>
+  <rect x="588" y="342" width="284" height="40" rx="3" fill="#d65d0e" fill-opacity="0.2" stroke="#d65d0e"/>
+  <g class="mono" text-anchor="middle">
+    <text x="103" y="367">ascii</text>
+    <text x="221" y="367">utf8</text>
+    <text x="329" y="367">esc</text>
+    <text x="427" y="367">c0</text>
+    <text x="530" y="367">csi</text>
+    <text x="730" y="367">str: flags.stream</text>
+  </g>
+  <text class="muted" x="48" y="400">off / len reference the ring</text>
+
+  <!-- Runs retain input order regardless of backing storage. -->
+  <path class="reference" d="M730,382 V486"/>
+  <text class="mono" x="744" y="434">off / len</text>
+  <text class="heading" x="588" y="466">Stream buffer <tspan class="muted"></tspan></text>
+  <rect class="box" x="588" y="486" width="284" height="46"/>
+  <rect x="589" y="487" width="222" height="44" fill="#d65d0e" fill-opacity="0.2" stroke="#d65d0e"/>
+  <text class="mono" x="600" y="514">ESC ... payload ... ST</text>
+
+  <!-- Consumption follows the batch's skipText policy. -->
+  <path class="link" d="M282,382 V436"/>
+  <text class="heading" x="282" y="462" text-anchor="middle">Consume runs in order</text>
+  <path d="M282,474 V498" fill="none" stroke="#a89984" stroke-width="1.5"/>
+  <path class="link" d="M282,498 H156 V542"/>
+  <path class="link" d="M282,498 H426 V762"/>
+  <text class="pressure" x="140" y="502" text-anchor="end" font-size="13">Above 75% cutoff</text>
+  <text class="mono pressure" x="140" y="524" text-anchor="end">skipText=true</text>
+  <text class="mono" x="442" y="524">skipText=false</text>
+
+  <rect class="box" x="32" y="554" width="248" height="96" rx="4"/>
+  <text class="function" x="48" y="581">isSpanObsolete()</text>
+  <text class="text" x="48" y="608">Uses later runs to prove text</text>
+  <text class="text" x="48" y="630">will be scrolled off or cleared.</text>
+
+  <path class="link" d="M156,650 V762"/>
+  <rect class="box" x="32" y="762" width="516" height="58" rx="4"/>
+  <text class="heading" x="48" y="787">VT</text>
+  <text class="text" x="48" y="808">Preserve terminal state and graphics in order.</text>
+
+  <!-- Only graphics payloads transfer into persistent image ownership. -->
+  <path class="link" d="M730,532 V638"/>
+  <text class="muted" x="744" y="570">graphics payload</text>
+  <text class="mono" x="744" y="590">copy or handoff</text>
+  <path class="link" d="M548,791 H566 V728 H588"/>
+  <rect class="box" x="588" y="638" width="284" height="182" rx="4"/>
+  <text class="heading" x="604" y="665">Image store</text>
+  <text class="mono" x="604" y="690">IDs + placements</text>
+  <text class="text" x="604" y="713">Owns both payloads</text>
+  <text class="text" x="604" y="734">and bitmaps.</text>
+  <text class="text" x="604" y="758">Persists after drains, resizes and redraws.</text>
+  <text class="text" x="604" y="783">Clears remove placements. Named</text>
+  <text class="text" x="604" y="802">data stays until deletion or eviction.</text>
+</svg>

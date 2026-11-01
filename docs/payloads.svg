@@ -1,0 +1,122 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="410" viewBox="0 0 920 410" role="img" aria-labelledby="title desc">
+  <title id="title">Large payloads: ring, runs, and stream buffer</title>
+  <desc id="desc">An initial PTY read contains plain text followed by an unfinished control string. The parser frames the text and moves the unfinished string into stream storage. Later input appends directly there. The terminator completes a stream-backed run; bytes after the terminator return to the ring as text. Runs remain ordered.</desc>
+
+  <style>
+    text { font-family:sans-serif; }
+    .heading { fill:#d79921; font-size:17px; font-weight:bold; }
+    .mono { fill:#ebdbb2; font-family:monospace; font-size:13px; }
+    .muted { fill:#bdae93; font-family:monospace; font-size:13px; }
+    .outline { fill:none; stroke:#665c54; stroke-width:1.3; }
+    .text-cell { fill:#458588; fill-opacity:.2; stroke:#458588; stroke-width:1.2; }
+    .stream-cell { fill:#d65d0e; fill-opacity:.2; stroke:#d65d0e; stroke-width:1.2; }
+    .stream-cell-border { fill:none; stroke:#d65d0e; stroke-width:1.2; }
+    .rule { stroke:#a89984; stroke-width:1.5; fill:none; }
+    .pulse { fill:none; stroke:#d79921; stroke-width:2; }
+    .run-hi { fill:none; stroke:#d79921; stroke-width:2.4; }
+    .stream-hi { fill:none; stroke:#d65d0e; stroke-width:2.2; }
+    .flow { fill:none; stroke:#a89984; stroke-width:1.5; }
+
+    .first-read { animation:first-read 18s linear infinite; }
+    @keyframes first-read {
+      0%,4% {opacity:0} 6%,17% {opacity:1} 20%,100% {opacity:0}
+    }
+    .ascii-run { animation:ascii-run 18s linear infinite; }
+    @keyframes ascii-run {0%,11% {opacity:0} 13%,99% {opacity:1} 100%{opacity:0}}
+    .part-one { animation:part-one 18s linear infinite; }
+    @keyframes part-one {0%,17%{opacity:0} 20%,99%{opacity:1} 100%{opacity:0}}
+    .part-one-move { animation:part-one-move 18s linear infinite; }
+    @keyframes part-one-move {0%,15%{opacity:0; transform:translateY(-30px)} 19%,22%{opacity:1; transform:translateY(0)} 26%,100%{opacity:0}}
+    .part-two { animation:part-two 18s linear infinite; }
+    @keyframes part-two {0%,35%{opacity:0} 39%,99%{opacity:1} 100%{opacity:0}}
+    .part-three { animation:part-three 18s linear infinite; }
+    @keyframes part-three {0%,49%{opacity:0} 53%,99%{opacity:1} 100%{opacity:0}}
+    .part-end { animation:part-end 18s linear infinite; }
+    @keyframes part-end {0%,62%{opacity:0} 65%,99%{opacity:1} 100%{opacity:0}}
+    .suffix-in-ring { animation:suffix-in-ring 18s linear infinite; }
+    @keyframes suffix-in-ring {0%,64%{opacity:0} 67%,77%{opacity:1} 79%,100%{opacity:0}}
+    .final-str-run { animation:final-str-run 18s linear infinite; }
+    @keyframes final-str-run {0%,66%{opacity:0} 69%,99%{opacity:1} 100%{opacity:0}}
+    .final-suffix-run { animation:final-suffix-run 18s linear infinite; }
+    @keyframes final-suffix-run {0%,72%{opacity:0} 75%,99%{opacity:1} 100%{opacity:0}}
+    .stream-pulse { animation:stream-pulse 18s linear infinite; }
+    @keyframes stream-pulse {0%,37%{opacity:0} 38%,41%{opacity:1} 43%,49%{opacity:0} 51%,54%{opacity:1} 57%,100%{opacity:0}}
+    .finish-pulse { animation:finish-pulse 18s linear infinite; }
+    @keyframes finish-pulse {0%,62%{opacity:0} 64%,70%{opacity:1} 72%,100%{opacity:0}}
+    .ring-pulse { animation:ring-pulse 18s linear infinite; }
+    @keyframes ring-pulse {0%,4%{opacity:0} 5%,9%{opacity:1} 11%,63%{opacity:0} 65%,70%{opacity:1} 72%,100%{opacity:0}}
+    .parser-pulse { animation:parser-pulse 18s linear infinite; }
+    @keyframes parser-pulse {0%,11%{opacity:0} 13%,16%{opacity:1} 18%,65%{opacity:0} 68%,77%{opacity:1} 79%,100%{opacity:0}}
+    .consume-a { animation:consume-a 18s linear infinite; }
+    @keyframes consume-a {0%,82%{opacity:0} 84%,88%{opacity:1} 90%,100%{opacity:0}}
+    .consume-b { animation:consume-b 18s linear infinite; }
+    @keyframes consume-b {0%,88%{opacity:0} 90%,94%{opacity:1} 96%,100%{opacity:0}}
+    .consume-c { animation:consume-c 18s linear infinite; }
+    @keyframes consume-c {0%,94%{opacity:0} 96%,99%{opacity:1} 100%{opacity:0}}
+    .dim-text { animation:dim-text 18s linear infinite; }
+    @keyframes dim-text {0%,4%{opacity:1} 6%,18%{opacity:0} 20%,100%{opacity:1}}
+    @media(prefers-reduced-motion:reduce){
+      * { animation:none !important; }
+      .first-read,.part-one-move,.stream-pulse,.finish-pulse,.ring-pulse,.parser-pulse,.consume-a,.consume-b,.consume-c,.suffix-in-ring {opacity:0 !important;}
+      .ascii-run,.part-one,.part-two,.part-three,.part-end,.final-str-run,.final-suffix-run {opacity:1 !important;}
+    }
+  </style>
+
+
+  <!-- Ring: the first read, then the suffix following ST. -->
+  <text x="40" y="38" class="heading">Ring buffer</text>
+  <text x="875" y="38" text-anchor="end" class="muted">1 MiB</text>
+  <rect x="40" y="51" width="840" height="52" class="outline"/>
+  <g class="first-read">
+    <rect x="41" y="52" width="160" height="50" class="text-cell"/>
+    <text x="57" y="81" class="mono">ASCII: hello</text>
+    <rect x="201" y="52" width="265" height="50" class="stream-cell"/>
+    <text x="217" y="81" class="mono">OSC 52; partial payload</text>
+  </g>
+  <g class="suffix-in-ring">
+    <rect x="41" y="52" width="170" height="50" class="text-cell"/>
+    <text x="57" y="81" class="mono">ASCII: READY</text>
+  </g>
+  <rect class="pulse ring-pulse" x="39" y="49" width="842" height="56"/>
+
+  <!-- The pre-parser creates runs in input order. -->
+  <text x="40" y="174" class="heading">Runs</text>
+  <g class="ascii-run">
+    <rect x="40" y="188" width="171" height="45" rx="3" class="text-cell"/>
+    <text x="56" y="215" class="mono">ascii: hello</text>
+  </g>
+  <g class="final-str-run">
+    <rect x="220" y="188" width="270" height="45" rx="3" class="stream-cell"/>
+    <text x="236" y="215" class="mono">str: flags.stream</text>
+  </g>
+  <g class="final-suffix-run">
+    <rect x="499" y="188" width="190" height="45" rx="3" class="text-cell"/>
+    <text x="515" y="215" class="mono">ascii: READY</text>
+  </g>
+  <rect class="run-hi consume-a" x="38" y="186" width="175" height="49" rx="3"/>
+  <rect class="run-hi consume-b" x="218" y="186" width="274" height="49" rx="3"/>
+  <rect class="run-hi consume-c" x="497" y="186" width="194" height="49" rx="3"/>
+
+  <!-- Stream storage: a single string grows across several reads. -->
+  <text x="40" y="316" class="heading">Stream buffer</text>
+  <text x="875" y="316" text-anchor="end" class="muted">max 320 MiB</text>
+  <rect x="40" y="329" width="840" height="52" class="outline"/>
+  <g class="part-one">
+    <rect x="41" y="330" width="230" height="50" class="stream-cell"/>
+    <text x="57" y="360" class="mono">OSC 52; payload...</text>
+  </g>
+  <g class="part-two">
+    <rect x="271" y="330" width="167" height="50" class="stream-cell"/>
+    <text x="288" y="360" class="mono">payload +</text>
+  </g>
+  <g class="part-three">
+    <rect x="438" y="330" width="167" height="50" class="stream-cell"/>
+    <text x="455" y="360" class="mono">payload +</text>
+  </g>
+  <g class="part-end">
+    <rect x="605" y="330" width="78" height="50" class="stream-cell"/>
+    <text x="629" y="360" class="mono">ST</text>
+  </g>
+  <rect class="stream-hi stream-pulse" x="271" y="329" width="334" height="52"/>
+  <rect class="stream-hi finish-pulse" x="605" y="329" width="78" height="52"/>
+</svg>

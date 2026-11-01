@@ -1,71 +1,38 @@
 # Velocitty
-- DESIGN.md is the original design sketch, not a feature-completeness contract.
-- Do not change the README.md
-- Keep AGENTS.md up-to-date.
-- Omarchy-first, (not) a terminal, with Windows and macOS ports through Peak. Executable is `src/main.zig`.
-- User-facing branding says “(not) a terminal”; preserve technical terminal terminology and integration identifiers.
-- Use Peak for windowing, input, clipboard, PTYs and process I/O on Linux (Wayland, then X11), Windows (Win32/ConPTY), and macOS (AppKit/POSIX PTY). Omarchy (Hyprland, themes, fonts, app menu) remains the primary Linux desktop.
-- Pipeline: `circbuffer` (line split + runs) → `vt` → `draw`.
 
-# Release
-- `zig build release` builds ReleaseFast for every target whose SDK is available (`-Drelease-os=linux|windows|macos` restricts it). Linux gnu (glibc 2.28 floor) and dynamically linked musl, x86_64 and aarch64, link libc (and libdl/libpthread/libutil on gnu); Peak compiles against host X11 and Wayland headers (`-idirafter /usr/include`) and dlopens Wayland, X11, Pulse, and xkbcommon at runtime. Windows x86_64-gnu cross-builds from Linux (manifest + `velocitty.rc` icon). macOS needs the native SDK or `-Dmacos-sdk=`; Peak is compiled with `.language = .objective_c` (a `-x objective-c` cflag is ignored because Zig puts cflags after the file).
-- `zig build package` runs `scripts/package.py`: Linux `packages/velocitty-<version>-<triple>.tar.gz` (binary, desktop, icon, manpage); Windows portable ZIP plus Inno Setup installer from `scripts/windows.iss` (ZIP only when not on Windows); macOS universal `Velocitty.app` (ad-hoc signed) in a DMG, built on macOS.
-- `.github/workflows/release.yml` builds, tests, packages and smoke-launches on Linux (gnu + Alpine musl under Xvfb), Windows (silent install → `tests/desktop_smoke.py` → uninstall) and macOS (mount DMG, `lipo -verify_arch`, launch) for `main`, `codex/**`, `release/**`, PRs and `v*` tags. `publish` runs only on `release/**` pushes or `v*` tags and uploads the unsigned release plus SHA256SUMS via `scripts/publish_release.py`. Release text is `RELEASE_NOTES.md`.
-- Branding: `scripts/branding.py` regenerates `assets/icon.svg`, `icon.png`, `icon.ico`, `icon.icns` from the vector bolt path in the script, and the README wordmark/GIF via `ttfx` (`--icon-only` skips the wordmark).
-- Windows ConPTY children get `STARTF_USESTDHANDLES` with invalid std handles; otherwise a child of a redirected parent writes to the parent's pipes instead of the pseudoconsole. Windows argv is quoted only when needed (cmd.exe ignores quoted switches like `"/c"`).
+## Font policy
+- Select the primary family from configuration; when unset, resolve the system `monospace` default. Never hardcode Iosevka or another user family/path as the preferred or emergency default.
+- Load fallback fonts only when a requested glyph is missing. Preserve configured fallback order and Unicode/CJK/emoji coverage; do not eagerly load every coverage font.
+- Use fontconfig on Linux and native font resolution elsewhere. Verify requested fallback-family matches while preserving primary-pattern substitution.
+- Parser-only benchmarks load no fonts. Rendering benchmarks follow application font selection unless explicitly overridden.
 
-# Install
-- `zig build` / `zig build install` is Zig's prefix install (default `zig-out/`: binary, `velocitty.desktop`, icon, manpage).
-- `zig build install-usr` builds ReleaseFast for the host and installs `/usr/bin/velocitty`, `/usr/share/applications/velocitty.desktop`, the hicolor icon, and `/usr/share/man/man1/velocitty.1` so it appears in the Omarchy app menu. Uses `sudo` when stdin is a TTY, otherwise `pkexec`.
+## Code map
+- `src/main.zig`: executable and active event loop.
+- Input pipeline: `circbuffer.zig` (owns `preparser.zig` run preparation) → `vt.zig` → `draw.zig` → Peak present.
+- `grid.zig`: cells, interned styles, scrollback, and reflow.
+- `c0.zig`, `esc.zig`, `csi.zig`, `osc.zig`, `dcs.zig`: protocol dispatch; `csiparse.zig`: shared CSI parser.
+- `kitty.zig`, `sixel.zig`: image storage and graphics protocols.
+- `type.zig`, `type/`, `simd.zig`: fonts, rasterization, and SIMD utilities.
+- `scheme.zig`: theme/config loading; `key.zig` and `select.zig`: key encoding and selection.
+- Desktop metadata, Windows resources, and all icon formats live in `assets/`; the manual Unicode rendering fixture is `tests/fixtures/unicode.txt`.
+- `assets/icon.svg` is the canonical icon. Regenerate other formats with `python3 scripts/branding.py --icon-only` (omit the flag only when intentionally updating the wordmark/GIF).
+- `docs/index.html` and `docs/design-1.3.html` share `docs/style.css`.
+- Whenever updating the vs-Ghostty benchmark or its chart, regenerate the chart and refresh `docs/velocitty-vs-ghostty.png`, the image referenced by `docs/design-1.3.html`.
 
-# Code Base
-- Read files only when necessary. Use `grep` or `rg` if you only need a specific function.
-- `simd.zig` — SIMD utilities.
-- `debug.zig` — Debug-mode log + visual overlay (OSC 556 / CSI ? 556; ignored in Release). HUD: cursor, flags, dirty count `D`, last OSC `o`, `SYNC`/`NTF`
-- `circbuffer.zig` — mirrored firehose buffer; `readPTY` (EOF or EAGAIN + 1/hz, never poll 0ms); SIMD LF/ESC scan + run split (not payload-aware line preparse); plain is 0x21..0x7E, space is dispatched through C0, UTF-8 runs are per sequence; incomplete trailing ESC/CSI/OSC/string/UTF-8 is held until more input
-- `vt.zig` — minimal-state emulator; `feedRuns` routes C0/C1/ESC/CSI/OSC/DCS/kitty; plain ASCII runs go through bulk `printPlain` (row-at-a-time fill; wrap, insert mode and DEC charsets fall back to `printCodepoint`)
-- `grid.zig` — cell buffer (including default-color provenance), cursor, last-column flag (`wrap_pending`), scroll region, insert/delete; primary reflow on column resize (soft-wrap flags)
-- `c0.zig` / `c1.zig` — C0/C1 dispatch (BEL ignored; HT writes tab+spaces; BS reverse-wrap; LF/VT/FF are index only so terminfo `cud1` stays in column; NEL is CR+LF; cooked NL becomes CR NL via PTY `OPOST|ONLCR`; LCF delayed DECAWM wrap)
-- `esc.zig` — ESC parse + charset G0–G3 / RIS / HTS / DECALN / SS2/SS3
-- `csi.zig` — CSI parse (`;` params, `:` subparams, packed privates) + apply (foot ctlseqs: SGR, CUP, DECSET, DECRQM, rectangular, kitty kbd, window ops, color stack, XTSMGRAPHICS); debug-only CSI `? 556` overlay
-- `osc.zig` — OSC 0/2 title, 4/10–12/104/110–112 colors, OSC 8 hyperlinks, 7 cwd, 9/99/777 notify (OSC 9;4 ConEmu progress and 9;9 cwd are not notify; OSC 777 only `notify;`; kitty OSC 99 `d=2` closes), 11 alpha, 17/19 selection, 22 cursor, 52 clipboard, 66 text, 133 marks, 176 app-id, debug-only 556 overlay (`all`/`off`/`grid,wrap,lcf,cursor,dirty,region,wide,hud`)
-- `dcs.zig` — DCS DECRQSS (DECSTBM/SGR/DECSCUSR) + iTerm sync + XTGETTCAP + sixel (`sixel.zig`)
-- `draw.zig` — CPU framebuffer; line-dirty fill + SIMD glyph blit; color-emoji RGBA blit; cell-span dirty when a prev snapshot exists; scroll reuse shifts pixels by the best-matching N-row offset (searched only when most lines are dirty; unmatched rows repaint); rows covered by kitty/sixel placements now or last frame repaint (not the whole screen), with clipped placement scaling; DECSCNM reverse; styled/colored underlines; C0 cells are not rasterized; Debug overlay (grid, wrap, LCF, dirty, region, wide, HUD)
-- `type.zig` — TrueType rasterizer, coverage + RGBA atlas, bounded glyph cache (true LRU: hits on the glyph and render paths refresh recency; codepoint+style -> face/glyph resolve memo, 4096 direct-mapped, cleared on font changes); bold/italic faces; CBDT/CBLC color emoji (`type/cbdt.zig`); `type/eastasian.zig` cell width
-- `scheme.zig` — TOML subset (colors, font, pad; hz/whitelist are legacy parsed settings with no runtime effect; cadence uses the Hyprland monitor rate or 60 Hz). Supported settings use bare table/key names and single-line strings, with basic escapes decoded; unrelated values, quoted names, array tables, multiline strings and nested collections are skipped without full TOML validation (collections are bounded to 64 levels). Integer settings parse directly into checked u32 values; finite font sizes accept exponents and digit separators. Loads Omarchy current theme; font size from Alacritty, then 9 pt only if the current theme's colors.toml is a regular file, otherwise 8 pt; family from fontconfig `monospace` (`omarchy font`). `[font].fallbacks` is an ordered array of up to 16 installed family names (128 bytes each), applied before built-ins; overlays replace the array, `[]` clears custom entries only
-- SIGUSR1/SIGUSR2 or Omarchy theme/font file change reloads colors and font in `main.zig` (`fc-match` needs process environ so HOME/fonts.conf apply); custom and built-in Noto family resolution verifies the matched family so missing names cannot silently load an unrelated substitute; primary patterns keep fontconfig substitution. Linux distro DejaVu/Noto paths remain as defaults; do not hardcode app-specific/user font families.
-- `loop.zig` — unused libxev-shaped scaffolding; the active loop is in `main.zig`
-- `select.zig` — cell-stream selection over `vt.VtState` (drag, double-click word, triple-click line)
-- `key.zig` — PTY key encoding: Shift+Tab CSI Z, modified arrows CSI 1;mod A, xterm modifyOtherKeys `CSI 27;mod;key~`, kitty keyboard protocol CSI u when flags are pushed; Delete is CSI 3~ (not DEL 0x7F, which the tty treats as backspace)
-- `kitty.zig` — kitty graphics (APC G: stream + file/temp, `a=q` OK replies for icat); multipart encoded data capped at 16 MiB; file reads are nonblocking regular-file only, and file reads reopen pinned regular files through /proc/self/fd; temporary unlink is restricted to protocol-marked direct children of /tmp, /var/tmp, /dev/shm, or an absolute TMPDIR; sixel bitmaps placed through the same store
-- `sixel.zig` — DCS q decoder (palette, repeats, raster attrs) → RGBA
-- `platform/` — Peak backend. `peak.zig` declares calls to vendored `vendor/godstack/Peak`; `build.zig` compiles its `peak.c`. Window + backbuffer present, focus/expose, WM_CLASS / xdg app-id (`--class` / OSC 176), opacity (X11 `_NET_WM_WINDOW_OPACITY`; Wayland `wp_alpha_modifier_v1`, else buffer alpha), clipboard CLIPBOARD plus primary (`zwp_primary_selection_v1` on Wayland). Wayland backbuffer is logical size × fractional scale (`wp_fractional_scale_v1` + `wp_viewport`; integer `wl_output` scale if those are absent) and pointer coordinates are in that buffer. Each commit sets `xdg_surface.set_window_geometry` and `wl_surface.set_input_region` to the logical size so a scaled buffer cannot take clicks outside the tile. The configure ack commits that clip immediately, without waiting for the next present, and pointer events outside the logical window are dropped (strict half-open bounds, rechecked for clicks/wheel after resize; extra mouse buttons are ignored rather than mapped to left-click). Temporary input regions are destroyed on the server after use. `peak_window_present_rect(y, h)` copies only those rows to the Wayland shm and sends `wl_surface.damage_buffer` (full damage when the shm is stale, opacity changed, or wl_surface < 4); X11 puts only those rows. Pointer events follow the entered surface; leave releases held buttons instead of extending the selection. Wheel is `wl_pointer` `axis_value120` / discrete, one click per detent. Cursor shape (OSC 22) is `wp_cursor_shape_v1` (text, hand, wait, crosshair, not-allowed, help) and hide uses `wl_pointer.set_cursor`. Motion is always delivered. PTY is `peak_pty_spawn` (`$SHELL` or `-e`); slave keeps `OPOST|ONLCR`; child env `TERM=xterm-256color`, `COLORTERM=truecolor`, `TERM_PROGRAM=velocitty`, `KITTY_WINDOW_ID`, `COLUMNS`, `LINES` is set around the spawn and restored in the parent; `TIOCSWINSZ` + `SIGWINCH` to the slave fg pgroup. Wayland compose is Peak's xkbcommon path; X11 text is `XLookupString` (no Multi_key compose). Keyboard text is retained per event; PTY writes queue on backpressure and flush in order without blocking. A key or paste while scrolled calls `viewBottom`
-- `main.zig` — window + PTY + fonts (regular/bold/italic via fc-match, Noto Color Emoji fallback); `circbuffer` → `vt` → `draw` → Peak present (gated by `need_draw`; `Presenter` copies only the frame's damaged rows and calls `presentRect`, full blit + present when the window buffer, layout or pad color changed or after expose/resize); each tick `readPTY` (EOF or EAGAIN+1/hz) pumps Peak during EAGAIN waits (successful reads are not deadline-bounded); DECSET 2026 / iTerm DCS `=1s` defers present until sync ends (bounded by `hz` loop iterations, approximately 1s at intended cadence); mouse reports (1000/1002/1003 + SGR/urxvt/pixels) for buttons/motion/wheel, else alt-screen arrows or primary history view; Shift+Tab sends CSI Z (CSI 9;2u with kitty kbd); modified keys and kitty CSI u via `key.zig`; left-drag selects (Shift+drag when mouse reporting is on); double-click word / triple-click line (click chains and held/drag state reset on focus changes); mouse-up copies PRIMARY; Ctrl+Shift+C copies CLIPBOARD; Ctrl+Shift+V / Shift+Insert paste CLIPBOARD, middle-click pastes PRIMARY (bracketed if DECSET 2004); focus CSI I/O (1004) and visibility 2033; theme-change 2031 on palette reload (watchStamp throttled); inner pad from `[general] pad` (default 14), scaled by Wayland output scale; font/pad/cells use CSS 96 DPI × Hyprland/`GDK_SCALE` multiplier (not X11 mm-DPI) and re-apply on focus/resize only when scale/grid actually change; resize updates the grid, PTY winsize (SIGWINCH), real window pixel geometry (CSI 14/15/16), and flushes VT replies (in-band 2048 if enabled); CLI `-e`/`--` command, `--class=`, `--title=`, `--working-directory=` (xdg-terminal-exec)
+## Common checks
+- `zig build check`: compile portable tests; `zig build test`: run them and native Peak checks.
+- `python3 tests/package_test.py`: package layout checks.
+- Linux inline checks (musl avoids host GNU CRT `.sframe` issues):
+  ```sh
+  zig test src/main.zig src/type/stb_truetype.c src/stb_image.c -Ilib -lc -target x86_64-linux-musl
+  zig test src/firehose_test.zig src/stb_image.c -Ilib -lc -target x86_64-linux-musl
+  ```
+- Select targeted checks from the testing reference. Rendering regressions live inline in `src/draw.zig`; there is no standalone golden/render harness.
+- Report checks actually run, observed outcomes, and skips; do not copy historical pass counts.
 
-# Bench
-- `zig build bench` — `src/bench.zig`, ReleaseFast, ~13 s by default. Options: `--quick` (1 MiB/workload, 40 samples), `--mib`, `--burst` (KiB per frame), `--grid COLSxROWS` (default 120x40), `--samples`, `--font`, `--only a,b`, `--help`. Every row is p50/p95/mean (nearest-rank over frames or 64-lookup batches). Header records Zig, CPU, AC/battery, governor and platform profile; a 500 ms spin-up precedes timing.
-- Pipeline workloads (`ascii`, `unicode`, `grapheme`, `csi-short`, `long-escape`, `kitty-image`, `sixel`): a writer thread streams generated bytes into a real raw-mode PTY slave; each frame reads one burst (default 16 KiB) from the master into the 64 KiB circbuffer, then `consumeAndGetRuns` (scan) → `feedRuns` (vt) → `renderSel` (render) → framebuffer memcpy (present). Reports per-stage p50/p95 and share: io (time inside read(2); poll wait reported separately) / parse (scan+vt) / render (draw+copy). No Peak, compositor or input latency.
-- `glyph` section: ASCII table, non-ASCII and CJK (fallback face) hits via `glyph()`/`peekGlyph()`, misses (raster+pack Latin, CJK, color emoji), uniform working sets at 0.5/0.9/1.1/2x the 2048-entry cache, and a hot-64 retention test (ideal LRU = 100% hot hits). `render` section: full/skip/single/line/cursor/selection/scroll/resize + present copy at the grid and ~4K.
-- Logs: `bench/<UTC>-<git12>[-dirty].txt` and `last_bench` (gitignored). Laptop power state moves numbers 1.5x+; compare runs only under the same power header.
-- Benchmark checks: `zig test src/bench.zig src/type/stb_truetype.c src/stb_image.c -Ilib -lc --test-filter benchmark` (workloads parse completely with images reaching the store; PTY pipeline delivers every byte).
-
-# Firehose regression tests
-- `zig test src/circbuffer.zig --test-filter firehose` checks that overruns retain exactly the newest ringful without growing storage, and that `readPTY` drains beyond capacity through EOF. Keep this lossy output-ingestion behavior from DESIGN.md; it is separate from keyboard/paste delivery to the PTY.
-
-# Peak input regression tests
-- Velocitty builds Peak with `PEAK_NO_GAMEPAD`: no direct `/dev/input/js*` polling. Gaming mice can expose joystick interfaces; converting their global button events into pointer events caused clicks at (0,0) in every terminal, bypassing compositor routing.
-- Headless joystick-disabled regression: `cc -Ivendor/godstack/Peak tests/peak_no_gamepad.c -o /tmp/velocitty-peak-no-gamepad -ldl -lpthread -lm && /tmp/velocitty-peak-no-gamepad`.
-- Headless Wayland hit-region, resize/click, extra-button, wheel, and leave tests: `cc -Ivendor/godstack/Peak tests/peak_pointer.c -o /tmp/velocitty-peak-pointer -ldl -lpthread -lm && /tmp/velocitty-peak-pointer`.
-
-- Headless keyboard callback and wrapper regression: `zig test tests/peak_keyboard.c --dep platform -Mroot=tests/peak_keyboard.zig -Mplatform=src/platform/platform.zig -lc -ldl -lpthread -lm`. Wayland special-key identities use compositor xkb keysyms (not physical evdev codes), and repeat eligibility uses the keymap. Includes a real libxkbcommon `caps:swapescape` regression for press/release, modified Escape, and repeat (skips if libxkbcommon is unavailable).
-- Headless Wayland partial-present regression: `cc -Ivendor/godstack/Peak tests/peak_present.c -o /tmp/velocitty-peak-present -ldl -lpthread -lm && /tmp/velocitty-peak-present`.
-- PTY backpressure and ordering regression: `zig test tests/pty_queue.c --dep platform -Mroot=tests/pty_queue.zig -Mplatform=src/platform/platform.zig -lc -ldl -lpthread -lutil -lm`.
-
-# Rendering tests
-- Config checks: `zig test src/scheme.zig -lc -target x86_64-linux-musl` (integer precision/overflow, ignored TOML values and array tables, escaped strings, actual theme-file font defaults, fallback array order, ownership, overlays, empty reset, malformed input and limits). `src/main.zig` also tests rejection of unrelated fontconfig substitutions and real fallback order/deduplication, primary ASCII and symbol/braille glyphs. The loading smoke test explicitly skips if fontconfig or the two Noto Symbols families are unavailable.
-- Direct current inline check: `zig test src/main.zig src/type/stb_truetype.c src/stb_image.c -Ilib -lc -target x86_64-linux-musl` (106 reported OK with Zig 0.17; overlapping/import-only tests and font early returns are not extra coverage). The musl target avoids host GNU CRT `.sframe` linker incompatibility.
-- `zig build test` runs `src/port_test.zig` (inline tests + portable Peak PTY) and `tests/peak_native.c`; `zig build check` compiles them without running; `python3 tests/package_test.py` checks package layouts. `build.zig` does not wire `fuzz-render`; the `tests/` Zig harness imports the removed `ZT` Engine/Runs API. Commands below are historical, not working build targets. Inline `src/` tests and standalone Peak C checks are separate.
-- Cell dumps: `VtState.dumpAlloc` / `dumpCellsAlloc`; fixtures in `tests/vt/*.in` (first line `cols rows`).
-- PNG goldens: `tests/golden/`; mismatch writes `zig-out/screenshots/<name>` and `<name>.diff.png`.
-- Bless dumps and PNGs with `ZT_UPDATE_GOLDEN=1 zig build test`.
-- Dirty vs full: `tests/render.zig` (32 iters). Long run: `zig build fuzz-render -- 10000`.
+## Task-specific references
+Read only what is relevant, before modifying the corresponding subsystem:
+- [Codebase map and ownership details](docs/agents/map.md)
+- [Regression tests and standalone Peak checks](docs/agents/testing.md)
+- [Benchmark workloads and comparison methodology](docs/agents/benchmarks.md)
+- [Release, packaging, CI, and installation](docs/agents/release.md)

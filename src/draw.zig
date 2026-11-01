@@ -7,6 +7,81 @@ const Type = @import("type.zig");
 const Box = @import("draw/box.zig");
 const Select = @import("select.zig");
 const Debug = @import("debug.zig");
+const Grapheme = @import("type/grapheme.zig");
+
+/// The glyph to draw for a cluster's first code point: Hangul L V (T)
+/// jamo and LV + T compose into their precomposed syllable (the fonts have
+/// no shaping here); everything else is its first code point.
+fn clusterBase(cps: []const u32) u21 {
+    const first: u21 = @intCast(cps[0]);
+    if (cps.len >= 2) {
+        const second = cps[1];
+        const third: u32 = if (cps.len >= 3) cps[2] else 0;
+        const t: u32 = if (third > 0x11A7 and third <= 0x11C2) third - 0x11A7 else 0;
+        if (first >= 0x1100 and first <= 0x1112 and second >= 0x1161 and second <= 0x1175) {
+            return @intCast(0xAC00 + (@as(u32, first) - 0x1100) * 588 + (second - 0x1161) * 28 + t);
+        }
+        if (first >= 0xAC00 and first <= 0xD7A3 and (first - 0xAC00) % 28 == 0 and second > 0x11A7 and second <= 0x11C2) {
+            return @intCast(first + (second - 0x11A7));
+        }
+    }
+    return first;
+}
+
+/// A code point after a cluster's base that has ink of its own: marks and
+/// spacing marks, not joiners, selectors, tags or jamo already composed.
+fn drawnMark(cp: u21) bool {
+    if (cp == 0x200C or cp == 0x200D) return false;
+    if (cp >= 0xFE00 and cp <= 0xFE0F) return false;
+    if (cp >= 0xE0000) return false;
+    if (cp >= 0x1160 and cp <= 0x11FF) return false;
+    return switch (Grapheme.props(cp).class) {
+        .extend, .extend_incb, .extend_linker, .spacing_mark, .linker_spacing => true,
+        else => false,
+    };
+}
+
+/// A cluster cell (kept off the single-codepoint path): its base glyph
+/// (`clusterBase`), then, unless that is a color emoji (no shaping: an
+/// emoji ZWJ sequence, flag or modifier sequence shows its first emoji),
+/// its marks. A mark drawn left of its origin goes after the base, as fonts
+/// design them; one drawn right of it sits on the cell; spacing marks
+/// follow the base.
+noinline fn drawCluster(self: *Frame, cps: []const u32, st: Term.Style, x0: u32, y0: u32, cell_w: u32, cell_h: u32, type_ctx: ?*Type.Context, size: f32, baseline: f32, fg: u32, bg: u32, clip: Clip) void {
+    const base = clusterBase(cps);
+    if (base >= 0x80 and Box.paint(self.pixels, self.width, self.height, @intCast(x0), @intCast(y0), cell_w, cell_h, fg, bg, .{ .x0 = clip.x0, .y0 = clip.y0, .x1 = clip.x1, .y1 = clip.y1 }, base, st.attrs.bold)) return;
+    const ctx = type_ctx orelse {
+        // No fonts: the box `blitLine` draws for any character.
+        if (clip.y0 <= @as(i32, @intCast(y0)) and clip.y1 >= @as(i32, @intCast(y0 + cell_h)) and cell_w > 2 and cell_h > 2) {
+            var y: u32 = 1;
+            while (y + 1 < cell_h) : (y += 1) @memset(self.pixels[(y0 + y) * self.width + x0 + 1 ..][0 .. cell_w - 2], fg);
+        }
+        return;
+    };
+    const face = Type.Style{ .bold = st.attrs.bold, .italic = st.attrs.italic };
+    const fx0: f32 = @floatFromInt(x0);
+    const first = ctx.peekGlyphStyled(base, size, face) orelse (ctx.ensureGlyphStyled(base, size, face) catch return);
+    const oy0: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(y0)) + baseline - first.bearing_y));
+    const ox0: i32 = @intFromFloat(@round(fx0 + first.bearing_x));
+    if (first.color) {
+        blitColorGlyph(self, first, ctx.color_atlas.pixels, ctx.color_atlas.width, ox0, oy0, clip);
+        return;
+    }
+    if (base != ' ') @call(.never_inline, blitGlyph, .{ self, first, ctx.atlas.pixels, ctx.atlas.width, ox0, oy0, fg, bg, clip });
+    var pen = fx0 + first.advance;
+    for (cps[1..]) |v| {
+        const cp: u21 = @intCast(v);
+        if (!drawnMark(cp)) continue;
+        const glyph = ctx.peekGlyphStyled(cp, size, face) orelse (ctx.ensureGlyphStyled(cp, size, face) catch continue);
+        if (glyph.color) continue;
+        const spacing = Grapheme.props(cp).width != 0;
+        const origin = if (spacing or glyph.bearing_x < 0) pen else fx0;
+        const ox: i32 = @intFromFloat(@round(origin + glyph.bearing_x));
+        const oy: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(y0)) + baseline - glyph.bearing_y));
+        @call(.never_inline, blitGlyph, .{ self, glyph, ctx.atlas.pixels, ctx.atlas.width, ox, oy, fg, bg, clip });
+        if (spacing) pen += glyph.advance;
+    }
+}
 
 const vec_len = std.simd.suggestVectorLength(u32) orelse 4;
 
@@ -26,6 +101,11 @@ pub const Frame = struct {
     height: u32,
     pixels: []u32,
     prev: []Term.Cell = &.{},
+    /// Style table and generation the snapshot's ids belong to: ids are
+    /// only comparable within one generation (`Term.Styles`).
+    prev_styles: ?*const Term.Styles = null,
+    prev_gen: u32 = 0,
+    prev_reverse: bool = false,
     prev_cols: u16 = 0,
     prev_rows: u16 = 0,
     prev_cursor: Term.Cursor = .{},
@@ -113,6 +193,13 @@ pub const Frame = struct {
 
         const cols = screen.cols;
         const rows = screen.rows;
+        if (self.prev_styles != screen.styles or self.prev_gen != screen.styles.gen or self.prev_reverse != screen.flags.reverse) {
+            // Cell ids do not capture recoloring or global reverse video.
+            self.prev_rows = 0;
+            self.prev_styles = screen.styles;
+            self.prev_gen = screen.styles.gen;
+            self.prev_reverse = screen.flags.reverse;
+        }
         const have_prev = self.ensurePrev(cols, rows);
         const cur_on = screen.cursorVisible() and screen.scrollOffset() == 0;
         var cur = screen.cursor();
@@ -128,7 +215,7 @@ pub const Frame = struct {
         // Images are blitted over text: rows they cover now or covered last
         // frame are repainted; other rows keep the dirty/compare rules.
         var img_rows: [max_rows]bool = @splat(false);
-        if (screen.scrollOffset() == 0) imageRows(screen, cell_h, rows, &img_rows);
+        imageRows(screen, cell_w, cell_h, rows, &img_rows);
         var scroll: i32 = 0;
         if (have_prev and mayHaveScrolled(screen, rows)) {
             scroll = scrollDelta(screen, self.prev, cols, rows);
@@ -157,7 +244,10 @@ pub const Frame = struct {
             const cursor_row = mustPaintCursorRow(r, self.prev_cursor, self.prev_cursor_on, cur, cur_on) or
                 (style_changed and (r == cur.row or r == self.prev_cursor.row)) or
                 (scroll != 0 and cur_on and r == cur.row);
-            const sel_row = sel.coversRow(r, cols) or self.prev_sel.coversRow(r, cols);
+            const shifted_row = @as(i32, r) + scroll;
+            const shifted_sel = scroll != 0 and shifted_row >= 0 and shifted_row < rows and
+                self.prev_sel.coversRow(@intCast(shifted_row), cols);
+            const sel_row = sel.coversRow(r, cols) or self.prev_sel.coversRow(r, cols) or shifted_sel;
             const img_row = r < max_rows and (img_rows[r] or self.prev_img_rows[r]);
             var need = true;
             if (!paint_all and !cursor_row and !sel_row and !img_row) {
@@ -227,9 +317,7 @@ pub const Frame = struct {
             }
             glyph_ns += @intCast(nowNs() - tg0);
         }
-        if (screen.scrollOffset() == 0) {
-            blitKitty(self, screen, cell_w, cell_h);
-        }
+        blitKitty(self, screen, cell_w, cell_h);
         if (overlay_on) {
             paintDebugOverlay(self, screen, cell_w, cell_h, cur);
             self.dirty_full = true;
@@ -312,11 +400,15 @@ fn runUniformBg(screen: *const Term.Screen, start: u16, end: u16) ?u32 {
     const first = screen.rowCells(start);
     if (first.len == 0) return null;
     const rev = screen.flags.reverse;
-    const bg = packColor(effectiveBg(first[0], rev));
+    const styles = screen.styles;
+    var id = first[0].style;
+    const bg = packColor(effectiveBg(styles.get(id), rev));
     var r = start;
     while (r < end) : (r += 1) {
         for (screen.rowCells(r)) |cell| {
-            if (packColor(effectiveBg(cell, rev)) != bg) return null;
+            if (cell.style == id) continue;
+            if (packColor(effectiveBg(styles.of(cell), rev)) != bg) return null;
+            id = cell.style;
         }
     }
     return bg;
@@ -435,20 +527,20 @@ fn markDirtyStrip(self: *Frame, row: u16, cell_h: u32) void {
     self.dirty_h = y1 - y0;
 }
 
-fn effectiveBg(cell: Term.Cell, reverse: bool) Term.Color {
-    const inv = cell.attrs.inverse != reverse;
-    return if (inv) cell.fg else cell.bg;
+fn effectiveBg(st: Term.Style, reverse: bool) Term.Color {
+    const inv = st.attrs.inverse != reverse;
+    return if (inv) st.fg else st.bg;
 }
 
-fn effectiveFg(cell: Term.Cell, reverse: bool) Term.Color {
-    var fg = cell.fg;
-    var bg = cell.bg;
-    if (cell.attrs.inverse != reverse) {
+fn effectiveFg(st: Term.Style, reverse: bool) Term.Color {
+    var fg = st.fg;
+    var bg = st.bg;
+    if (st.attrs.inverse != reverse) {
         const tmp = fg;
         fg = bg;
         bg = tmp;
     }
-    if (cell.attrs.dim) {
+    if (st.attrs.dim) {
         fg = .{ .r = fg.r / 2, .g = fg.g / 2, .b = fg.b / 2, .a = fg.a };
     }
     return fg;
@@ -462,19 +554,26 @@ fn paintBgSpan(self: *Frame, screen: *const Term.Screen, line: []const Term.Cell
     const y0 = @as(u32, row) * cell_h;
     const last: u16 = @intCast(@min(@as(usize, col1), line.len));
     var c = col0;
+    const styles = screen.styles;
     while (c < last) {
-        const bg = packColor(paintColors(screen, line[c], sel.contains(c, row, cols)).bg);
+        const in_sel = sel.contains(c, row, cols);
+        const bg = packColor(paintColors(screen, styles.of(line[c]), in_sel).bg);
         var n: u16 = 1;
-        while (c + n < last and packColor(paintColors(screen, line[c + n], sel.contains(c + n, row, cols)).bg) == bg) : (n += 1) {}
+        while (c + n < last) : (n += 1) {
+            const next_sel = sel.contains(c + n, row, cols);
+            // Same style and selection state: same color, no lookup.
+            if (line[c + n].style == line[c].style and next_sel == in_sel) continue;
+            if (packColor(paintColors(screen, styles.of(line[c + n]), next_sel).bg) != bg) break;
+        }
         fillRect(self, @as(u32, c) * cell_w, y0, @as(u32, n) * cell_w, cell_h, bg);
         c += n;
     }
 }
 
-fn paintColors(screen: *const Term.Screen, cell: Term.Cell, selected: bool) struct { fg: Term.Color, bg: Term.Color } {
+fn paintColors(screen: *const Term.Screen, st: Term.Style, selected: bool) struct { fg: Term.Color, bg: Term.Color } {
     const rev = screen.flags.reverse;
-    var fg = effectiveFg(cell, rev);
-    var bg = effectiveBg(cell, rev);
+    var fg = effectiveFg(st, rev);
+    var bg = effectiveBg(st, rev);
     if (selected) {
         if (screen.have_sel_fg or screen.have_sel_bg) {
             if (screen.have_sel_fg) fg = screen.sel_fg;
@@ -509,15 +608,20 @@ fn blitLine(
 ) void {
     const y0 = @as(u32, row) * cell_h;
     const last: u16 = @intCast(@min(@as(usize, col1), line.len));
+    const styles = screen.styles;
     var c = col0;
     while (c < last) : (c += 1) {
         const cell = line[c];
-        if (cell.attrs.hidden or cell.codepoint < 0x20 or cell.codepoint == 0x7F) continue;
-        const painted = paintColors(screen, cell, sel.contains(c, row, @intCast(line.len)));
+        if (cell.codepoint < 0x20 or cell.codepoint == 0x7F) continue;
+        const st = styles.of(cell);
+        if (st.attrs.hidden) continue;
+        const painted = paintColors(screen, st, sel.contains(c, row, @intCast(line.len)));
         const fg = packColor(painted.fg);
         const bg = packColor(painted.bg);
         const x0 = @as(u32, c) * cell_w;
-        if (!(cell.codepoint >= 0x80 and Box.paint(
+        if (cell.isCluster()) {
+            drawCluster(self, styles.clusters.get(cell.codepoint - Term.cluster_base), st, x0, y0, cell_w, cell_h, type_ctx, size, baseline, fg, bg, clip);
+        } else if (!(cell.codepoint >= 0x80 and Box.paint(
             self.pixels,
             self.width,
             self.height,
@@ -529,14 +633,14 @@ fn blitLine(
             bg,
             .{ .x0 = clip.x0, .y0 = clip.y0, .x1 = clip.x1, .y1 = clip.y1 },
             cell.codepoint,
-            cell.attrs.bold,
+            st.attrs.bold,
         ))) {
             if (type_ctx) |ctx| {
                 if (cell.codepoint != ' ') {
-                    const st = Type.Style{ .bold = cell.attrs.bold, .italic = cell.attrs.italic };
-                    var g = ctx.peekGlyphStyled(cell.codepoint, size, st);
+                    const face = Type.Style{ .bold = st.attrs.bold, .italic = st.attrs.italic };
+                    var g = ctx.peekGlyphStyled(cell.codepoint, size, face);
                     if (g == null) {
-                        g = ctx.ensureGlyphStyled(cell.codepoint, size, st) catch null;
+                        g = ctx.ensureGlyphStyled(cell.codepoint, size, face) catch null;
                     }
                     if (g) |glyph| {
                         const ox: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(x0)) + glyph.bearing_x));
@@ -544,6 +648,7 @@ fn blitLine(
                         if (glyph.color) {
                             blitColorGlyph(self, glyph, ctx.color_atlas.pixels, ctx.color_atlas.width, ox, oy, clip);
                         } else {
+                            // `drawCluster` calls it out of line.
                             blitGlyph(self, glyph, ctx.atlas.pixels, ctx.atlas.width, ox, oy, fg, bg, clip);
                         }
                     }
@@ -561,12 +666,12 @@ fn blitLine(
                 }
             }
         }
-        if ((cell.attrs.underline or cell.attrs.link) and clip.y0 <= @as(i32, @intCast(y0)) and clip.y1 >= @as(i32, @intCast(y0 + cell_h))) {
-            const ul = if (cell.attrs.ul_color)
-                packColor(.{ .r = cell.ul.r, .g = cell.ul.g, .b = cell.ul.b, .a = 255 })
+        if ((st.attrs.underline or st.attrs.link) and clip.y0 <= @as(i32, @intCast(y0)) and clip.y1 >= @as(i32, @intCast(y0 + cell_h))) {
+            const ul = if (st.attrs.ul_color)
+                packColor(.{ .r = st.ul.r, .g = st.ul.g, .b = st.ul.b, .a = 255 })
             else
                 fg;
-            const style: u3 = if (cell.attrs.underline_style != 0) cell.attrs.underline_style else 1;
+            const style: u3 = if (st.attrs.underline_style != 0) st.attrs.underline_style else 1;
             drawUnderline(self, x0, y0, cell_w, cell_h, ul, style);
         }
     }
@@ -609,14 +714,18 @@ fn drawUnderline(self: *Frame, x0: u32, y0: u32, cell_w: u32, cell_h: u32, color
 }
 
 /// Marks screen rows covered by visible placements (same geometry as blitKitty).
-fn imageRows(screen: *const Term.Screen, cell_h: u32, rows: u16, out: *[max_rows]bool) void {
+fn imageRows(screen: *const Term.Screen, cell_w: u32, cell_h: u32, rows: u16, out: *[max_rows]bool) void {
     const store = &screen.kitty;
+    const base = screen.imageBase();
     for (store.placements.items) |p| {
         if (p.screen != @as(u1, if (screen.altScreen()) 1 else 0)) continue;
         const img = store.find(p.image_id) orelse continue;
-        const span: i64 = if (p.rows != 0) p.rows else (img.height + cell_h - 1) / cell_h;
-        const r0: i64 = @max(0, p.row);
-        const r1: i64 = @min(@as(i64, @min(rows, max_rows)), @as(i64, p.row) + span);
+        const size = p.pixelSize(img.*, cell_w, cell_h);
+        if (size.width == 0 or size.height == 0) continue;
+        const span: i64 = @intCast(@min(std.math.maxInt(u32), (size.height - 1) / cell_h + 1));
+        const row = p.row - base;
+        const r0: i64 = @max(0, row);
+        const r1: i64 = @min(@as(i64, @min(rows, max_rows)), row + span);
         var r = r0;
         while (r < r1) : (r += 1) out[@intCast(r)] = true;
     }
@@ -642,13 +751,16 @@ fn shiftRows(flags: *[max_rows]bool, k: u16, dir: Shift) void {
 fn blitKitty(self: *Frame, screen: *const Term.Screen, cell_w: u32, cell_h: u32) void {
     const store = &screen.kitty;
     if (store.placements.items.len == 0) return;
+    const base = screen.imageBase();
     for (store.placements.items) |p| {
         if (p.screen != @as(u1, if (screen.altScreen()) 1 else 0)) continue;
         const img = store.find(p.image_id) orelse continue;
-        const dest_w: u64 = if (p.columns != 0) @as(u64, p.columns) * cell_w else img.width;
-        const dest_h: u64 = if (p.rows != 0) @as(u64, p.rows) * cell_h else img.height;
+        if (img.rgba.len < @as(usize, img.width) * img.height * 4) continue;
+        const size = p.pixelSize(img.*, cell_w, cell_h);
+        const dest_w = size.width;
+        const dest_h = size.height;
         const dx: i64 = @as(i64, p.col) * cell_w;
-        const dy: i64 = @as(i64, p.row) * cell_h;
+        const dy: i64 = (p.row - base) * cell_h;
         const src_x = @min(p.src_x, img.width);
         const src_y = @min(p.src_y, img.height);
         const crop_w: u32 = if (p.src_w == 0) img.width - src_x else @min(p.src_w, img.width - src_x);
@@ -1072,6 +1184,168 @@ fn mixVec(bg: @Vector(vec_len, u32), fg: @Vector(vec_len, u32), cover: @Vector(v
     return (ba << s24) | (r << s16) | (g << s8) | b;
 }
 
+test "image anchors follow wrapped text through repeated width changes" {
+    const a = std.testing.allocator;
+    var storage: [4096]u8 = undefined;
+    var vt = try Term.VtState.init(a, 8, 4, 20, &storage);
+    defer vt.deinit();
+    vt.flags.cursor_visible = false;
+    vt.cell_px_w = 4;
+    vt.cell_px_h = 4;
+    vt.feedText("abcdefghijklmnop");
+    _ = vt.kitty.feed("\x1b_Ga=T,f=32,s=1,v=1,i=8,C=1,c=1,r=1;/wAA/w==\x1b\\", .{ .row = 0, .col = 5, .cell_w = 4, .cell_h = 4 }, 8, 4, 0);
+    var frame = try Frame.init(a, 32, 16);
+    defer frame.deinit();
+    for (0..3) |_| {
+        for ([_]struct { cols: u16, rows: u16, row: i64, col: i32 }{
+            .{ .cols = 4, .rows = 6, .row = 1, .col = 1 },
+            .{ .cols = 8, .rows = 4, .row = 0, .col = 5 },
+        }) |size| {
+            try vt.resize(size.cols, size.rows);
+            try frame.resize(@as(u32, size.cols) * 4, @as(u32, size.rows) * 4);
+            vt.prepareImages();
+            frame.render(&vt, 4, 4, null, 8);
+            try std.testing.expectEqual(@as(usize, 1), vt.kitty.placements.items.len);
+            const p = vt.kitty.placements.items[0];
+            try std.testing.expectEqual(size.row, p.row - vt.imageBase());
+            try std.testing.expectEqual(size.col, p.col);
+            const pixel: usize = @intCast(size.row * 4 * frame.width + size.col * 4);
+            try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[pixel]);
+            vt.clearDirty();
+        }
+    }
+}
+
+test "history images survive reflow instead of being deleted" {
+    const a = std.testing.allocator;
+    var storage: [4096]u8 = undefined;
+    var vt = try Term.VtState.init(a, 4, 4, 20, &storage);
+    defer vt.deinit();
+    vt.flags.cursor_visible = false;
+    vt.cell_px_w = 4;
+    vt.cell_px_h = 4;
+    vt.feedText("abcdefgh");
+    _ = vt.kitty.feed("\x1b_Ga=T,f=32,s=1,v=1,i=8,C=1,c=1,r=1;/wAA/w==\x1b\\", .{ .row = 1, .col = 1, .cell_w = 4, .cell_h = 4 }, 4, 4, 0);
+    vt.regionScrollUp(2);
+    vt.viewScroll(2);
+    try vt.resize(8, 4);
+    var frame = try Frame.init(a, 32, 16);
+    defer frame.deinit();
+    vt.prepareImages();
+    frame.render(&vt, 4, 4, null, 8);
+    try std.testing.expect(vt.kitty.find(8) != null);
+    try std.testing.expectEqual(@as(usize, 1), vt.kitty.placements.items.len);
+    try std.testing.expectEqual(@as(i64, 0), vt.kitty.placements.items[0].row - vt.imageBase());
+    try std.testing.expectEqual(@as(i32, 5), vt.kitty.placements.items[0].col);
+    try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[20]);
+}
+
+test "reflow preserves the scrolled viewport over an image" {
+    const a = std.testing.allocator;
+    var storage: [4096]u8 = undefined;
+    var vt = try Term.VtState.init(a, 4, 4, 50, &storage);
+    defer vt.deinit();
+    vt.flags.cursor_visible = false;
+    vt.cell_px_w = 4;
+    vt.cell_px_h = 4;
+    _ = vt.kitty.feed("\x1b_Ga=T,f=32,s=1,v=1,i=8,C=1,c=1,r=1;/wAA/w==\x1b\\", .{ .row = 1, .col = 1, .cell_w = 4, .cell_h = 4 }, 4, 4, 0);
+    const text: [80]u8 = @splat('a');
+    vt.feedText(&text);
+    vt.viewScroll(1000);
+    try vt.resize(8, 4);
+    try std.testing.expect(vt.scrollOffset() > 0);
+    var frame = try Frame.init(a, 32, 16);
+    defer frame.deinit();
+    vt.prepareImages();
+    frame.render(&vt, 4, 4, null, 8);
+    try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[20]);
+}
+
+test "blank-cell images survive lazy decode redraw and font-sized resize" {
+    const a = std.testing.allocator;
+    var storage: [4096]u8 = undefined;
+    var vt = try Term.VtState.init(a, 8, 4, 20, &storage);
+    defer vt.deinit();
+    vt.flags.cursor_visible = false;
+    vt.cell_px_w = 4;
+    vt.cell_px_h = 4;
+    _ = vt.kitty.feed("\x1b_Ga=T,f=32,s=1,v=1,i=8,C=1,c=1,r=1;/wAA/w==\x1b\\", .{ .row = 2, .col = 5, .cell_w = 4, .cell_h = 4 }, 8, 4, 0);
+    try std.testing.expect(vt.kitty.find(8).?.pending != null);
+    try vt.resize(4, 4); // Resize before the first decode.
+    var frame = try Frame.init(a, 16, 16);
+    defer frame.deinit();
+    vt.prepareImages();
+    frame.render(&vt, 4, 4, null, 8);
+    try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[12 * 16 + 4]);
+    try std.testing.expect(vt.kitty.find(8).?.pending == null);
+    vt.clearDirty();
+    frame.invalidate();
+    frame.render(&vt, 4, 4, null, 8);
+    try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[12 * 16 + 4]);
+    vt.cell_px_w = 8;
+    vt.cell_px_h = 8;
+    try frame.resize(32, 32);
+    vt.prepareImages();
+    frame.render(&vt, 8, 8, null, 16);
+    try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[24 * 32 + 8]);
+    try vt.resize(8, 4);
+    try frame.resize(64, 32);
+    vt.prepareImages();
+    frame.render(&vt, 8, 8, null, 16);
+    try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[16 * 64 + 40]);
+}
+
+test "cached image can be placed again after screen clear and placement deletion" {
+    const a = std.testing.allocator;
+    var storage: [4096]u8 = undefined;
+    var vt = try Term.VtState.init(a, 4, 4, 20, &storage);
+    defer vt.deinit();
+    vt.flags.cursor_visible = false;
+    vt.cell_px_w = 4;
+    vt.cell_px_h = 4;
+    _ = vt.kitty.feed("\x1b_Ga=T,f=32,s=1,v=1,i=8,C=1,c=1,r=1,q=2;/wAA/w==\x1b\\", .{ .cell_w = 4, .cell_h = 4 }, 4, 4, 0);
+    var frame = try Frame.init(a, 16, 16);
+    defer frame.deinit();
+    vt.prepareImages();
+    frame.render(&vt, 4, 4, null, 8);
+    try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[0]);
+    vt.ed(2);
+    frame.render(&vt, 4, 4, null, 8);
+    try std.testing.expectEqual(@as(u32, 0xff000000), frame.pixels[0]);
+    try std.testing.expectEqual(@as(usize, 0), vt.kitty.placements.items.len);
+    try std.testing.expect(vt.kitty.find(8) != null);
+    for (0..2) |_| {
+        _ = vt.kitty.feed("\x1b_Ga=p,i=8,C=1,c=1,r=1,q=2;\x1b\\", .{ .cell_w = 4, .cell_h = 4 }, 4, 4, 0);
+        vt.markDirtyAll();
+        vt.prepareImages();
+        frame.render(&vt, 4, 4, null, 8);
+        try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[0]);
+        _ = vt.kitty.feed("\x1b_Ga=d,d=i,i=8,q=2;\x1b\\", .{}, 4, 4, 0);
+        frame.render(&vt, 4, 4, null, 8);
+        try std.testing.expectEqual(@as(u32, 0xff000000), frame.pixels[0]);
+    }
+}
+
+test "image anchors account for wide glyph wrap padding" {
+    const a = std.testing.allocator;
+    var storage: [4096]u8 = undefined;
+    var vt = try Term.VtState.init(a, 4, 4, 20, &storage);
+    defer vt.deinit();
+    vt.flags.cursor_visible = false;
+    vt.cell_px_w = 4;
+    vt.cell_px_h = 4;
+    vt.feedText("ab\u{4e2d}X");
+    _ = vt.kitty.feed("\x1b_Ga=T,f=32,s=1,v=1,i=8,C=1,c=1,r=1;/wAA/w==\x1b\\", .{ .row = 0, .col = 2, .cell_w = 4, .cell_h = 4 }, 4, 4, 0);
+    try vt.resize(3, 6);
+    var frame = try Frame.init(a, 12, 24);
+    defer frame.deinit();
+    vt.prepareImages();
+    frame.render(&vt, 4, 4, null, 8);
+    try std.testing.expectEqual(@as(i64, 1), vt.kitty.placements.items[0].row - vt.imageBase());
+    try std.testing.expectEqual(@as(i32, 0), vt.kitty.placements.items[0].col);
+    try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[4 * 12]);
+}
+
 test "debug overlay paints grid" {
     if (!Debug.live) return;
     const gpa = std.testing.allocator;
@@ -1101,12 +1375,50 @@ test "graphics repaint after deletion and clip oversized placement" {
     var frame = try Frame.init(a, 8, 8);
     defer frame.deinit();
     _ = vt.kitty.feed("\x1b_Ga=T,f=32,s=1,v=1,i=4,C=1,c=1073741824,r=1;/wAA/w==\x1b\\", .{}, 2, 2, 0);
+    vt.prepareImages();
     frame.render(&vt, 4, 4, null, 8);
     try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[0]);
     vt.clearDirty();
     _ = vt.kitty.feed("\x1b_Ga=d,d=a,q=2\x1b\\", .{}, 2, 2, 0);
     vt.markDirtyAll();
     frame.render(&vt, 4, 4, null, 8);
+    try std.testing.expectEqual(@as(u32, 0xff000000), frame.pixels[0]);
+}
+
+test "kitty image scrolls with output and returns in scrollback" {
+    const a = std.testing.allocator;
+    var storage: [4096]u8 = undefined;
+    var vt = try Term.VtState.init(a, 4, 4, 8, &storage);
+    defer vt.deinit();
+    vt.flags.cursor_visible = false;
+    vt.cell_px_w = 4;
+    vt.cell_px_h = 4;
+    var frame = try Frame.init(a, 16, 16);
+    defer frame.deinit();
+
+    _ = vt.kitty.feed("\x1b_Ga=T,f=32,s=1,v=1,i=4,C=1,c=1,r=1;/wAA/w==\x1b\\", .{ .row = 1, .col = 0 }, 4, 4, 0);
+    vt.prepareImages();
+    frame.render(&vt, 4, 4, null, 8);
+    try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[4 * 16]);
+    vt.clearDirty();
+
+    vt.regionScrollUp(1);
+    vt.prepareImages();
+    frame.render(&vt, 4, 4, null, 8);
+    try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[0]);
+    try std.testing.expectEqual(@as(u32, 0xff000000), frame.pixels[4 * 16]);
+    vt.clearDirty();
+
+    vt.regionScrollUp(1);
+    frame.render(&vt, 4, 4, null, 8);
+    try std.testing.expectEqual(@as(u32, 0xff000000), frame.pixels[0]);
+    vt.clearDirty();
+
+    vt.grid().scroll = 2;
+    vt.markDirtyAll();
+    vt.prepareImages();
+    frame.render(&vt, 4, 4, null, 8);
+    try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[4 * 16]);
     try std.testing.expectEqual(@as(u32, 0xff000000), frame.pixels[0]);
 }
 
@@ -1152,6 +1464,7 @@ test "incremental render after multi-line scroll and image moves matches full re
         if (step.lines > 0 and step.lines <= 3 and frame.prev.len != 0) {
             try std.testing.expectEqual(@as(i32, step.lines), scrollDelta(&vt, frame.prev, 6, 6));
         }
+        vt.prepareImages();
         frame.render(&vt, 4, 4, null, 8);
         vt.clearDirty();
         fresh.invalidate();
@@ -1159,4 +1472,204 @@ test "incremental render after multi-line scroll and image moves matches full re
         fresh.render(&vt, 4, 4, null, 8);
         try std.testing.expectEqualSlices(u32, fresh.pixels, frame.pixels);
     }
+}
+
+test "incremental render matches full render across style compactions and recolors" {
+    const a = std.testing.allocator;
+    var storage: [4096]u8 = undefined;
+    var vt = try Term.VtState.init(a, 6, 4, 8, &storage);
+    defer vt.deinit();
+    vt.flags.cursor_visible = false;
+    vt.styles.limit = 8;
+    var frame = try Frame.init(a, 24, 16);
+    defer frame.deinit();
+    var fresh = try Frame.init(a, 24, 16);
+    defer fresh.deinit();
+    var prng = std.Random.DefaultPrng.init(7);
+    const rnd = prng.random();
+    var compactions: u32 = 0;
+    for (0..300) |step| {
+        // A few cells in new colors: dirty rows are checked against the
+        // frame's snapshot by style id, which compactions renumber.
+        for (0..3) |_| {
+            const g = vt.grid();
+            g.cursor = .{ .row = rnd.uintLessThan(u16, 4), .col = rnd.uintLessThan(u16, 6) };
+            g.wrap_pending = false;
+            g.fg = .{ .r = rnd.int(u8), .g = rnd.int(u8), .b = rnd.int(u8) };
+            g.attrs.fg_explicit = rnd.boolean();
+            g.bg = .{ .r = rnd.uintLessThan(u8, 4), .g = 0, .b = 0 };
+            g.attrs.bg_explicit = rnd.boolean();
+            const gen = vt.styles.gen;
+            vt.printCodepoint('a' + rnd.uintLessThan(u8, 3));
+            if (vt.styles.gen != gen) compactions += 1;
+        }
+        if (step % 25 == 24) vt.setDefaultColor(step % 50 == 24, .{ .r = 9, .g = 9, .b = @intCast(step % 256) });
+        frame.render(&vt, 4, 4, null, 8);
+        vt.clearDirty();
+        fresh.invalidate();
+        fresh.forgetPrev();
+        fresh.render(&vt, 4, 4, null, 8);
+        try std.testing.expectEqualSlices(u32, fresh.pixels, frame.pixels);
+    }
+    try std.testing.expect(compactions > 10);
+}
+
+test "a compaction that hands a dead style's id to a new one repaints" {
+    const a = std.testing.allocator;
+    var storage: [4096]u8 = undefined;
+    var vt = try Term.VtState.init(a, 2, 1, 1, &storage);
+    defer vt.deinit();
+    vt.flags.cursor_visible = false;
+    var frame = try Frame.init(a, 8, 4);
+    defer frame.deinit();
+    var fresh = try Frame.init(a, 8, 4);
+    defer fresh.deinit();
+    const g = vt.grid();
+    g.bg = .{ .r = 200, .g = 0, .b = 0 };
+    vt.printCodepoint('a');
+    const first = vt.grid().cellAt(0, 0);
+    frame.render(&vt, 4, 4, null, 8);
+    vt.clearDirty();
+    // Same character in another style; the old style dies and the
+    // compaction gives its id to the new one: same cell bits as the
+    // frame's snapshot, different colors.
+    g.cursor.col = 0;
+    g.wrap_pending = false;
+    g.bg = .{ .r = 0, .g = 0, .b = 200 };
+    vt.printCodepoint('a');
+    vt.styles.compact();
+    try std.testing.expectEqual(first, vt.grid().cellAt(0, 0));
+    frame.render(&vt, 4, 4, null, 8);
+    fresh.render(&vt, 4, 4, null, 8);
+    try std.testing.expectEqualSlices(u32, fresh.pixels, frame.pixels);
+}
+
+test "a combining mark draws over its base cell" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const file = std.Io.Dir.openFileAbsolute(io, "/usr/share/fonts/TTF/DejaVuSansMono.ttf", .{}) catch return error.SkipZigTest;
+    defer file.close(io);
+    const n = try file.length(io);
+    const bytes = try a.alloc(u8, n);
+    defer a.free(bytes);
+    _ = try file.readPositionalAll(io, bytes, 0);
+    var ctx = try Type.Context.init(a, .{ .atlas_width = 256, .atlas_height = 256, .cache_capacity = 64 });
+    defer ctx.deinit();
+    _ = try ctx.addFont(bytes, .{});
+    var storage: [16]u8 = undefined;
+    var vt = try Term.VtState.init(a, 4, 1, 1, &storage);
+    defer vt.deinit();
+    vt.flags.cursor_visible = false;
+    var frame = try Frame.init(a, 4 * 10, 22);
+    defer frame.deinit();
+    // "e" and "e" + acute: the accent adds ink above the e, in its cell.
+    vt.feedText("ee\u{301}");
+    try std.testing.expect(vt.cell(0, 1).isCluster());
+    frame.render(&vt, 10, 22, &ctx, 16);
+    const bg = Frame.pack(vt.scheme.bg);
+    var ink: [2]u32 = .{ 0, 0 };
+    for (0..2) |c| {
+        for (0..22) |y| for (0..10) |x| {
+            if (frame.pixels[y * frame.width + c * 10 + x] != bg) ink[c] += 1;
+        };
+    }
+    try std.testing.expect(ink[0] > 0);
+    try std.testing.expect(ink[1] > ink[0]);
+}
+
+test "reverse mode repaints previously rendered cells" {
+    const a = std.testing.allocator;
+    var storage: [32]u8 = undefined;
+    var vt = try Term.VtState.init(a, 4, 2, 4, &storage);
+    defer vt.deinit();
+    vt.flags.cursor_visible = false;
+    vt.feedText("hello");
+    var frame = try Frame.init(a, 16, 8);
+    defer frame.deinit();
+    var fresh = try Frame.init(a, 16, 8);
+    defer fresh.deinit();
+    frame.render(&vt, 4, 4, null, 8);
+    vt.clearDirty();
+    for ([_]bool{ true, false }) |enabled| {
+        vt.setPrivate(&.{5}, enabled);
+        frame.render(&vt, 4, 4, null, 8);
+        fresh.invalidate();
+        fresh.render(&vt, 4, 4, null, 8);
+        try std.testing.expectEqualSlices(u32, fresh.pixels, frame.pixels);
+        vt.clearDirty();
+    }
+}
+
+test "cursor follows padded wide glyph during reflow" {
+    const a = std.testing.allocator;
+    var storage: [32]u8 = undefined;
+    var vt = try Term.VtState.init(a, 4, 4, 16, &storage);
+    defer vt.deinit();
+    vt.feedText("ab\u{754c}");
+    try vt.resize(3, 4);
+    vt.feedText("Z");
+    try std.testing.expectEqual(@as(u21, 0), vt.grid().cellAt(1, 1).codepoint);
+    try std.testing.expectEqual(@as(u21, 'Z'), vt.grid().cellAt(1, 2).codepoint);
+}
+
+test "scrolling does not leave selection painted at old content position" {
+    const a = std.testing.allocator;
+    var storage: [32]u8 = undefined;
+    var vt = try Term.VtState.init(a, 4, 4, 16, &storage);
+    defer vt.deinit();
+    vt.flags.cursor_visible = false;
+    vt.feedText("AAAABBBBCCCCDDDD");
+    var frame = try Frame.init(a, 16, 16);
+    defer frame.deinit();
+    var fresh = try Frame.init(a, 16, 16);
+    defer fresh.deinit();
+    var sel: Select.State = .{};
+    sel.begin(1, 2);
+    frame.renderSel(&vt, 4, 4, null, 8, sel);
+    vt.clearDirty();
+    vt.regionScrollUp(1);
+    frame.renderSel(&vt, 4, 4, null, 8, sel);
+    fresh.renderSel(&vt, 4, 4, null, 8, sel);
+    try std.testing.expectEqualSlices(u32, fresh.pixels, frame.pixels);
+}
+
+test "reflow retains styled spaces" {
+    const a = std.testing.allocator;
+    var storage: [32]u8 = undefined;
+    var vt = try Term.VtState.init(a, 4, 4, 16, &storage);
+    defer vt.deinit();
+    vt.grid().bg = .{ .r = 200, .g = 0, .b = 0 };
+    vt.feedText(" ");
+    vt.grid().bg = vt.scheme.bg;
+    try vt.resize(5, 4);
+    try std.testing.expectEqual(@as(u8, 200), vt.styleOf(vt.grid().cellAt(0, 0)).bg.r);
+}
+
+test "shrinking height keeps cursor content" {
+    const a = std.testing.allocator;
+    var storage: [32]u8 = undefined;
+    var vt = try Term.VtState.init(a, 4, 4, 16, &storage);
+    defer vt.deinit();
+    vt.feedText("AAAABBBBCCCCDDDD");
+    try vt.resize(4, 2);
+    try std.testing.expectEqual(@as(u21, 'D'), vt.grid().cellAt(vt.cursor().row, 0).codepoint);
+    try std.testing.expect(vt.grid().wrap_pending);
+}
+
+test "height shrink keeps graphics anchored to the retained text" {
+    const a = std.testing.allocator;
+    var vt = try Term.VtState.init(a, 4, 4, 16, &.{});
+    defer vt.deinit();
+    vt.flags.cursor_visible = false;
+    vt.feedText("AAAABBBBCCCCDDDD");
+    const pixels = try a.dupe(u8, &.{ 255, 0, 0, 255 });
+    vt.kitty.placeBitmap(pixels, 1, 1, .{ .row = 3 }, 0, 1, 1);
+    try vt.resize(4, 2);
+    try std.testing.expectEqual(@as(i64, 3), vt.kitty.placements.items[0].row);
+    try std.testing.expectEqual(@as(i64, 2), vt.imageBase());
+    var frame = try Frame.init(a, 16, 8);
+    defer frame.deinit();
+    vt.prepareImages();
+    frame.render(&vt, 4, 4, null, 8);
+    try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[4 * frame.width]);
 }

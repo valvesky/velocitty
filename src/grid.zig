@@ -54,13 +54,366 @@ pub const Rgb = packed struct {
     b: u8 = 0,
 };
 
-pub const Cell = packed struct {
-    codepoint: u21 = ' ',
-    attrs: Attrs = .{},
-    _pad: u3 = 0,
+/// `@memset` for cells: stores eight 8-byte cells per 64-byte vector.
+pub fn fillCells(dst: []Cell, value: Cell) void {
+    const bits: u64 = @bitCast(value);
+    const pat: @Vector(8, u64) = @splat(bits);
+    const words: [*]u64 = @ptrCast(dst.ptr);
+    const n = dst.len;
+    var i: usize = 0;
+    while (i + 8 <= n) : (i += 8) words[i..][0..8].* = pat;
+    while (i < n) : (i += 1) words[i] = bits;
+}
+
+/// Everything about a cell except its character: colors (resolved RGB, as
+/// the pen held them), underline color and attributes. Stored once in
+/// `Styles`; cells refer to it by id.
+pub const Style = packed struct(u128) {
     fg: Color = Color.default_fg,
     bg: Color = Color.default_bg,
+    /// Underline color, used when `attrs.ul_color` is set.
     ul: Rgb = .{},
+    attrs: Attrs = .{},
+    _pad: u24 = 0,
+
+    pub inline fn key(self: Style) u128 {
+        return @bitCast(self);
+    }
+};
+
+/// Index into `Styles.list`. 0 is `Style{}`'s slot (it is recolored like
+/// any other entry, so it is not always `Style{}`).
+pub const StyleId = u32;
+
+/// `Cell.codepoint` values from here up are not code points (those end at
+/// U+10FFFF) but grapheme clusters: `cluster_base + id` in `Clusters`. So
+/// the "is a cluster" flag is the codepoint field being out of Unicode's
+/// range, and compares against real code points (`' '`, 0, < 0x20) never
+/// match a cluster.
+pub const cluster_base: u21 = 0x110000;
+
+/// 8 bytes: the character (or cluster) and its interned style. A wide
+/// character's second cell holds codepoint 0.
+pub const Cell = packed struct(u64) {
+    codepoint: u21 = ' ',
+    _pad: u11 = 0,
+    style: StyleId = 0,
+
+    /// `codepoint` is a cluster id (see `cluster_base`).
+    pub inline fn isCluster(c: Cell) bool {
+        return c.codepoint >= cluster_base;
+    }
+};
+
+/// Interned multi-codepoint grapheme clusters, deduplicated by content and
+/// shared by both grids (owned by `Styles`, which has the roots and `gen`).
+/// A cell whose character is more than one code point holds
+/// `cluster_base + id`; a single code point stays in the cell itself.
+/// Entries never change; ids are renumbered only by
+/// `Styles.compactClusters` (every id in a cell of either ring is kept and
+/// rewritten, the rest dropped, `gen` bumped), so an id a cell holds is
+/// never reused.
+pub const Clusters = struct {
+    /// Code points of every entry, back to back.
+    cps: std.ArrayListUnmanaged(u32) = .empty,
+    /// Per id: its code points in `cps`.
+    spans: std.ArrayListUnmanaged(Span) = .empty,
+    /// Ids, keyed by content.
+    map: std.HashMapUnmanaged(u32, void, IdContext, 80) = .empty,
+    limit: u32 = default_limit,
+
+    /// Longest cluster stored; printing drops code points past it.
+    pub const max_len = 32;
+    pub const default_limit: u32 = 1 << 12;
+    /// Ids fit in the code point field above `cluster_base`.
+    pub const max_ids: u32 = (1 << 21) - @as(u32, cluster_base);
+    /// `hash` is the content's: growing or rebuilding the map rehashes no
+    /// code points.
+    const Span = struct { off: u32, len: u32, hash: u64 };
+
+    const IdContext = struct {
+        c: *const Clusters,
+        pub fn hash(self: IdContext, id: u32) u64 {
+            return self.c.spans.items[id].hash;
+        }
+        pub fn eql(_: IdContext, a: u32, b: u32) bool {
+            return a == b;
+        }
+    };
+
+    /// Looks up content whose hash `h` is already computed.
+    const SliceContext = struct {
+        c: *const Clusters,
+        h: u64,
+        pub fn hash(self: SliceContext, _: []const u32) u64 {
+            return self.h;
+        }
+        pub fn eql(self: SliceContext, s: []const u32, id: u32) bool {
+            return std.mem.eql(u32, s, self.c.get(id));
+        }
+    };
+
+    fn hashCps(s: []const u32) u64 {
+        return std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(s));
+    }
+
+    pub fn deinit(self: *Clusters, allocator: std.mem.Allocator) void {
+        self.cps.deinit(allocator);
+        self.spans.deinit(allocator);
+        self.map.deinit(allocator);
+    }
+
+    /// The code points of cluster `id`.
+    pub inline fn get(self: *const Clusters, id: u32) []const u32 {
+        const s = self.spans.items[id];
+        return self.cps.items[s.off..][0..s.len];
+    }
+
+    /// The id of `s` (2..max_len code points), added if new; null when out
+    /// of memory or ids. `Styles.internCluster` compacts first when full.
+    fn intern(self: *Clusters, allocator: std.mem.Allocator, s: []const u32) ?u32 {
+        const n = self.spans.items.len;
+        const h = hashCps(s);
+        const key: SliceContext = .{ .c = self, .h = h };
+        if (n >= max_ids) return self.map.getKeyAdapted(s, key);
+        self.cps.ensureUnusedCapacity(allocator, s.len) catch return null;
+        self.spans.ensureUnusedCapacity(allocator, 1) catch return null;
+        const gop = self.map.getOrPutContextAdapted(allocator, s, key, IdContext{ .c = self }) catch return null;
+        if (gop.found_existing) return gop.key_ptr.*;
+        const id: u32 = @intCast(n);
+        self.spans.appendAssumeCapacity(.{ .off = @intCast(self.cps.items.len), .len = @intCast(s.len), .hash = h });
+        self.cps.appendSliceAssumeCapacity(s);
+        gop.key_ptr.* = id;
+        return id;
+    }
+
+    fn rebuildMap(self: *Clusters, allocator: std.mem.Allocator) void {
+        self.map.clearRetainingCapacity();
+        // The map only deduplicates: an entry it misses gets a twin later.
+        for (0..self.spans.items.len) |i| self.map.putContext(allocator, @intCast(i), {}, IdContext{ .c = self }) catch break;
+    }
+};
+
+/// Interned styles (and, in `clusters`, grapheme clusters) shared by both
+/// grids of a terminal. The pen interns its
+/// style when it prints (a small memo of recent interns makes that a
+/// compare while the pen and the erase style do not change); erase paths
+/// intern the erase style.
+///
+/// Lifetime: once `list` reaches `limit`, `compact` marks every id still in
+/// a cell (both grids, every ring row including scrollback and rows not in
+/// use, and the row-tail blanks), drops the rest, renumbers the survivors
+/// in order and rewrites every cell. Pens are kept as raw colors, not ids,
+/// so nothing else holds an id across calls. Ids change only there, and
+/// entries change only in `recolor`; both bump `gen` (the renderer keeps a
+/// cell snapshot and repaints everything when `gen` moves). A caller must
+/// not keep an id across a call that may intern a new style (anything that
+/// clears with a blank, or prints): fetch it again after.
+/// `limit` doubles when more than half the entries survive a compaction,
+/// so compaction stays amortized O(1) per new style and a screen with more
+/// distinct live styles than any fixed limit still gets exact colors.
+pub const Styles = struct {
+    allocator: std.mem.Allocator,
+    list: std.ArrayListUnmanaged(Style) = .empty,
+    map: std.AutoHashMapUnmanaged(u128, StyleId) = .empty,
+    limit: u32 = default_limit,
+    gen: u32 = 0,
+    /// Direct-mapped memo of recent interns (by a cheap hash of the key):
+    /// the pen, the erase style and the few styles a TUI cycles through
+    /// resolve without the hash map.
+    cache: [cache_len]Entry = @splat(no_entry),
+    /// The latest intern (usually the pen): checked before the memo.
+    last: Entry = no_entry,
+    /// The cell buffers whose ids `compact` keeps and rewrites, one per grid.
+    roots: [2]Root = .{ .{}, .{} },
+    /// Grapheme clusters the cells refer to (same roots and `gen`).
+    clusters: Clusters = .{},
+
+    pub const default_limit: u32 = 1 << 16;
+    const cache_bits = 5;
+    const cache_len = 1 << cache_bits;
+    const Entry = struct { key: u128, id: StyleId };
+    /// Never a real key: `Style._pad` is always zero.
+    const no_entry: Entry = .{ .key = std.math.maxInt(u128), .id = 0 };
+    pub const Root = struct { cells: []Cell = &.{}, tail: []u64 = &.{} };
+
+    pub fn create(allocator: std.mem.Allocator) std.mem.Allocator.Error!*Styles {
+        const self = try allocator.create(Styles);
+        errdefer allocator.destroy(self);
+        self.* = .{ .allocator = allocator };
+        errdefer self.list.deinit(allocator);
+        try self.list.append(allocator, .{});
+        try self.map.put(allocator, (Style{}).key(), 0);
+        return self;
+    }
+
+    pub fn destroy(self: *Styles) void {
+        const allocator = self.allocator;
+        self.list.deinit(allocator);
+        self.map.deinit(allocator);
+        self.clusters.deinit(allocator);
+        allocator.destroy(self);
+    }
+
+    /// The code points a cell shows: its cluster's, or its own (put in
+    /// `one`).
+    pub inline fn text(self: *const Styles, c: Cell, one: *u32) []const u32 {
+        if (c.isCluster()) return self.clusters.get(c.codepoint - cluster_base);
+        one.* = c.codepoint;
+        return @as(*const [1]u32, one);
+    }
+
+    /// The first code point of a cell (a cluster's base).
+    pub inline fn base(self: *const Styles, c: Cell) u21 {
+        if (!c.isCluster()) return c.codepoint;
+        return @intCast(self.clusters.get(c.codepoint - cluster_base)[0]);
+    }
+
+    /// The codepoint field for `cps`: the code point itself when there is
+    /// one, else an interned cluster (compacting the table when it is
+    /// full). Falls back to the first code point when clusters run out.
+    pub fn internCluster(self: *Styles, cps: []const u32) u21 {
+        if (cps.len == 1) return @intCast(cps[0]);
+        const c = &self.clusters;
+        if (c.spans.items.len >= c.limit) self.compactClusters();
+        const id = c.intern(self.allocator, cps) orelse return @intCast(cps[0]);
+        return cluster_base + @as(u21, @intCast(id));
+    }
+
+    /// `compact` for clusters: drop every entry no cell refers to and
+    /// renumber the rest in order. Bumps `gen`.
+    pub fn compactClusters(self: *Styles) void {
+        const allocator = self.allocator;
+        const c = &self.clusters;
+        const n = c.spans.items.len;
+        var live = std.DynamicBitSetUnmanaged.initEmpty(allocator, n) catch return;
+        defer live.deinit(allocator);
+        const remap = allocator.alloc(u21, n) catch return;
+        defer allocator.free(remap);
+        for (self.roots) |root| {
+            for (root.cells) |cell| {
+                if (cell.isCluster()) live.set(cell.codepoint - cluster_base);
+            }
+        }
+        var next: u32 = 0;
+        var off: u32 = 0;
+        for (0..n) |i| {
+            if (!live.isSet(i)) continue;
+            const s = c.spans.items[i];
+            remap[i] = @intCast(next);
+            // Survivors keep their order, so this only moves data down.
+            std.mem.copyForwards(u32, c.cps.items[off..][0..s.len], c.cps.items[s.off..][0..s.len]);
+            c.spans.items[next] = .{ .off = off, .len = s.len, .hash = s.hash };
+            off += s.len;
+            next += 1;
+        }
+        c.spans.shrinkRetainingCapacity(next);
+        c.cps.shrinkRetainingCapacity(off);
+        for (self.roots) |root| {
+            for (root.cells) |*cell| {
+                if (cell.isCluster()) cell.codepoint = cluster_base + remap[cell.codepoint - cluster_base];
+            }
+        }
+        c.rebuildMap(allocator);
+        if (next * 2 > c.limit) c.limit = @min(c.limit * 2, Clusters.max_ids);
+        self.gen +%= 1;
+    }
+
+    pub inline fn get(self: *const Styles, id: StyleId) Style {
+        return self.list.items[id];
+    }
+
+    pub inline fn of(self: *const Styles, c: Cell) Style {
+        return self.list.items[c.style];
+    }
+
+    inline fn cacheSlot(k: u128) usize {
+        const x = @as(u64, @truncate(k)) ^ @as(u64, @truncate(k >> 64));
+        // Top log2(cache_len) bits of a multiplicative hash.
+        return @intCast((x *% 0x9E37_79B9_7F4A_7C15) >> (64 - cache_bits));
+    }
+
+    pub inline fn intern(self: *Styles, s: Style) StyleId {
+        const k = s.key();
+        if (self.last.key == k) return self.last.id;
+        return self.internSlow(k);
+    }
+
+    fn internSlow(self: *Styles, k: u128) StyleId {
+        const e = &self.cache[cacheSlot(k)];
+        if (e.key != k) {
+            const id = self.map.get(k) orelse self.add(k);
+            // After `add`: a compaction there clears the memo.
+            self.cache[cacheSlot(k)] = .{ .key = k, .id = id };
+        }
+        self.last = self.cache[cacheSlot(k)];
+        return self.last.id;
+    }
+
+    fn add(self: *Styles, k: u128) StyleId {
+        if (self.list.items.len >= self.limit) self.compact();
+        const allocator = self.allocator;
+        // Out of memory: the default style (wrong colors, but a valid id).
+        self.list.ensureUnusedCapacity(allocator, 1) catch return 0;
+        self.map.ensureUnusedCapacity(allocator, 1) catch return 0;
+        const id: StyleId = @intCast(self.list.items.len);
+        self.list.appendAssumeCapacity(@bitCast(k));
+        self.map.putAssumeCapacity(k, id);
+        return id;
+    }
+
+    /// Drop every entry no cell refers to and renumber the rest (see the
+    /// type comment). Skipped if its scratch memory cannot be allocated.
+    pub fn compact(self: *Styles) void {
+        const allocator = self.allocator;
+        const n = self.list.items.len;
+        var live = std.DynamicBitSetUnmanaged.initEmpty(allocator, n) catch return;
+        defer live.deinit(allocator);
+        const remap = allocator.alloc(StyleId, n) catch return;
+        defer allocator.free(remap);
+        live.set(0);
+        for (self.roots) |root| {
+            for (root.cells) |c| live.set(c.style);
+            for (root.tail) |t| live.set(@as(Cell, @bitCast(t)).style);
+        }
+        var next: StyleId = 0;
+        for (0..n) |i| {
+            if (!live.isSet(i)) continue;
+            remap[i] = next;
+            self.list.items[next] = self.list.items[i];
+            next += 1;
+        }
+        self.list.shrinkRetainingCapacity(next);
+        for (self.roots) |root| {
+            for (root.cells) |*c| c.style = remap[c.style];
+            for (root.tail) |*t| {
+                var c: Cell = @bitCast(t.*);
+                c.style = remap[c.style];
+                t.* = @bitCast(c);
+            }
+        }
+        self.rebuildMap();
+        if (@as(u64, next) * 2 > self.limit) self.limit = @intCast(@min(@as(u64, self.limit) * 2, std.math.maxInt(StyleId)));
+    }
+
+    /// Apply `f(ctx, &style)` to every entry (a palette or default color
+    /// change); cells keep their ids and pick the new colors up.
+    pub fn recolor(self: *Styles, ctx: anytype, comptime f: fn (@TypeOf(ctx), *Style) void) void {
+        for (self.list.items) |*s| f(ctx, s);
+        self.rebuildMap();
+    }
+
+    /// Re-key the map after entries changed or moved (equal entries may
+    /// now repeat: any of their ids is fine). Bumps `gen`.
+    fn rebuildMap(self: *Styles) void {
+        // The map only deduplicates: a key it misses (out of memory) just
+        // gets a second entry later.
+        self.map.clearRetainingCapacity();
+        for (self.list.items, 0..) |s, i| self.map.put(self.allocator, s.key(), @intCast(i)) catch break;
+        self.cache = @splat(no_entry);
+        self.last = no_entry;
+        self.gen +%= 1;
+    }
 };
 
 pub const Cursor = struct { row: u16 = 0, col: u16 = 0 };
@@ -70,9 +423,26 @@ pub const Grid = struct {
     starts: []u32,
     /// 1 if this ring row continues onto the next (DECAWM soft wrap).
     wraps: []u8,
+    /// Per ring row: cells from `extent` to the row end all equal `tail`
+    /// (the blank the row was last cleared with), so clearing it again with
+    /// the same blank only needs `[0, extent)`. `full_extent`: unknown.
+    extent: []u16,
+    tail: []u64,
+    /// Style table shared with the other grid; `slot` is this grid's root
+    /// in it (the cells `Styles.compact` rewrites).
+    styles: *Styles,
+    slot: u1,
+    /// Cells per row.
+    width: u16,
+    /// Use `extent` to shorten whole-row clears (tests turn it off to
+    /// compare against clearing everything).
+    lazy_clear: bool = true,
     cap: u32,
     head: u32 = 0,
     used: u32,
+    /// Absolute line number of screen row 0; grows by one per line pushed
+    /// into history. The oldest kept line is `base - (used - rows)`.
+    base: u64 = 0,
     scroll: u32 = 0,
     cursor: Cursor = .{},
     /// Last-column flag (DECAWM delayed wrap). Cursor stays on the last cell.
@@ -88,7 +458,10 @@ pub const Grid = struct {
     scroll_top: u16 = 0,
     scroll_bottom: u16,
 
-    pub fn init(allocator: std.mem.Allocator, cols: u16, rows: u16, cap: u32) !Grid {
+    /// The grid registers its buffers as root `slot` of `styles`; the
+    /// caller must keep it in place until `deinit` (or call `register`
+    /// again after moving it, though only the buffers are recorded).
+    pub fn init(allocator: std.mem.Allocator, cols: u16, rows: u16, cap: u32, styles: *Styles, slot: u1) !Grid {
         const total = @as(usize, cols) * cap;
         const cells = try allocator.alloc(Cell, total);
         errdefer allocator.free(cells);
@@ -103,26 +476,87 @@ pub const Grid = struct {
         const wraps = try allocator.alloc(u8, cap);
         errdefer allocator.free(wraps);
         @memset(wraps, 0);
+        const extent = try allocator.alloc(u16, cap);
+        errdefer allocator.free(extent);
+        @memset(extent, 0);
+        const tail = try allocator.alloc(u64, cap);
+        errdefer allocator.free(tail);
+        @memset(tail, @as(u64, @bitCast(Cell{})));
 
-        return Grid{
+        const g = Grid{
             .cells = cells,
             .starts = starts,
             .wraps = wraps,
+            .extent = extent,
+            .tail = tail,
+            .styles = styles,
+            .slot = slot,
+            .width = cols,
             .cap = cap,
             .used = rows,
             .scroll_bottom = rows -| 1,
         };
+        g.register();
+        return g;
+    }
+
+    /// Record the current cell and tail buffers in the style table.
+    pub fn register(self: *const Grid) void {
+        self.styles.roots[self.slot] = .{ .cells = self.cells, .tail = self.tail };
     }
 
     pub fn deinit(self: *Grid, allocator: std.mem.Allocator) void {
+        self.styles.roots[self.slot] = .{};
         allocator.free(self.cells);
         allocator.free(self.starts);
         allocator.free(self.wraps);
+        allocator.free(self.extent);
+        allocator.free(self.tail);
+    }
+
+    pub const full_extent: u16 = std.math.maxInt(u16);
+
+    /// Every row may hold anything (after resize or a whole-grid recolor).
+    pub fn markAllWritten(self: *Grid) void {
+        @memset(self.extent, full_extent);
+    }
+
+    /// Cells `[0, end)` of `row` were written by a tracked writer.
+    pub inline fn noteWrite(self: *Grid, row: u16, end: u16) void {
+        const j = self.lineIndex(row);
+        if (self.extent[j] < end) self.extent[j] = end;
+    }
+
+    /// Replace the row-tracking arrays after the ring was rebuilt.
+    fn resizeTracking(self: *Grid, allocator: std.mem.Allocator, cap: u32) std.mem.Allocator.Error!void {
+        const extent = try allocator.alloc(u16, cap);
+        errdefer allocator.free(extent);
+        const tail = try allocator.alloc(u64, cap);
+        // Never read while the extent is full, but `Styles.compact` scans it.
+        @memset(tail, @as(u64, @bitCast(Cell{})));
+        allocator.free(self.extent);
+        allocator.free(self.tail);
+        self.extent = extent;
+        self.tail = tail;
+        self.markAllWritten();
+        self.register();
     }
 
     pub fn setRowWrap(self: *Grid, row: u16, wrapped: bool) void {
-        self.wraps[(self.head + row) % self.cap] = if (wrapped) 1 else 0;
+        self.wraps[self.lineIndex(row)] = if (wrapped) 1 else 0;
     }
+
+    /// A graphics anchor borrows a text-cell position during reflow. Original
+    /// absolute coordinates are replaced only after the new grid commits.
+    pub const Anchor = struct {
+        row: i64,
+        col: i32,
+        offset: ?usize = null,
+        mapped_row: u32 = 0,
+        mapped_col: u16 = 0,
+        outside_rows: i64 = 0,
+        mapped: bool = false,
+    };
 
     /// Compact the ring onto a new cell buffer. Scrollback is kept.
     /// When `reflow` is set and the column count changes, soft-wrapped rows
@@ -139,11 +573,15 @@ pub const Grid = struct {
         reflow: bool,
     ) std.mem.Allocator.Error!void {
         assert(new_cols > 0 and new_rows > 0);
+        return self.resizeAnchored(allocator, old_cols, old_rows, new_cols, new_rows, min_cap, reflow, &.{});
+    }
+
+    pub fn resizeAnchored(self: *Grid, allocator: std.mem.Allocator, old_cols: u16, old_rows: u16, new_cols: u16, new_rows: u16, min_cap: u32, reflow: bool, anchors: []Anchor) std.mem.Allocator.Error!void {
         if (reflow and new_cols != old_cols) {
-            try self.resizeReflow(allocator, old_cols, old_rows, new_cols, new_rows, min_cap);
+            try self.resizeReflow(allocator, old_cols, old_rows, new_cols, new_rows, min_cap, anchors);
             return;
         }
-        try self.resizeClip(allocator, old_cols, old_rows, new_cols, new_rows, min_cap);
+        try self.resizeClip(allocator, old_cols, old_rows, new_cols, new_rows, min_cap, reflow);
     }
 
     fn resizeClip(
@@ -154,10 +592,18 @@ pub const Grid = struct {
         new_cols: u16,
         new_rows: u16,
         min_cap: u32,
+        preserve_history: bool,
     ) std.mem.Allocator.Error!void {
         const hist = self.used -| @as(u32, old_rows);
-        const keep_screen = @min(@as(u32, old_rows), @as(u32, new_rows));
-        const new_cap = @max(min_cap, hist + new_rows);
+        // A primary-screen height reduction moves the rows above the cursor
+        // into history rather than deleting the live prompt at the bottom.
+        const shift: u32 = if (preserve_history)
+            @min(old_rows -| new_rows, self.cursor.row -| (new_rows - 1))
+        else
+            0;
+        const new_hist = hist + shift;
+        const keep = @min(hist + old_rows, new_hist + new_rows);
+        const new_cap = @max(min_cap, new_hist + new_rows);
 
         const new_cells = try allocator.alloc(Cell, @as(usize, new_cols) * new_cap);
         errdefer allocator.free(new_cells);
@@ -175,7 +621,7 @@ pub const Grid = struct {
         const copy_cols = @min(old_cols, new_cols);
         const oldest = (self.head + self.cap - hist) % self.cap;
         var n: u32 = 0;
-        while (n < hist + keep_screen) : (n += 1) {
+        while (n < keep) : (n += 1) {
             const src_idx = (oldest + n) % self.cap;
             const src_off = self.starts[src_idx];
             const dst_off = new_starts[n];
@@ -186,17 +632,30 @@ pub const Grid = struct {
             new_wraps[n] = self.wraps[src_idx];
         }
 
+        try self.resizeTracking(allocator, new_cap);
         allocator.free(self.cells);
         allocator.free(self.starts);
         allocator.free(self.wraps);
         self.cells = new_cells;
+        self.register();
         self.starts = new_starts;
         self.wraps = new_wraps;
         self.cap = new_cap;
-        self.head = hist;
-        self.used = hist + new_rows;
-        self.scroll = @min(self.scroll, hist);
+        self.width = new_cols;
+        self.head = new_hist;
+        self.used = new_hist + new_rows;
+        self.base += shift;
+        if (self.scroll != 0) self.scroll += shift;
+        self.scroll = @min(self.scroll, new_hist);
+        const pending = self.wrap_pending;
+        const saved_pending = self.saved_wrap_pending and self.saved_cursor.row >= shift;
+        self.cursor.row -|= @intCast(shift);
+        self.saved_cursor.row -|= @intCast(shift);
         self.clampCursors(new_cols, new_rows, old_rows);
+        if (preserve_history and old_cols == new_cols) {
+            self.wrap_pending = pending;
+            self.saved_wrap_pending = saved_pending;
+        }
     }
 
     fn resizeReflow(
@@ -207,13 +666,23 @@ pub const Grid = struct {
         new_cols: u16,
         new_rows: u16,
         min_cap: u32,
+        anchors: []Anchor,
     ) std.mem.Allocator.Error!void {
         const hist = self.used -| @as(u32, old_rows);
         const old_total = hist + @as(u32, old_rows);
+        const oldest_line = @as(i64, @intCast(self.base)) - hist;
+        for (anchors) |*anchor| {
+            const relative = anchor.row - oldest_line;
+            const clamped = std.math.clamp(relative, 0, old_total - 1);
+            anchor.outside_rows = relative - clamped;
+            anchor.mapped = false;
+        }
         const oldest = (self.head + self.cap - hist) % self.cap;
         const blank = self.blankCell();
-        const cur_abs = hist + @as(u32, self.cursor.row);
-        const cur_col = self.cursor.col;
+        var positions = [_]ReflowPosition{
+            .{ .source = self.cursor, .wrap_pending = self.wrap_pending },
+            .{ .source = self.saved_cursor, .wrap_pending = self.saved_wrap_pending },
+        };
 
         var out_cells: std.ArrayList(Cell) = .empty;
         defer out_cells.deinit(allocator);
@@ -221,11 +690,6 @@ pub const Grid = struct {
         defer out_wraps.deinit(allocator);
         var logical: std.ArrayList(Cell) = .empty;
         defer logical.deinit(allocator);
-
-        var new_cur_row: u32 = 0;
-        var new_cur_col: u16 = @min(cur_col, new_cols - 1);
-        var mapped_cursor = false;
-        var new_wrap_pending = false;
 
         var i: u32 = 0;
         while (i < old_total) {
@@ -235,13 +699,35 @@ pub const Grid = struct {
                 const src_idx = (oldest + i) % self.cap;
                 const src = self.cells[self.starts[src_idx] .. self.starts[src_idx] + old_cols];
                 const wrapped = self.wraps[src_idx] != 0 and i + 1 < old_total;
-                const take = if (wrapped) old_cols else rowContentLen(src);
+                const take = if (wrapped) old_cols else rowContentLen(src, blank);
                 try logical.appendSlice(allocator, src[0..take]);
                 if (!wrapped) break;
                 i += 1;
             }
             const log_end = i;
-            const before_rows: u32 = @intCast(out_wraps.items.len);
+            // Images can sit on otherwise blank cells. Pin their anchor cell
+            // so trimming/reflow cannot silently erase their logical row.
+            for (anchors) |*anchor| {
+                anchor.offset = null;
+                const relative = std.math.clamp(anchor.row - oldest_line, 0, old_total - 1);
+                if (relative < log_start or relative > log_end) continue;
+                const col: usize = @intCast(std.math.clamp(anchor.col, 0, old_cols - 1));
+                const offset = @as(usize, @intCast(relative - log_start)) * old_cols + col;
+                anchor.offset = offset;
+                while (logical.items.len <= offset) try logical.append(allocator, blank);
+            }
+            for (&positions, 0..) |*position, pos_index| {
+                position.offset = null;
+                const abs = hist + @as(u32, position.source.row);
+                if (abs < log_start or abs > log_end) continue;
+                // Graphics and saved cursor positions can lie beyond text.
+                const offset = if (pos_index == 1 or anchors.len != 0) offset: {
+                    const raw = (abs - log_start) * @as(u32, old_cols) + position.source.col;
+                    while (logical.items.len <= raw) try logical.append(allocator, blank);
+                    break :offset raw;
+                } else cursorOffsetInLogical(self, oldest, old_cols, log_start, abs, position.source.col, blank);
+                position.offset = offset + @intFromBool(position.wrap_pending);
+            }
             try wrapLogical(
                 allocator,
                 &out_cells,
@@ -249,34 +735,22 @@ pub const Grid = struct {
                 logical.items,
                 new_cols,
                 blank,
+                anchors,
+                &positions,
             );
-            if (!mapped_cursor and cur_abs >= log_start and cur_abs <= log_end) {
-                const offset = cursorOffsetInLogical(
-                    self,
-                    oldest,
-                    old_cols,
-                    log_start,
-                    cur_abs,
-                    cur_col,
-                );
-                const insertion_offset = offset + @intFromBool(self.wrap_pending);
-                if (self.wrap_pending and insertion_offset % new_cols == 0) {
-                    mapCursor(insertion_offset - 1, new_cols, before_rows, &new_cur_row, &new_cur_col);
-                    new_wrap_pending = true;
-                } else {
-                    mapCursor(insertion_offset, new_cols, before_rows, &new_cur_row, &new_cur_col);
-                }
-                mapped_cursor = true;
-            }
             i += 1;
         }
 
         var out_rows: u32 = @intCast(out_wraps.items.len);
-        const cur_line: u32 = if (mapped_cursor) new_cur_row else out_rows -| 1;
+        const active = positions[0];
+        var cur_line: u32 = if (active.mapped) active.row else out_rows -| 1;
+        for (anchors) |anchor| {
+            if (anchor.mapped and anchor.outside_rows <= 0) cur_line = @max(cur_line, anchor.mapped_row);
+        }
         while (out_rows > new_rows and out_rows > cur_line + 1) {
             const last = out_rows - 1;
             const off = last * @as(u32, new_cols);
-            if (rowContentLen(out_cells.items[off .. off + new_cols]) != 0) break;
+            if (rowContentLen(out_cells.items[off .. off + new_cols], blank) != 0) break;
             out_rows = last;
         }
         if (out_rows < new_rows) {
@@ -290,9 +764,9 @@ pub const Grid = struct {
         }
 
         var view_top = out_rows -| @as(u32, new_rows);
-        if (mapped_cursor and new_cur_row < view_top) view_top = new_cur_row;
-        if (mapped_cursor and new_cur_row >= view_top + new_rows) {
-            view_top = new_cur_row + 1 - new_rows;
+        if (active.mapped and active.row < view_top) view_top = active.row;
+        if (active.mapped and active.row >= view_top + new_rows) {
+            view_top = active.row + 1 - new_rows;
         }
 
         const new_cap = @max(min_cap, out_rows);
@@ -320,34 +794,38 @@ pub const Grid = struct {
             new_wraps[n] = out_wraps.items[src_row];
         }
 
+        try self.resizeTracking(allocator, new_cap);
         allocator.free(self.cells);
         allocator.free(self.starts);
         allocator.free(self.wraps);
         self.cells = new_cells;
+        self.register();
         self.starts = new_starts;
         self.wraps = new_wraps;
         self.cap = new_cap;
+        self.width = new_cols;
         const view = @min(view_top -| drop, keep -| @as(u32, new_rows));
         self.head = view;
         self.used = view + new_rows;
         self.scroll = 0;
-        if (mapped_cursor) {
-            const abs = new_cur_row -| drop;
-            if (abs >= view) {
-                self.cursor.row = @intCast(@min(abs - view, @as(u32, new_rows - 1)));
+        for (positions, 0..) |position, pos_index| {
+            const cursor = if (pos_index == 0) &self.cursor else &self.saved_cursor;
+            if (position.mapped) {
+                cursor.row = @intCast(@min(position.row -| drop -| view, new_rows - 1));
+                cursor.col = @min(position.col, new_cols - 1);
             } else {
-                self.cursor.row = 0;
+                cursor.row = @min(cursor.row, new_rows - 1);
+                cursor.col = @min(cursor.col, new_cols - 1);
             }
-            self.cursor.col = @min(new_cur_col, new_cols - 1);
-        } else {
-            self.cursor.row = @min(self.cursor.row, new_rows - 1);
-            self.cursor.col = @min(self.cursor.col, new_cols - 1);
+            const pending = position.mapped and position.wrap_pending;
+            if (pos_index == 0) self.wrap_pending = pending else self.saved_wrap_pending = pending;
         }
-        self.wrap_pending = new_wrap_pending;
-        self.saved_cursor.row = @min(self.saved_cursor.row, new_rows - 1);
-        self.saved_cursor.col = @min(self.saved_cursor.col, new_cols - 1);
-        self.saved_wrap_pending = false;
         self.clampScrollRegion(old_rows, new_rows);
+        for (anchors) |*anchor| {
+            if (!anchor.mapped) continue;
+            anchor.row = @as(i64, @intCast(self.base)) + anchor.mapped_row - @as(i64, view) - @as(i64, drop) + anchor.outside_rows;
+            anchor.col = anchor.mapped_col;
+        }
     }
 
     fn clampCursors(self: *Grid, new_cols: u16, new_rows: u16, old_rows: u16) void {
@@ -374,7 +852,11 @@ pub const Grid = struct {
     }
 
     pub fn reset(self: *Grid, cols: u16, rows: u16, scheme: Scheme) void {
-        @memset(self.cells, Cell{ .fg = scheme.fg, .bg = scheme.bg });
+        const blank = Cell{ .style = self.styles.intern(.{ .fg = scheme.fg, .bg = scheme.bg }) };
+        fillCells(self.cells, blank);
+        @memset(self.extent, 0);
+        @memset(self.tail, @as(u64, @bitCast(blank)));
+        self.width = cols;
         for (self.starts, 0..) |*s, i| {
             s.* = @intCast(i * cols);
         }
@@ -396,24 +878,42 @@ pub const Grid = struct {
         self.scroll_bottom = rows -| 1;
     }
 
+    /// Ring index of screen row `row` (< cap): a compare instead of `%`.
+    pub inline fn lineIndex(self: *const Grid, row: u32) u32 {
+        const i = self.head + row;
+        return if (i >= self.cap) i - self.cap else i;
+    }
+
+    /// Mutable cell: the row counts as fully written. Tracked writers use
+    /// `cellPtr` + `noteWrite` instead.
     pub inline fn getCell(self: *Grid, row: u16, col: u16) *Cell {
-        const line_idx = (self.head + row) % self.cap;
+        const line_idx = self.lineIndex(row);
+        self.extent[line_idx] = full_extent;
         return &self.cells[self.starts[line_idx] + col];
     }
 
+    /// Mutable cells of `row` from `col`, without marking the row; the
+    /// caller reports what it wrote with `noteWrite`.
+    pub inline fn cellPtr(self: *Grid, row: u16, col: u16) [*]Cell {
+        const line_idx = self.lineIndex(row);
+        return self.cells[self.starts[line_idx] + col ..].ptr;
+    }
+
     pub inline fn cellAt(self: *const Grid, row: u16, col: u16) Cell {
-        const line_idx = (self.head + row) % self.cap;
+        const line_idx = self.lineIndex(row);
         return self.cells[self.starts[line_idx] + col];
     }
 
+    /// Mutable row: it counts as fully written.
     pub inline fn rowSlice(self: *Grid, row: u16, cols: u16) []Cell {
-        const line_idx = (self.head + row) % self.cap;
+        const line_idx = self.lineIndex(row);
+        self.extent[line_idx] = full_extent;
         const off = self.starts[line_idx];
         return self.cells[off .. off + cols];
     }
 
     pub inline fn rowSliceConst(self: *const Grid, row: u16, cols: u16) []const Cell {
-        const line_idx = (self.head + row) % self.cap;
+        const line_idx = self.lineIndex(row);
         const off = self.starts[line_idx];
         return self.cells[off .. off + cols];
     }
@@ -438,8 +938,10 @@ pub const Grid = struct {
     pub fn historyScrollUp(self: *Grid, n: u16, cols: u16, rows: u16) void {
         var k: u16 = 0;
         while (k < n) : (k += 1) {
-            self.head = (self.head + 1) % self.cap;
+            self.head += 1;
+            if (self.head == self.cap) self.head = 0;
             if (self.used < self.cap) self.used += 1;
+            self.base += 1;
             if (rows != 0) {
                 self.clearRange(rows - 1, 0, cols);
                 self.setRowWrap(rows - 1, false);
@@ -451,41 +953,55 @@ pub const Grid = struct {
         }
     }
 
-    pub inline fn blankCell(self: *Grid) Cell {
-        return Cell{
-            .codepoint = ' ',
+    /// The erase style: pen colors and which of them are explicit.
+    pub inline fn blankStyle(self: *const Grid) Style {
+        return .{
             .attrs = .{ .fg_explicit = self.attrs.fg_explicit, .bg_explicit = self.attrs.bg_explicit },
             .fg = self.fg,
             .bg = self.bg,
         };
     }
 
+    /// A blank in the erase style. May intern (see `Styles`).
+    pub inline fn blankCell(self: *Grid) Cell {
+        return .{ .codepoint = ' ', .style = self.styles.intern(self.blankStyle()) };
+    }
+
     /// Primary cell mutation primitive
     pub fn writeCell(self: *Grid, row: u16, col: u16, cp: u21) void {
-        const cell = self.getCell(row, col);
-        cell.* = .{
-            .codepoint = cp,
-            .attrs = self.attrs,
-            .fg = self.fg,
-            .bg = self.bg,
-        };
+        const id = self.styles.intern(.{ .attrs = self.attrs, .fg = self.fg, .bg = self.bg });
+        const cell = &self.cellPtr(row, col)[0];
+        self.noteWrite(row, col + 1);
+        cell.* = .{ .codepoint = cp, .style = id };
     }
 
     /// Clear cell range [start_col, end_col) on a given row
     pub fn clearRange(self: *Grid, row: u16, start_col: u16, end_col: u16) void {
-        const line_idx = (self.head + row) % self.cap;
+        const line_idx = self.lineIndex(row);
         const row_offset = self.starts[line_idx];
         const blank = self.blankCell();
-        @memset(self.cells[row_offset + start_col .. row_offset + end_col], blank);
+        const bits: u64 = @bitCast(blank);
+        if (start_col == 0 and end_col >= self.width) {
+            // A whole row: past `extent` it already holds this blank.
+            const ext = self.extent[line_idx];
+            const n = if (self.lazy_clear and self.tail[line_idx] == bits and ext != full_extent) @min(ext, end_col) else end_col;
+            fillCells(self.cells[row_offset .. row_offset + n], blank);
+            self.extent[line_idx] = 0;
+            self.tail[line_idx] = bits;
+            return;
+        }
+        fillCells(self.cells[row_offset + start_col .. row_offset + end_col], blank);
+        if (self.extent[line_idx] < end_col) self.extent[line_idx] = end_col;
     }
 
     /// Insert blank characters at row/col, shifting existing cells right
     pub fn insertCells(self: *Grid, row: u16, col: u16, count: u16, cols: u16) void {
         if (col >= cols) return;
-        const line_idx = (self.head + row) % self.cap;
+        const line_idx = self.lineIndex(row);
         const offset = self.starts[line_idx];
         const shift_count = @min(count, cols - col);
         const copy_len = cols - col - shift_count;
+        self.extent[line_idx] = full_extent;
 
         if (copy_len > 0) {
             std.mem.copyBackwards(
@@ -494,16 +1010,17 @@ pub const Grid = struct {
                 self.cells[offset + col .. offset + col + copy_len],
             );
         }
-        @memset(self.cells[offset + col .. offset + col + shift_count], self.blankCell());
+        fillCells(self.cells[offset + col .. offset + col + shift_count], self.blankCell());
     }
 
     /// Delete characters at row/col, shifting remaining cells left
     pub fn deleteCells(self: *Grid, row: u16, col: u16, count: u16, cols: u16) void {
         if (col >= cols) return;
-        const line_idx = (self.head + row) % self.cap;
+        const line_idx = self.lineIndex(row);
         const offset = self.starts[line_idx];
         const del_count = @min(count, cols - col);
         const copy_len = cols - col - del_count;
+        self.extent[line_idx] = full_extent;
 
         if (copy_len > 0) {
             std.mem.copyForwards(
@@ -512,7 +1029,7 @@ pub const Grid = struct {
                 self.cells[offset + col + del_count .. offset + cols],
             );
         }
-        @memset(self.cells[offset + cols - del_count .. offset + cols], self.blankCell());
+        fillCells(self.cells[offset + cols - del_count .. offset + cols], self.blankCell());
     }
 
     /// Scroll defined region up by n lines
@@ -528,6 +1045,8 @@ pub const Grid = struct {
                 self.cells[self.starts[src_idx] .. self.starts[src_idx] + cols],
             );
             self.wraps[dst_idx] = self.wraps[src_idx];
+            self.extent[dst_idx] = self.extent[src_idx];
+            self.tail[dst_idx] = self.tail[src_idx];
         }
         var clear_row: u16 = @intCast(@as(u32, bottom) + 1 - count);
         while (clear_row <= bottom) : (clear_row += 1) {
@@ -548,6 +1067,8 @@ pub const Grid = struct {
                 self.cells[self.starts[src_idx] .. self.starts[src_idx] + cols],
             );
             self.wraps[dst_idx] = self.wraps[src_idx];
+            self.extent[dst_idx] = self.extent[src_idx];
+            self.tail[dst_idx] = self.tail[src_idx];
             if (i == top + count) break;
         }
         var clear_row: u16 = top;
@@ -574,10 +1095,13 @@ pub const Grid = struct {
     }
 };
 
-fn rowContentLen(row: []const Cell) u16 {
+fn rowContentLen(row: []const Cell, blank: Cell) u16 {
     var n: u16 = @intCast(row.len);
     while (n > 0) {
-        const cp = row[n - 1].codepoint;
+        const cell = row[n - 1];
+        const cp = cell.codepoint;
+        // Reflow can discard only blanks it can reproduce with the new fill.
+        if (cell.style != blank.style) break;
         if (cp == 0 and n >= 2 and row[n - 2].codepoint != 0 and row[n - 2].codepoint != ' ') break;
         if (cp != 0 and cp != ' ') break;
         n -= 1;
@@ -592,18 +1116,22 @@ fn wrapLogical(
     logical: []const Cell,
     new_cols: u16,
     blank: Cell,
+    anchors: []Grid.Anchor,
+    positions: []ReflowPosition,
 ) std.mem.Allocator.Error!void {
     var col: u16 = 0;
     var i: usize = 0;
     if (logical.len == 0) {
         var c: u16 = 0;
         while (c < new_cols) : (c += 1) try out_cells.append(allocator, blank);
+        mapPositions(positions, 0, 1, @intCast(out_wraps.items.len), 0, 1);
         try out_wraps.append(allocator, 0);
         return;
     }
     while (i < logical.len) {
         const cell = logical[i];
         if (cell.codepoint == 0) {
+            mapAnchors(anchors, i, 1, @intCast(out_wraps.items.len), @min(col, new_cols - 1), 1);
             i += 1;
             continue;
         }
@@ -615,6 +1143,8 @@ fn wrapLogical(
             try out_wraps.append(allocator, 1);
             col = 0;
         }
+        mapAnchors(anchors, i, if (wide) 2 else 1, @intCast(out_wraps.items.len), col, width);
+        mapPositions(positions, i, if (wide) 2 else 1, @intCast(out_wraps.items.len), col, width);
         try out_cells.append(allocator, cell);
         col += 1;
         if (width == 2) {
@@ -624,8 +1154,54 @@ fn wrapLogical(
         }
         i += 1;
     }
+    // A cursor may be the insertion point after the final glyph. Its output
+    // position includes padding inserted before wide glyphs, just like cells.
+    for (positions) |*position| {
+        const offset = position.offset orelse continue;
+        if (offset != logical.len) continue;
+        position.row = @intCast(out_wraps.items.len);
+        position.col = col;
+        if (col == new_cols) {
+            position.col -= 1;
+            position.wrap_pending = true;
+        } else position.wrap_pending = false;
+        position.mapped = true;
+        position.offset = null;
+    }
     while (col < new_cols) : (col += 1) try out_cells.append(allocator, blank);
     try out_wraps.append(allocator, 0);
+}
+
+const ReflowPosition = struct {
+    source: Cursor,
+    wrap_pending: bool,
+    offset: ?usize = null,
+    row: u32 = 0,
+    col: u16 = 0,
+    mapped: bool = false,
+};
+
+fn mapPositions(positions: []ReflowPosition, index: usize, old_width: usize, row: u32, col: u16, width: u16) void {
+    for (positions) |*position| {
+        const offset = position.offset orelse continue;
+        if (offset < index or offset >= index + old_width) continue;
+        position.row = row;
+        position.col = col + @as(u16, @intCast(@min(offset - index, width - 1)));
+        position.wrap_pending = false;
+        position.mapped = true;
+        position.offset = null;
+    }
+}
+
+fn mapAnchors(anchors: []Grid.Anchor, index: usize, old_width: usize, row: u32, col: u16, width: u16) void {
+    for (anchors) |*anchor| {
+        const offset = anchor.offset orelse continue;
+        if (offset < index or offset >= index + old_width) continue;
+        anchor.mapped_row = row;
+        anchor.mapped_col = col + @as(u16, @intCast(@min(offset - index, width - 1)));
+        anchor.mapped = true;
+        anchor.offset = null;
+    }
 }
 
 fn cursorOffsetInLogical(
@@ -635,6 +1211,7 @@ fn cursorOffsetInLogical(
     log_start: u32,
     cur_abs: u32,
     cur_col: u16,
+    blank: Cell,
 ) u32 {
     var off: u32 = 0;
     var r = log_start;
@@ -642,21 +1219,18 @@ fn cursorOffsetInLogical(
         const src_idx = (oldest + r) % grid.cap;
         const src = grid.cells[grid.starts[src_idx] .. grid.starts[src_idx] + old_cols];
         const wrapped = grid.wraps[src_idx] != 0;
-        off += if (wrapped) old_cols else rowContentLen(src);
+        off += if (wrapped) old_cols else rowContentLen(src, blank);
     }
     const src_idx = (oldest + cur_abs) % grid.cap;
     const src = grid.cells[grid.starts[src_idx] .. grid.starts[src_idx] + old_cols];
-    const take = if (grid.wraps[src_idx] != 0) old_cols else rowContentLen(src);
+    const take = if (grid.wraps[src_idx] != 0) old_cols else rowContentLen(src, blank);
     return off + @min(@as(u32, cur_col), @as(u32, take));
 }
 
-fn mapCursor(offset: u32, new_cols: u16, before_rows: u32, row: *u32, col: *u16) void {
-    row.* = before_rows + offset / new_cols;
-    col.* = @intCast(@min(offset % new_cols, @as(u32, new_cols - 1)));
-}
-
 test "reflow keeps glyphs" {
-    var g = try Grid.init(std.testing.allocator, 4, 2, 8);
+    const styles = try Styles.create(std.testing.allocator);
+    defer styles.destroy();
+    var g = try Grid.init(std.testing.allocator, 4, 2, 8, styles, 0);
     defer g.deinit(std.testing.allocator);
     g.writeCell(0, 0, 'A');
     g.writeCell(0, 1, 'B');
@@ -664,4 +1238,179 @@ test "reflow keeps glyphs" {
     try g.resize(std.testing.allocator, 4, 2, 6, 3, 8, true);
     try std.testing.expectEqual(@as(u21, 'A'), g.cellAt(0, 0).codepoint);
     try std.testing.expectEqual(@as(u21, 'B'), g.cellAt(0, 1).codepoint);
+}
+
+test "height shrink preserves history, saved cursor and absolute viewport" {
+    const a = std.testing.allocator;
+    const styles = try Styles.create(a);
+    defer styles.destroy();
+    var g = try Grid.init(a, 4, 4, 8, styles, 0);
+    defer g.deinit(a);
+    for (0..4) |r| g.writeCell(@intCast(r), 0, @intCast('A' + r));
+    g.cursor = .{ .row = 3, .col = 2 };
+    g.saveCursor();
+    // Seed one existing history row, as after a full-screen scroll.
+    g.historyScrollUp(1, 4, 4);
+    g.cursor.row = 3;
+    g.saved_cursor.row = 2;
+    g.scroll = 1;
+    const old_view = @as(i64, @intCast(g.base)) - g.scroll;
+    try g.resize(a, 4, 4, 4, 2, 8, true);
+    try std.testing.expectEqual(@as(u32, 3), g.used - 2);
+    try std.testing.expectEqual(@as(u16, 1), g.cursor.row);
+    try std.testing.expectEqual(@as(u16, 0), g.saved_cursor.row);
+    try std.testing.expectEqual(old_view, @as(i64, @intCast(g.base)) - g.scroll);
+    const oldest = (g.head + g.cap - (g.used - 2)) % g.cap;
+    try std.testing.expectEqual(@as(u21, 'A'), g.cells[g.starts[oldest]].codepoint);
+}
+
+test "wide reflow maps saved insertion point through padding" {
+    const a = std.testing.allocator;
+    const styles = try Styles.create(a);
+    defer styles.destroy();
+    var g = try Grid.init(a, 4, 4, 8, styles, 0);
+    defer g.deinit(a);
+    for ([_]u21{ 'a', 'b', '界', 0 }, 0..) |cp, col| g.writeCell(0, @intCast(col), cp);
+    g.cursor = .{ .col = 3 };
+    g.wrap_pending = true;
+    g.saveCursor();
+    try g.resize(a, 4, 4, 3, 4, 8, true);
+    try std.testing.expectEqual(Cursor{ .row = 1, .col = 2 }, g.cursor);
+    try std.testing.expectEqual(g.cursor, g.saved_cursor);
+    try std.testing.expect(!g.wrap_pending and !g.saved_wrap_pending);
+}
+
+test "reflow ending at the new margin retains an insertion point" {
+    const a = std.testing.allocator;
+    const styles = try Styles.create(a);
+    defer styles.destroy();
+    var g = try Grid.init(a, 4, 1, 4, styles, 0);
+    defer g.deinit(a);
+    for ("abc", 0..) |cp, col| g.writeCell(0, @intCast(col), cp);
+    g.cursor.col = 3;
+    try g.resize(a, 4, 1, 3, 1, 4, true);
+    try std.testing.expectEqual(Cursor{ .col = 2 }, g.cursor);
+    try std.testing.expect(g.wrap_pending);
+}
+
+test "saved cursor beyond text survives reflow" {
+    const a = std.testing.allocator;
+    const styles = try Styles.create(a);
+    defer styles.destroy();
+    var g = try Grid.init(a, 4, 2, 4, styles, 0);
+    defer g.deinit(a);
+    g.saved_cursor = .{ .col = 2 };
+    g.cursor.row = 1;
+    g.writeCell(1, 0, 'Y');
+    try g.resize(a, 4, 2, 5, 2, 4, true);
+    try std.testing.expectEqual(Cursor{ .col = 2 }, g.saved_cursor);
+    try std.testing.expectEqual(@as(u21, 'Y'), g.cellAt(1, 0).codepoint);
+}
+
+test "fillCells matches memset" {
+    var a: [19]Cell = undefined;
+    var b: [19]Cell = undefined;
+    const v: Cell = .{ .codepoint = 'q', .style = 0xdead_beef };
+    for (0..19) |n| {
+        @memset(&a, Cell{});
+        @memset(&b, Cell{});
+        @memset(a[0..n], v);
+        fillCells(b[0..n], v);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&a), std.mem.sliceAsBytes(&b));
+    }
+}
+
+test "cells are 8 bytes" {
+    try std.testing.expectEqual(8, @sizeOf(Cell));
+    try std.testing.expectEqual(16, @sizeOf(Style));
+}
+
+test "a full style table compacts without reusing live ids" {
+    const gpa = std.testing.allocator;
+    const styles = try Styles.create(gpa);
+    defer styles.destroy();
+    styles.limit = 64;
+    var g = try Grid.init(gpa, 8, 4, 6, styles, 0);
+    defer g.deinit(gpa);
+    var alt = try Grid.init(gpa, 8, 4, 4, styles, 1);
+    defer alt.deinit(gpa);
+    // Every cell gets its own style; most are overwritten later, so their
+    // ids die. Check after every write that each cell still resolves to the
+    // style it was written with.
+    var want: [2][8 * 6]u32 = @splat(@splat(0));
+    var prng = std.Random.DefaultPrng.init(42);
+    const rnd = prng.random();
+    var serial: u32 = 1;
+    var compactions: u32 = 0;
+    for (0..5000) |_| {
+        const which = rnd.uintLessThan(u8, 2);
+        const grid = if (which == 0) &g else &alt;
+        const ncells = grid.cells.len;
+        const k = rnd.uintLessThan(usize, ncells);
+        // Reuse an old color now and then so lookups hit existing entries.
+        const color = if (rnd.uintLessThan(u8, 4) == 0) 1 + rnd.uintLessThan(u32, serial) else serial;
+        serial += 1;
+        const st: Style = .{ .fg = @bitCast(color), .bg = Color.default_bg };
+        const gen = styles.gen;
+        grid.cells[k] = .{ .codepoint = 'x', .style = styles.intern(st) };
+        if (styles.gen != gen) compactions += 1;
+        want[which][k] = color;
+        try std.testing.expect(styles.list.items.len <= styles.limit);
+        for ([_]*Grid{ &g, &alt }, 0..) |gr, w| {
+            for (gr.cells, 0..) |c, i| {
+                const got = styles.of(c);
+                if (want[w][i] == 0) {
+                    try std.testing.expectEqual((Style{}).key(), got.key());
+                } else {
+                    try std.testing.expectEqual(want[w][i], @as(u32, @bitCast(got.fg)));
+                }
+            }
+        }
+    }
+    try std.testing.expect(compactions > 10);
+    // At most 80 cells + the default are live: the limit stops growing
+    // once that is under half of it.
+    try std.testing.expect(styles.limit <= 256);
+}
+
+test "the style limit grows when every id is live" {
+    const gpa = std.testing.allocator;
+    const styles = try Styles.create(gpa);
+    defer styles.destroy();
+    styles.limit = 16;
+    var g = try Grid.init(gpa, 10, 10, 10, styles, 0);
+    defer g.deinit(gpa);
+    for (g.cells, 0..) |*c, i| c.* = .{ .codepoint = 'x', .style = styles.intern(.{ .fg = @bitCast(@as(u32, @intCast(i + 1))) }) };
+    for (g.cells, 0..) |c, i| try std.testing.expectEqual(@as(u32, @intCast(i + 1)), @as(u32, @bitCast(styles.of(c).fg)));
+    try std.testing.expect(styles.limit >= 101);
+}
+
+test "cluster compaction keeps live ids' content, drops dead ones and bumps gen" {
+    const gpa = std.testing.allocator;
+    const styles = try Styles.create(gpa);
+    defer styles.destroy();
+    var g = try Grid.init(gpa, 4, 2, 3, styles, 0);
+    defer g.deinit(gpa);
+    const ab = [_]u32{ 'a', 0x301 };
+    const bc = [_]u32{ 'b', 0x302 };
+    const cd = [_]u32{ 'c', 0x303 };
+    const x = styles.internCluster(&ab);
+    const y = styles.internCluster(&bc);
+    const z = styles.internCluster(&cd);
+    try std.testing.expectEqual(x, styles.internCluster(&ab));
+    try std.testing.expect(x >= cluster_base and y != x and z != y);
+    // Only the second and third are in cells; the first dies.
+    g.cells[1].codepoint = y;
+    g.cells[6].codepoint = z;
+    const gen = styles.gen;
+    styles.compactClusters();
+    try std.testing.expect(styles.gen != gen);
+    try std.testing.expectEqual(@as(usize, 2), styles.clusters.spans.items.len);
+    var one: u32 = undefined;
+    try std.testing.expectEqualSlices(u32, &bc, styles.text(g.cells[1], &one));
+    try std.testing.expectEqualSlices(u32, &cd, styles.text(g.cells[6], &one));
+    // The dead content interns as a new entry; live ones still dedupe.
+    try std.testing.expectEqual(g.cells[6].codepoint, styles.internCluster(&cd));
+    try std.testing.expectEqual(@as(u21, cluster_base + 2), styles.internCluster(&ab));
+    try std.testing.expectEqual(@as(u21, 'q'), styles.internCluster(&[_]u32{'q'}));
 }

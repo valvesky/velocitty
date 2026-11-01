@@ -20,13 +20,13 @@ pub fn build(b: *std.Build) void {
     const exe = buildExeForTarget(b, target, optimize, macos_sdk);
     b.installArtifact(exe);
     if (target.result.os.tag == .linux) {
-        b.installFile("velocitty.desktop", "share/applications/velocitty.desktop");
-        b.installFile("icon.png", "share/icons/hicolor/512x512/apps/velocitty.png");
+        b.installFile("assets/velocitty.desktop", "share/applications/velocitty.desktop");
+        b.installFile("assets/icon.png", "share/icons/hicolor/512x512/apps/velocitty.png");
         b.installFile("velocitty.1", "share/man/man1/velocitty.1");
     }
     const tests_mod = appModule(b, target, optimize, "src/port_test.zig", macos_sdk);
     const tests = b.addTest(.{ .root_module = tests_mod });
-    if (target.result.os.tag == .windows) tests.win32_manifest = b.path("velocitty.manifest");
+    if (target.result.os.tag == .windows) tests.win32_manifest = b.path("assets/velocitty.manifest");
     const test_run = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run inline and portable Peak regressions");
     test_step.dependOn(&test_run.step);
@@ -34,7 +34,7 @@ pub fn build(b: *std.Build) void {
     addPeakSource(native_mod, b, target, "tests/peak_native.c");
     addMacSdk(native_mod, b, target, macos_sdk);
     const native_tests = b.addExecutable(.{ .name = "peak-native-test", .root_module = native_mod });
-    if (target.result.os.tag == .windows) native_tests.win32_manifest = b.path("velocitty.manifest");
+    if (target.result.os.tag == .windows) native_tests.win32_manifest = b.path("assets/velocitty.manifest");
     const native_run = b.addRunArtifact(native_tests);
     test_step.dependOn(&native_run.step);
     const check_step = b.step("check", "Compile the app and tests without running them");
@@ -53,7 +53,7 @@ pub fn build(b: *std.Build) void {
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("src/bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = b.option(std.builtin.OptimizeMode, "bench-optimize", "Bench optimize mode (default ReleaseFast)") orelse .ReleaseFast,
         .link_libc = true,
     });
     addStbTrueType(bench_mod, b);
@@ -67,6 +67,8 @@ pub fn build(b: *std.Build) void {
     bench_run.addPassthruArgs();
     const bench_step = b.step("bench", "Run PTY pipeline, glyph cache and render benchmarks (ReleaseFast)");
     bench_step.dependOn(&bench_run.step);
+    const bench_install = b.step("bench-install", "Install velocitty-bench to zig-out/bin (for +terminal-stream and scripts)");
+    bench_install.dependOn(&b.addInstallArtifact(bench_exe, .{}).step);
 
     // Each OS uses its native SDK; Linux hosts can also build Windows directly.
     const release_step = b.step("release", "Build ReleaseFast binaries for available target SDKs");
@@ -117,8 +119,8 @@ pub fn build(b: *std.Build) void {
     const usr_cmd = b.addSystemCommand(&.{"bash"});
     usr_cmd.addFileArg(b.path("scripts/install-usr.sh"));
     usr_cmd.addArtifactArg(usr_exe);
-    usr_cmd.addFileArg(b.path("velocitty.desktop"));
-    usr_cmd.addFileArg(b.path("icon.png"));
+    usr_cmd.addFileArg(b.path("assets/velocitty.desktop"));
+    usr_cmd.addFileArg(b.path("assets/icon.png"));
     usr_cmd.addFileArg(b.path("velocitty.1"));
     usr_cmd.stdio = .inherit;
     usr_cmd.has_side_effects = true;
@@ -149,8 +151,8 @@ fn buildExeForTarget(
     if (target.result.os.tag == .linux and target.result.abi == .musl) exe.linkage = .dynamic;
     if (target.result.os.tag == .windows) {
         exe.subsystem = .windows;
-        exe.win32_manifest = b.path("velocitty.manifest");
-        exe.root_module.addWin32ResourceFile(.{ .file = b.path("velocitty.rc"), .include_paths = &.{b.path(".")} });
+        exe.win32_manifest = b.path("assets/velocitty.manifest");
+        exe.root_module.addWin32ResourceFile(.{ .file = b.path("assets/velocitty.rc"), .include_paths = &.{b.path("assets")} });
     }
     return exe;
 }

@@ -8,15 +8,11 @@ enum { ZT_STB_INFO_CAP = 256 };
 
 _Static_assert(sizeof(stbtt_fontinfo) <= ZT_STB_INFO_CAP, "stbtt_fontinfo grew");
 
-int zt_stb_init(void *storage, const unsigned char *data, int len) {
+int zt_stb_init(void *storage, const unsigned char *data, int len, int offset) {
     stbtt_fontinfo *info;
-    int offset;
-    (void)len;
-    if (storage == NULL || data == NULL) return 0;
+    if (storage == NULL || data == NULL || offset < 0 || offset > len - 12) return 0;
     memset(storage, 0, sizeof(stbtt_fontinfo));
     info = (stbtt_fontinfo *)storage;
-    offset = stbtt_GetFontOffsetForIndex(data, 0);
-    if (offset < 0) return 0;
     return stbtt_InitFont(info, data, offset);
 }
 

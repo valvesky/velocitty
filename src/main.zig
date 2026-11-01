@@ -12,253 +12,62 @@ const Scheme = @import("scheme.zig");
 const Select = @import("select.zig");
 const Key = @import("key.zig");
 
-const font_paths: []const []const u8 = switch (builtin.os.tag) {
-    .macos, .ios, .tvos, .watchos, .visionos => &.{
-        "/Library/Fonts/Courier New.ttf",
-        "/System/Library/Fonts/Supplemental/Courier New.ttf",
-        "/System/Library/Fonts/Menlo.ttc",
-        "/System/Library/Fonts/Monaco.ttf",
-    },
-    .windows => &.{
-        "C:/Windows/Fonts/consola.ttf",
-        "C:/Windows/Fonts/cour.ttf",
-        "C:/Windows/Fonts/lucon.ttf",
-    },
-    else => &.{
-        "/usr/share/fonts/iosevka-term/IosevkaTermNerdFontMono-Regular.ttf",
-        "/usr/share/fonts/iosevka-term/IosevkaTermNerdFont-Regular.ttf",
-        "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
-    },
-};
-
-const fallback_paths: []const []const u8 = switch (builtin.os.tag) {
-    .macos, .ios, .tvos, .watchos, .visionos => &.{
-        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-        "/Library/Fonts/Arial Unicode.ttf",
-        "/System/Library/Fonts/STHeiti Light.ttc",
-    },
-    .windows => &.{
-        "C:/Windows/Fonts/arial.ttf",
-        "C:/Windows/Fonts/msyh.ttc",
-        "C:/Windows/Fonts/seguiemj.ttf",
-    },
-    else => &.{
-        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-        "/usr/share/fonts/noto/NotoSansSymbols-Regular.ttf",
-        "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
-        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/gnu-free/FreeSans.otf",
-        "/usr/share/fonts/noto/NotoColorEmoji.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
-        "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    },
-};
-
-// Resolve standard coverage fonts even when the distribution uses other paths.
-const fallback_families: []const []const u8 = &.{
-    "Noto Sans Symbols",
-    "Noto Sans Symbols 2",
-    "Noto Sans CJK JP",
-    "Noto Color Emoji",
-};
+const FontSource = @import("fontsource.zig");
+const fontMatchPath = FontSource.matchPath;
+const resolveFamilyFile = FontSource.resolveFamilyFile;
+const loadFontPath = FontSource.loadFile;
+const velocitty_font_load = FontSource.velocitty_font_load;
+const velocitty_font_free = FontSource.velocitty_font_free;
 
 const FontBlob = struct {
     bytes: []u8,
+    index: u32 = 0,
     style: @import("type.zig").Style = .{},
+    deferred: bool = false,
+    emoji_only: bool = false,
+    exact: bool = true,
+    io: ?std.Io = null,
 };
 
-fn loadFontPath(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
-    const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
-    defer file.close(io);
-    const n = try file.length(io);
-    const bytes = try gpa.alloc(u8, n);
-    errdefer gpa.free(bytes);
-    const got = try file.readPositionalAll(io, bytes, 0);
-    if (got != n) return error.InvalidFont;
-    return bytes;
-}
-
-fn fontMatchPath(output: []const u8, required_family: ?[]const u8) ?[]const u8 {
-    var lines = std.mem.splitScalar(u8, output, '\n');
-    const path = std.mem.trim(u8, lines.next() orelse return null, " \t\r");
-    if (path.len == 0 or path[0] != '/') return null;
-    if (required_family) |family| {
-        // fc-match succeeds even for nonexistent families. Never silently add
-        // its unrelated default face as a requested fallback.
-        const matched = lines.next() orelse return null;
-        var names = std.mem.splitScalar(u8, matched, ',');
-        while (names.next()) |name| {
-            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, name, " \t\r"), family)) return path;
-        }
-        return null;
+fn deferFont(io: std.Io, gpa: std.mem.Allocator, out: *std.ArrayList(FontBlob), name: []const u8, style: @import("type.zig").Style, exact: bool, emoji_only: bool) !void {
+    for (out.items) |blob| {
+        if (blob.deferred and std.ascii.eqlIgnoreCase(blob.bytes, name) and
+            blob.style.bold == style.bold and blob.style.italic == style.italic and blob.exact == exact) return;
     }
-    return path;
-}
-
-fn resolveFamilyFile(io: std.Io, gpa: std.mem.Allocator, family: []const u8, exact: bool) ?[]u8 {
-    // fontconfig reads HOME / FONTCONFIG_* from the child environment.
-    const result = std.process.run(gpa, io, .{
-        .argv = &.{ "fc-match", "-f", "%{file}\n%{family}\n", family },
-        .stdout_limit = .limited(4096),
-        .stderr_limit = .limited(4096),
-    }) catch return null;
-    defer gpa.free(result.stdout);
-    defer gpa.free(result.stderr);
-    switch (result.term) {
-        .exited => |code| if (code != 0) return null,
-        else => return null,
-    }
-    const path = fontMatchPath(result.stdout, if (exact) family else null) orelse return null;
-    return gpa.dupe(u8, path) catch null;
+    const owned = try gpa.dupe(u8, name);
+    errdefer gpa.free(owned);
+    try out.append(gpa, .{ .bytes = owned, .style = style, .deferred = true, .emoji_only = emoji_only, .exact = exact, .io = io });
 }
 
 fn loadFonts(io: std.Io, gpa: std.mem.Allocator, out: *std.ArrayList(FontBlob), config: *const Scheme.Config) !void {
-    if (builtin.os.tag != .linux) return loadNativeFonts(gpa, out, config);
-    // Four styled primary faces, emergency primary, custom families, defaults.
-    const max_paths = 5 + Scheme.max_font_fallbacks + fallback_paths.len + fallback_families.len;
-    var seen: [max_paths][std.fs.max_path_bytes]u8 = undefined;
-    var seen_len: [max_paths]usize = @splat(0);
-    var seen_n: usize = 0;
-
-    const already = struct {
-        fn go(path: []const u8, seen_buf: [][std.fs.max_path_bytes]u8, seen_l: []usize, n: usize) bool {
-            var i: usize = 0;
-            while (i < n) : (i += 1) {
-                if (std.mem.eql(u8, seen_buf[i][0..seen_l[i]], path)) return true;
-            }
-            return false;
-        }
-    }.go;
-
-    const remember = struct {
-        fn go(path: []const u8, seen_buf: [][std.fs.max_path_bytes]u8, seen_l: []usize, n: *usize) void {
-            if (n.* >= seen_buf.len) return;
-            const i = n.*;
-            const k = @min(path.len, seen_buf[i].len);
-            @memcpy(seen_buf[i][0..k], path[0..k]);
-            seen_l[i] = k;
-            n.* = i + 1;
-        }
-    }.go;
-
-    const append_path = struct {
-        fn go(
-            io_: std.Io,
-            gpa_: std.mem.Allocator,
-            out_: *std.ArrayList(FontBlob),
-            path: []const u8,
-            style: @import("type.zig").Style,
-            seen_buf: [][std.fs.max_path_bytes]u8,
-            seen_l: []usize,
-            n: *usize,
-        ) bool {
-            if (already(path, seen_buf, seen_l, n.*)) return false;
-            const bytes = loadFontPath(io_, gpa_, path) catch return false;
-            out_.append(gpa_, .{ .bytes = bytes, .style = style }) catch {
-                gpa_.free(bytes);
-                return false;
-            };
-            remember(path, seen_buf, seen_l, n);
-            return true;
-        }
-    }.go;
-
-    const try_pattern = struct {
-        fn go(
-            io_: std.Io,
-            gpa_: std.mem.Allocator,
-            out_: *std.ArrayList(FontBlob),
-            pattern: []const u8,
-            exact: bool,
-            style: @import("type.zig").Style,
-            seen_buf: [][std.fs.max_path_bytes]u8,
-            seen_l: []usize,
-            n: *usize,
-        ) void {
-            const path = resolveFamilyFile(io_, gpa_, pattern, exact) orelse return;
-            defer gpa_.free(path);
-            _ = append_path(io_, gpa_, out_, path, style, seen_buf, seen_l, n);
-        }
-    }.go;
-
-    const fam = config.family() orelse "monospace";
-    try_pattern(io, gpa, out, fam, false, .{}, &seen, seen_len[0..], &seen_n);
-    var pat_buf: [192]u8 = undefined;
-    if (std.fmt.bufPrint(&pat_buf, "{s}:weight=bold", .{fam})) |p| {
-        try_pattern(io, gpa, out, p, false, .{ .bold = true }, &seen, seen_len[0..], &seen_n);
-    } else |_| {}
-    if (std.fmt.bufPrint(&pat_buf, "{s}:slant=italic", .{fam})) |p| {
-        try_pattern(io, gpa, out, p, false, .{ .italic = true }, &seen, seen_len[0..], &seen_n);
-    } else |_| {}
-    if (std.fmt.bufPrint(&pat_buf, "{s}:weight=bold:slant=italic", .{fam})) |p| {
-        try_pattern(io, gpa, out, p, false, .{ .bold = true, .italic = true }, &seen, seen_len[0..], &seen_n);
-    } else |_| {}
-
-    if (out.items.len == 0) {
-        for (font_paths) |path| {
-            if (append_path(io, gpa, out, path, .{}, &seen, seen_len[0..], &seen_n)) break;
-        }
-    }
-    // Keep the configured primary/style faces; user fallbacks take priority
-    // over the built-in coverage fonts, in the order written in config.toml.
-    for (config.fallbackFamilies()) |*name| {
-        try_pattern(io, gpa, out, name.slice(), true, .{}, &seen, seen_len[0..], &seen_n);
-    }
-    for (fallback_paths) |path| {
-        _ = append_path(io, gpa, out, path, .{}, &seen, seen_len[0..], &seen_n);
-    }
-    for (fallback_families) |name| {
-        try_pattern(io, gpa, out, name, true, .{}, &seen, seen_len[0..], &seen_n);
-    }
-    if (out.items.len == 0) return error.InvalidFont;
-}
-
-extern fn velocitty_font_load(family: [*:0]const u8, bold: c_int, italic: c_int, exact: c_int, len: *usize) ?[*]u8;
-extern fn velocitty_font_free(data: [*]u8) void;
-
-fn appendNativeFont(gpa: std.mem.Allocator, out: *std.ArrayList(FontBlob), name: []const u8, style: @import("type.zig").Style, exact: bool) !void {
-    var name_buf: [256]u8 = undefined;
-    if (name.len >= name_buf.len or std.mem.indexOfScalar(u8, name, 0) != null) return;
-    @memcpy(name_buf[0..name.len], name);
-    name_buf[name.len] = 0;
-    var n: usize = 0;
-    const data = velocitty_font_load(@ptrCast(&name_buf), @intFromBool(style.bold), @intFromBool(style.italic), @intFromBool(exact), &n) orelse return;
-    defer velocitty_font_free(data);
-    for (out.items) |blob| if (std.mem.eql(u8, blob.bytes, data[0..n])) return;
-    const owned = try gpa.dupe(u8, data[0..n]);
-    errdefer gpa.free(owned);
-    try out.append(gpa, .{ .bytes = owned, .style = style });
+    const family = config.family() orelse "monospace";
+    const loaded = try FontSource.loadFamily(gpa, io, family, false, false, false);
+    out.append(gpa, .{ .bytes = loaded.bytes, .index = loaded.index }) catch |err| {
+        gpa.free(loaded.bytes);
+        return err;
+    };
+    try deferFont(io, gpa, out, family, .{ .bold = true }, false, false);
+    try deferFont(io, gpa, out, family, .{ .italic = true }, false, false);
+    try deferFont(io, gpa, out, family, .{ .bold = true, .italic = true }, false, false);
+    for (config.fallbackFamilies()) |*name| try deferFont(io, gpa, out, name.slice(), .{}, true, false);
+    for (FontSource.fallback_families) |name| try deferFont(io, gpa, out, name, .{}, true, FontSource.isEmojiFamily(name));
 }
 
 fn loadNativeFonts(gpa: std.mem.Allocator, out: *std.ArrayList(FontBlob), config: *const Scheme.Config) !void {
-    const family = config.family() orelse "monospace";
-    try appendNativeFont(gpa, out, family, .{}, false);
-    try appendNativeFont(gpa, out, family, .{ .bold = true }, false);
-    try appendNativeFont(gpa, out, family, .{ .italic = true }, false);
-    try appendNativeFont(gpa, out, family, .{ .bold = true, .italic = true }, false);
-    for (config.fallbackFamilies()) |*name| try appendNativeFont(gpa, out, name.slice(), .{}, true);
-    const defaults = if (builtin.os.tag == .windows)
-        &[_][]const u8{ "Segoe UI Symbol", "Microsoft YaHei", "Segoe UI Emoji" }
-    else
-        &[_][]const u8{ "Apple Symbols", "PingFang SC", "Apple Color Emoji" };
-    for (defaults) |name| try appendNativeFont(gpa, out, name, .{}, true);
-    if (out.items.len == 0) return error.InvalidFont;
+    return loadFonts(std.Io.Threaded.global_single_threaded.io(), gpa, out, config);
 }
 
 fn bindFonts(gpa: std.mem.Allocator, type_ctx: *TypeCtx, blobs: []const FontBlob) !void {
+    _ = gpa;
     type_ctx.clearFonts();
-    var fallbacks: std.ArrayList(@import("type.zig").FontId) = .empty;
-    defer fallbacks.deinit(gpa);
-    for (blobs, 0..) |blob, i| {
-        const id = type_ctx.addFont(blob.bytes, .{ .style = blob.style }) catch continue;
-        const styled = blob.style.bold or blob.style.italic;
-        if (i != 0 and !styled) try fallbacks.append(gpa, id);
+    for (blobs) |blob| {
+        if (blob.deferred) {
+            try type_ctx.addLazyFont(blob.io.?, blob.bytes, .{ .style = blob.style, .emoji_only = blob.emoji_only }, blob.exact, FontSource.loadFamily);
+        } else {
+            _ = try type_ctx.addFont(blob.bytes, .{ .style = blob.style, .index = blob.index });
+        }
     }
     if (type_ctx.primary == null) return error.InvalidFont;
-    if (fallbacks.items.len != 0) try type_ctx.setFallbacks(fallbacks.items);
 }
 
 fn pointsToPixels(pt: f32, dpi: f32) f32 {
@@ -410,16 +219,16 @@ fn applyMetrics(
 }
 
 fn syncGrid(
-    window: *Platform.Window,
+    window: anytype,
     term: *VtState,
     frame: *Draw.Frame,
-    pty: *Platform.Pty,
+    pty: anytype,
     cols: *u16,
     rows: *u16,
     cell_w: u32,
     cell_h: u32,
     pad_px: u32,
-) void {
+) !void {
     term.cell_px_w = @intCast(@min(cell_w, std.math.maxInt(u16)));
     term.cell_px_h = @intCast(@min(cell_h, std.math.maxInt(u16)));
     const fb = window.framebuffer();
@@ -428,10 +237,11 @@ fn syncGrid(
     const next = gridDims(fb.width, fb.height, cell_w, cell_h, pad_px);
     const new_fw = @as(u32, next.cols) * cell_w;
     const new_fh = @as(u32, next.rows) * cell_h;
+
     if (next.cols != cols.* or next.rows != rows.*) {
+        try term.resize(next.cols, next.rows);
         cols.* = next.cols;
         rows.* = next.rows;
-        term.resize(cols.*, rows.*) catch {};
         pty.setWinsize(.{
             .cols = cols.*,
             .rows = rows.*,
@@ -444,7 +254,7 @@ fn syncGrid(
         frame.invalidate();
     }
     if (frame.width != new_fw or frame.height != new_fh) {
-        frame.resize(new_fw, new_fh) catch {};
+        try frame.resize(new_fw, new_fh);
         frame.invalidate();
     }
 }
@@ -492,8 +302,25 @@ fn drainHost(window: *Platform.Window, term: *VtState, allocator: std.mem.Alloca
     }
 }
 
+var notify_children: [64]std.os.linux.pid_t = @splat(0);
+
+fn reapNotifications() void {
+    if (builtin.os.tag != .linux) return;
+    for (&notify_children) |*pid| {
+        if (pid.* == 0) continue;
+        var status: i32 = 0;
+        const rc = std.os.linux.waitpid(pid.*, &status, std.os.linux.W.NOHANG);
+        const err = std.os.linux.errno(rc);
+        if ((err == .SUCCESS and rc != 0) or err == .CHILD) pid.* = 0;
+    }
+}
+
 fn spawnNotify(_: std.mem.Allocator, title: []const u8, body: []const u8) void {
     if (builtin.os.tag != .linux) return;
+    reapNotifications();
+    const slot = for (&notify_children) |*pid| {
+        if (pid.* == 0) break pid;
+    } else return;
     const t = if (title.len == 0) "Velocitty" else title;
     var tbuf: [128]u8 = undefined;
     var bbuf: [512]u8 = undefined;
@@ -502,8 +329,11 @@ fn spawnNotify(_: std.mem.Allocator, title: []const u8, body: []const u8) void {
     const rc = std.os.linux.fork();
     const errno = std.os.linux.errno(rc);
     if (errno != .SUCCESS) return;
-    if (rc != 0) return;
-    const argv = [_:null]?[*:0]const u8{ "notify-send", tz, bz, null };
+    if (rc != 0) {
+        slot.* = @intCast(rc);
+        return;
+    }
+    const argv = [_:null]?[*:0]const u8{ "notify-send", "--", tz, bz, null };
     const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
     _ = std.c.execve("/usr/bin/notify-send", &argv, envp);
     std.os.linux.exit(127);
@@ -528,7 +358,7 @@ fn layoutIfNeeded(
     pty: *Platform.Pty,
     cols: *u16,
     rows: *u16,
-) void {
+) !void {
     if (!need_layout.*) return;
     const next_scale = if (builtin.os.tag == .linux) uiScaleCached(io, allocator, false) else window.scale();
     var changed = false;
@@ -546,7 +376,7 @@ fn layoutIfNeeded(
     const old_rows = rows.*;
     const old_fw = frame.width;
     const old_fh = frame.height;
-    syncGrid(window, term, frame, pty, cols, rows, cell_w.*, cell_h.*, pad_px.*);
+    try syncGrid(window, term, frame, pty, cols, rows, cell_w.*, cell_h.*, pad_px.*);
     need_layout.* = false;
     if (changed or cols.* != old_cols or rows.* != old_rows or frame.width != old_fw or frame.height != old_fh) {
         need_draw.* = true;
@@ -718,7 +548,7 @@ fn encodeMouse(
         return std.fmt.bufPrint(buf, "\x1b[<{d};{d};{d}{c}", .{ btn, col, row, final }) catch "";
     }
     if (term.flags.mouse_urxvt) {
-        const b = if (r.press or r.motion) btn else @as(u16, 3);
+        const b = 32 + (if (r.press or r.motion) btn else @as(u16, 3));
         return std.fmt.bufPrint(buf, "\x1b[{d};{d};{d}M", .{ b, col, row }) catch "";
     }
     if (col > 223 or row > 223) return "";
@@ -866,11 +696,15 @@ const EventLoop = struct {
                 } else if (n != 0) {
                     self.followOutput();
                     self.clearSel();
-                    self.pty.write(text[0..n]);
+                    self.writeText(text[0..n]);
                 }
             },
             else => {},
         }
+    }
+
+    fn writeText(self: *EventLoop, text: []const u8) void {
+        writeKeyboardText(self.pty, text, self.term.kitty_kbd[self.term.kitty_kbd_idx]);
     }
 
     fn inside(self: *const EventLoop, x: i32, y: i32) bool {
@@ -951,7 +785,7 @@ const EventLoop = struct {
         if (!self.dragging and !self.inside(m.x, m.y)) return;
         if (self.term.mouse == .any or (self.term.mouse == .drag and self.mouse_held != 0)) {
             if (!m.mods.shift) {
-                const btn: u16 = if (self.mouse_held != 0) self.mouse_held - 1 else 0;
+                const btn = motionButton(self.mouse_held);
                 self.reportMouse(.{ .btn = btn, .press = true, .motion = true, .x = m.x, .y = m.y, .mods = m.mods });
                 return;
             }
@@ -1021,17 +855,43 @@ fn clampCell(px: i32, cell: u32, max_cells: u16) u16 {
     return @intCast(@min(c, @as(u32, max_cells - 1)));
 }
 
-fn writePaste(pty: *Platform.Pty, term: *const VtState, allocator: std.mem.Allocator, raw: []const u8) void {
-    var buf = allocator.alloc(u8, raw.len) catch {
-        if (term.flags.bracket_paste) pty.write("\x1b[200~");
-        pty.write(raw);
-        if (term.flags.bracket_paste) pty.write("\x1b[201~");
+fn motionButton(held: u8) u16 {
+    return if (held != 0) held - 1 else 3;
+}
+
+fn writeKeyboardText(pty: anytype, text: []const u8, flags: u16) void {
+    if (flags & 8 == 0) {
+        pty.write(text);
         return;
-    };
+    }
+    var i: usize = 0;
+    while (i < text.len) {
+        const cp: u21 = if (text[i] < 0x80) blk: {
+            const ascii = text[i];
+            i += 1;
+            break :blk ascii;
+        } else @import("simd.zig").decodeUtf8Step(text, &i) orelse continue;
+        var buf: [64]u8 = undefined;
+        const bytes = std.fmt.bufPrint(&buf, "\x1b[{d}u", .{cp}) catch unreachable;
+        pty.write(bytes);
+    }
+}
+
+fn writePaste(pty: anytype, term: *const VtState, allocator: std.mem.Allocator, raw: []const u8) void {
+    // Never fall back to unfiltered input on allocation failure.
+    const buf = allocator.alloc(u8, raw.len) catch return;
     defer allocator.free(buf);
+    const n = sanitizePaste(buf, raw);
+    if (term.flags.bracket_paste) pty.write("\x1b[200~");
+    if (n != 0) pty.write(buf[0..n]);
+    if (term.flags.bracket_paste) pty.write("\x1b[201~");
+}
+
+fn sanitizePaste(buf: []u8, raw: []const u8) usize {
     var n: usize = 0;
     for (raw) |b| {
-        if (b == 0) continue;
+        // Strip escape/control injection, retaining tabs and normalized newlines.
+        if ((b < 0x20 and b != '\n' and b != '\r' and b != '\t') or b == 0x7f) continue;
         if (b == '\n') {
             if (n == 0 or buf[n - 1] != '\r') {
                 buf[n] = '\r';
@@ -1042,9 +902,7 @@ fn writePaste(pty: *Platform.Pty, term: *const VtState, allocator: std.mem.Alloc
         buf[n] = b;
         n += 1;
     }
-    if (term.flags.bracket_paste) pty.write("\x1b[200~");
-    if (n != 0) pty.write(buf[0..n]);
-    if (term.flags.bracket_paste) pty.write("\x1b[201~");
+    return n;
 }
 
 const Cli = struct {
@@ -1088,9 +946,14 @@ fn parseCli(argv: []const [*:0]const u8) Cli {
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {
+    // Debug builds check for leaks; release builds use libc malloc, which
+    // reuses freed large blocks (image transfers) instead of mapping and
+    // faulting in fresh pages for each one.
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    defer if (builtin.mode == .debug) {
+        _ = gpa.deinit();
+    };
+    const allocator = if (builtin.mode == .debug) gpa.allocator() else std.heap.c_allocator;
     var args_arena = std.heap.ArenaAllocator.init(allocator);
     defer args_arena.deinit();
     const args = try init.args.toSlice(args_arena.allocator());
@@ -1143,7 +1006,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         Debug.log("no fonts found; drawing without glyphs\n", .{});
     }
 
-    var circbuffer: CircBuffer = try CircBuffer.create(allocator, 64 * 1024);
+    var circbuffer: CircBuffer = try CircBuffer.create(allocator, CircBuffer.default_capacity);
     defer circbuffer.destroy();
 
     var term: VtState = try VtState.init(allocator, cols, rows, 1000, circbuffer.storage);
@@ -1197,6 +1060,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     };
 
     while (running) {
+        reapNotifications();
         eloop.drain();
 
         if (!running) break;
@@ -1232,7 +1096,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 new_blobs.deinit(allocator);
             }
             applyMetrics(type_ptr, size_px, scale, config.pad_px, &cell_w, &cell_h, &pad_px);
-            syncGrid(&window, &term, &frame, &pty, &cols, &rows, cell_w, cell_h, pad_px);
+            try syncGrid(&window, &term, &frame, &pty, &cols, &rows, cell_w, cell_h, pad_px);
             frame.invalidate();
             theme_stamp = Scheme.watchStamp(io.io());
             need_draw = true;
@@ -1242,7 +1106,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             eloop.pad_px = pad_px;
         }
 
-        layoutIfNeeded(
+        try layoutIfNeeded(
             &need_layout,
             &need_draw,
             io.io(),
@@ -1268,11 +1132,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
             .fd = x_fd,
             .ctx = @ptrCast(&eloop),
             .tick = EventLoop.pump,
-        }) catch {
+        }, term.sink()) catch {
             hangup = true;
         };
 
-        layoutIfNeeded(
+        try layoutIfNeeded(
             &need_layout,
             &need_draw,
             io.io(),
@@ -1293,9 +1157,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
             &rows,
         );
 
-        if (circbuffer.pending()) {
-            const runs = circbuffer.consumeAndGetRuns(std.math.maxInt(usize));
-            if (runs.len != 0) term.feedRuns(runs);
+        circbuffer.drain(term.sink(), false);
+        if (circbuffer.fed) {
+            circbuffer.fed = false;
             need_draw = true;
         }
         drainHost(&window, &term, allocator);
@@ -1308,6 +1172,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
         const hold_sync = term.flags.sync_output and sync_hold < hz;
         if (need_draw and !hold_sync) {
+            term.prepareImages();
             frame.renderSel(&term, cell_w, cell_h, type_ptr, size_px, eloop.sel);
             term.clearDirty();
             eloop.presenter.present(&window, &frame, padColor(&term));
@@ -1334,6 +1199,15 @@ test "fontconfig fallbacks require an installed family, not a substitute" {
     try std.testing.expect(fontMatchPath("/fonts/Example.ttf\n", "Example Sans") == null);
 }
 
+test "primary font binding preserves the selected collection member" {
+    var bytes = @import("type.zig").TrueType.testing.collection;
+    const blobs = [_]FontBlob{.{ .bytes = &bytes, .index = 1 }};
+    var ctx = try TypeCtx.init(std.testing.allocator, .{});
+    defer ctx.deinit();
+    try bindFonts(std.testing.allocator, &ctx, &blobs);
+    try std.testing.expectEqual(@as(u16, 2000), (try ctx.metrics(16)).units_per_em);
+}
+
 test "native fonts load real primary faces and reject unrelated substitutions" {
     if (builtin.os.tag == .linux) return error.SkipZigTest;
     var blobs: std.ArrayList(FontBlob) = .empty;
@@ -1355,23 +1229,20 @@ test "native fonts load real primary faces and reject unrelated substitutions" {
     try std.testing.expect(missing == null);
 }
 
-test "configured font fallbacks load in order and keep the primary font" {
+test "configured fonts defer coverage and styles while preserving fallback order" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{ .environ = std.testing.environ });
     defer threaded.deinit();
     const io = threaded.io();
-    const families = [_][]const u8{ "monospace", "Noto Sans Symbols 2", "Noto Sans Symbols" };
-    var expected: [families.len][]u8 = undefined;
-    var loaded: usize = 0;
-    defer for (expected[0..loaded]) |bytes| gpa.free(bytes);
-    for (families, 0..) |name, i| {
-        const path = resolveFamilyFile(io, gpa, name, i != 0) orelse return error.SkipZigTest;
-        defer gpa.free(path);
-        expected[i] = loadFontPath(io, gpa, path) catch return error.SkipZigTest;
-        loaded += 1;
+    for ([_][]const u8{ "Noto Sans Symbols", "Noto Sans Symbols 2" }) |name| {
+        const path = resolveFamilyFile(io, gpa, name, true) orelse return error.SkipZigTest;
+        gpa.free(path);
     }
-    // Exercise both initial configuration and a reordered list, as on reload.
+    const primary_path = resolveFamilyFile(io, gpa, "monospace", false) orelse return error.SkipZigTest;
+    defer gpa.free(primary_path);
+    const primary_bytes = try loadFontPath(io, gpa, primary_path);
+    defer gpa.free(primary_bytes);
     for ([_][]const u8{
         "['Noto Sans Symbols 2', 'Velocitty Missing Test Font', 'Noto Sans Symbols', 'Noto Sans Symbols 2']",
         "['Noto Sans Symbols', 'Noto Sans Symbols 2', 'Noto Sans Symbols']",
@@ -1385,25 +1256,31 @@ test "configured font fallbacks load in order and keep the primary font" {
             blobs.deinit(gpa);
         }
         try loadFonts(io, gpa, &blobs, &config);
-        var regular: usize = 0;
-        var first_fallback_count: usize = 0;
+        try std.testing.expectEqualSlices(u8, primary_bytes, blobs.items[0].bytes);
+        var eager: usize = 0;
+        var duplicate_count: usize = 0;
         for (blobs.items) |blob| {
-            if (blob.style.bold or blob.style.italic) continue;
-            if (regular < expected.len) {
-                const index = if (regular == 0 or round == 0) regular else 3 - regular;
-                try std.testing.expectEqualSlices(u8, expected[index], blob.bytes);
-            }
-            if (std.mem.eql(u8, expected[1], blob.bytes)) first_fallback_count += 1;
-            regular += 1;
+            if (!blob.deferred) eager += 1;
+            if (blob.deferred and std.mem.eql(u8, blob.bytes, "Noto Sans Symbols 2")) duplicate_count += 1;
         }
-        try std.testing.expect(regular >= expected.len);
-        try std.testing.expectEqual(@as(usize, 1), first_fallback_count);
+        try std.testing.expectEqual(@as(usize, 1), eager);
+        try std.testing.expectEqual(@as(usize, 1), duplicate_count);
         var ctx = try TypeCtx.init(gpa, .{});
         defer ctx.deinit();
         try bindFonts(gpa, &ctx, blobs.items);
+        try std.testing.expectEqual(@as(usize, 1), ctx.faces.items.len);
+        const first_custom = if (round == 0) "Noto Sans Symbols 2" else "Noto Sans Symbols";
+        try std.testing.expectEqualStrings(first_custom, ctx.lazy_fonts.items[3].name);
         const ascii = try ctx.glyph('A', 16);
         try std.testing.expectEqual(ctx.primary.?, ascii.font_id);
-        try std.testing.expect(ascii.glyph_id != 0);
+        try std.testing.expectEqual(@as(usize, 1), ctx.faces.items.len);
+        _ = try ctx.glyph(0x10FFFF, 16);
+        for (ctx.lazy_fonts.items) |candidate| {
+            if (std.mem.eql(u8, candidate.name, "Velocitty Missing Test Font")) {
+                try std.testing.expect(candidate.attempted);
+                try std.testing.expect(candidate.id == null);
+            }
+        }
         for ([_]u21{ 0x25B0, 0x25B1, 0x280B }) |cp| {
             const glyph = try ctx.glyph(cp, 16);
             try std.testing.expect(glyph.glyph_id != 0);
@@ -1433,4 +1310,100 @@ test "multi-click sequences stop at focus changes" {
     try std.testing.expectEqual(Select.Kind.line, a.clickKind(p, 350));
     try std.testing.expectEqual(Select.Kind.cell, a.clickKind(p, 400));
     try std.testing.expectEqual(Select.Kind.cell, a.clickKind(p, 900));
+}
+
+const InputCapture = struct {
+    bytes: [512]u8 = undefined,
+    len: usize = 0,
+
+    fn write(self: *@This(), bytes: []const u8) void {
+        @memcpy(self.bytes[self.len..][0..bytes.len], bytes);
+        self.len += bytes.len;
+    }
+};
+
+test "paste strips escape injection and fails closed on allocation failure" {
+    var dummy: [1]u8 = undefined;
+    var term = try VtState.init(std.testing.allocator, 8, 2, 0, &dummy);
+    defer term.deinit();
+    term.flags.bracket_paste = true;
+    var output: InputCapture = .{};
+    writePaste(&output, &term, std.testing.allocator, "a\x1b[201~echo\n\x00\x03\t日本語\r\n");
+    try std.testing.expectEqualStrings("\x1b[200~a[201~echo\r\t日本語\r\x1b[201~", output.bytes[0..output.len]);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    output.len = 0;
+    writePaste(&output, &term, failing.allocator(), "\x1b[201~echo\n");
+    try std.testing.expectEqual(@as(usize, 0), output.len);
+}
+
+test "kitty all keys encodes composed Unicode text while legacy stays raw" {
+    var output: InputCapture = .{};
+    writeKeyboardText(&output, "aA😀", 8);
+    try std.testing.expectEqualStrings("\x1b[97u\x1b[65u\x1b[128512u", output.bytes[0..output.len]);
+    output.len = 0;
+    writeKeyboardText(&output, "aA😀", 0);
+    try std.testing.expectEqualStrings("aA😀", output.bytes[0..output.len]);
+}
+
+test "mouse encodings distinguish no-button motion and offset urxvt buttons" {
+    var dummy: [1]u8 = undefined;
+    var term = try VtState.init(std.testing.allocator, 8, 2, 0, &dummy);
+    defer term.deinit();
+    var buf: [64]u8 = undefined;
+    term.flags.mouse_sgr = true;
+    try std.testing.expectEqualStrings("\x1b[<35;1;1M", encodeMouse(&term, .{ .btn = motionButton(0), .press = true, .motion = true, .x = 0, .y = 0, .mods = .{} }, 0, 0, 8, 16, &buf));
+    term.flags.mouse_sgr = false;
+    term.flags.mouse_urxvt = true;
+    try std.testing.expectEqualStrings("\x1b[32;1;1M", encodeMouse(&term, .{ .btn = 0, .press = true, .motion = false, .x = 0, .y = 0, .mods = .{} }, 0, 0, 8, 16, &buf));
+    try std.testing.expectEqualStrings("\x1b[35;1;1M", encodeMouse(&term, .{ .btn = 0, .press = false, .motion = false, .x = 0, .y = 0, .mods = .{} }, 0, 0, 8, 16, &buf));
+}
+
+test "resize allocation errors propagate without publishing new grid dimensions" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var dummy: [1]u8 = undefined;
+    var term = try VtState.init(failing.allocator(), 8, 2, 8, &dummy);
+    defer term.deinit();
+    var frame = try Draw.Frame.init(std.testing.allocator, 64, 32);
+    defer frame.deinit();
+    var cols: u16 = 8;
+    var rows: u16 = 2;
+    var window: struct {
+        fb: Platform.Framebuffer = .{ .pixels = &.{}, .width = 128, .height = 64, .stride = 128 },
+        fn framebuffer(self: *@This()) *Platform.Framebuffer {
+            return &self.fb;
+        }
+    } = .{};
+    var pty: struct {
+        fn setWinsize(_: *@This(), _: Platform.Dimensions) void {
+            @panic("failed resize must not update the PTY");
+        }
+    } = .{};
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, syncGrid(&window, &term, &frame, &pty, &cols, &rows, 8, 16, 0));
+    try std.testing.expectEqual(@as(u16, 8), cols);
+    try std.testing.expectEqual(@as(u16, 2), rows);
+    try std.testing.expectEqual(@as(u16, 8), term.cols);
+    try std.testing.expectEqual(@as(u16, 2), term.rows);
+}
+
+test "notification reaper collects exited tracked children" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    const rc = linux.fork();
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    if (rc == 0) linux.exit(0);
+    const pid: linux.pid_t = @intCast(rc);
+    var status: i32 = 0;
+    defer _ = linux.waitpid(pid, &status, 0);
+    var info: linux.siginfo_t = undefined;
+    var waited: usize = undefined;
+    while (true) {
+        waited = linux.waitid(.PID, pid, &info, linux.W.EXITED | linux.W.NOWAIT, null);
+        if (linux.errno(waited) != .INTR) break;
+    }
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(waited));
+    notify_children[0] = pid;
+    reapNotifications();
+    try std.testing.expectEqual(@as(linux.pid_t, 0), notify_children[0]);
+    try std.testing.expectEqual(linux.E.CHILD, linux.errno(linux.waitpid(pid, &status, linux.W.NOHANG)));
 }

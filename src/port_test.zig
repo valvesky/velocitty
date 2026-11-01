@@ -6,6 +6,7 @@ const CircBuffer = @import("circbuffer.zig").CircBuffer;
 test {
     _ = @import("main.zig");
     _ = @import("circbuffer.zig");
+    _ = @import("firehose_test.zig");
 }
 
 test "Peak PTY spawns, resizes, drains output and reports child exit" {
@@ -20,7 +21,7 @@ test "Peak PTY spawns, resizes, drains output and reports child exit" {
     defer buffer.destroy();
     var eof = false;
     for (0..1000) |_| {
-        buffer.readSource(Platform.PtySource{ .pty = &pty }, 200, null) catch {
+        buffer.readSource(Platform.PtySource{ .pty = &pty }, 200, null, null) catch {
             eof = true;
             break;
         };

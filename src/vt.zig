@@ -10,17 +10,60 @@ const Esc = @import("esc.zig");
 const Osc = @import("osc.zig");
 const Dcs = @import("dcs.zig");
 const C0 = @import("c0.zig");
-const C1 = @import("c1.zig");
-const EastAsian = @import("type/eastasian.zig");
-const Run = @import("circbuffer.zig").Run;
+const Grapheme = @import("type/grapheme.zig");
+const Ring = @import("circbuffer.zig");
+const Run = Ring.Run;
+const SIMD = @import("simd.zig");
+const assert = std.debug.assert;
 
 pub const Color = GridMod.Color;
 pub const Scheme = GridMod.Scheme;
 pub const Attrs = GridMod.Attrs;
 pub const Cell = GridMod.Cell;
+pub const Style = GridMod.Style;
+pub const StyleId = GridMod.StyleId;
+pub const Styles = GridMod.Styles;
 pub const Cursor = GridMod.Cursor;
 pub const Grid = GridMod.Grid;
+pub const Clusters = GridMod.Clusters;
+pub const cluster_base = GridMod.cluster_base;
 const Sixel = @import("sixel.zig");
+
+/// The cell the last printed character started, while only printing (and
+/// SGR) happened since: a code point that continues its grapheme cluster
+/// (mode 2027: no UAX #29 break; else any zero-width code point) joins
+/// that cell instead of taking one. Any control, escape other than SGR,
+/// cursor move or scroll ends it (`VtState.joinable` also checks that the
+/// cursor is still where the print left it). Kept apart from the cells so
+/// ghost text (which writes none) tracks it the same way.
+pub const Join = struct {
+    ok: bool = false,
+    which: u1 = 0,
+    /// The cluster's cell.
+    row: u16 = 0,
+    col: u16 = 0,
+    /// The cursor right after the cluster (the join holds while it stays).
+    cur_col: u16 = 0,
+    pending: bool = false,
+    wide: bool = false,
+    /// Code points in the cluster, at most `Clusters.max_len`.
+    len: u8 = 1,
+    /// The cluster's first code point (printing sets only this, so a
+    /// print costs a few stores; the rest is derived when something joins).
+    base: u21 = ' ',
+    /// With `len` > 1: the last code point's properties and the UAX #29
+    /// state of the text ending with it (`lastProps`/`breakState`).
+    last: Grapheme.Props = .{ .width = 1, .class = .other, .vs_base = false },
+    state: Grapheme.State = .{},
+
+    pub inline fn lastProps(j: *const Join) Grapheme.Props {
+        return if (j.len == 1) Grapheme.props(j.base) else j.last;
+    }
+
+    pub inline fn breakState(j: *const Join) Grapheme.State {
+        return if (j.len == 1) Grapheme.State.start(Grapheme.props(j.base).class) else j.state;
+    }
+};
 
 pub const Mouse = enum {
     off,
@@ -81,6 +124,8 @@ pub const VtState = struct {
     cols: u16,
     rows: u16,
     grids: [2]Grid,
+    /// Interned cell styles of both grids (heap: the grids point at it).
+    styles: *Styles,
     which: u1 = 0,
     flags: Flags = .{},
     cursor_style: CursorStyle = .block,
@@ -93,7 +138,14 @@ pub const VtState = struct {
     gl: u2 = 0,
     ss: u2 = 0,
     ss_active: bool = false,
+    /// REP's character: the last code point that started a cell (Ghostty's
+    /// `previous_char`; code points that joined a cluster do not count).
     last_cp: u21 = ' ',
+    join: Join = .{},
+    /// Feeding dead text (`Run.Flags.ghost`): the cursor moves, cells are
+    /// not written. Wraps, insert mode and charsets still take the writing
+    /// path; what they write is never seen.
+    ghost: bool = false,
     saved_mode: [32]u32 = @splat(0),
     saved_mode_val: [32]u8 = @splat(0),
     line_dirty: []u64,
@@ -148,9 +200,11 @@ pub const VtState = struct {
     reply: std.ArrayListUnmanaged(u8) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, cols: u16, rows: u16, scrollback: u32, storage: []u8) !VtState {
-        var primary = try Grid.init(allocator, cols, rows, scrollback);
+        const styles = try Styles.create(allocator);
+        errdefer styles.destroy();
+        var primary = try Grid.init(allocator, cols, rows, scrollback, styles, 0);
         errdefer primary.deinit(allocator);
-        var alt = try Grid.init(allocator, cols, rows, rows);
+        var alt = try Grid.init(allocator, cols, rows, rows, styles, 1);
         errdefer alt.deinit(allocator);
         const dirty_len = (rows + 63) / 64;
         const line_dirty = try allocator.alloc(u64, dirty_len);
@@ -165,6 +219,7 @@ pub const VtState = struct {
             .cols = cols,
             .rows = rows,
             .grids = .{ primary, alt },
+            .styles = styles,
             .line_dirty = line_dirty,
             .tabs = tabs,
             .kitty = Kitty.Store.init(allocator),
@@ -186,6 +241,7 @@ pub const VtState = struct {
         self.title_stack.deinit(self.allocator);
         self.grids[0].deinit(self.allocator);
         self.grids[1].deinit(self.allocator);
+        self.styles.destroy();
         self.allocator.free(self.line_dirty);
         self.allocator.free(self.tabs);
         self.kitty.deinit();
@@ -204,6 +260,8 @@ pub const VtState = struct {
         self.gl = 0;
         self.ss_active = false;
         self.last_cp = ' ';
+        self.join.ok = false;
+        self.shell_mark = 0;
         self.saved_mode = @splat(0);
         self.saved_mode_val = @splat(0);
         self.ul_set = false;
@@ -246,8 +304,18 @@ pub const VtState = struct {
         self.scheme = next;
         self.orig = next;
         self.initTable();
-        remapGrid(&self.grids[0], prev, next);
-        remapGrid(&self.grids[1], prev, next);
+        const Remap = struct {
+            prev: Scheme,
+            next: Scheme,
+            fn apply(ctx: *const @This(), st: *Style) void {
+                st.fg = remapColor(st.fg, ctx.prev, ctx.next);
+                st.bg = remapColor(st.bg, ctx.prev, ctx.next);
+            }
+        };
+        const remap: Remap = .{ .prev = prev, .next = next };
+        self.styles.recolor(&remap, Remap.apply);
+        remapPen(&self.grids[0], prev, next);
+        remapPen(&self.grids[1], prev, next);
         self.dark_theme = @as(u16, next.bg.r) + next.bg.g + next.bg.b < 384;
         if (self.flags.report_theme) {
             self.respond(if (self.dark_theme) "\x1b[?997;1n" else "\x1b[?997;2n");
@@ -259,14 +327,19 @@ pub const VtState = struct {
     /// explicitly selected colors even when their RGB happens to match.
     pub fn setDefaultColor(self: *VtState, fg: bool, c: Color) void {
         if (fg) self.scheme.fg = c else self.scheme.bg = c;
-        for (&self.grids) |*g| {
-            for (g.cells) |*slot| {
-                if (fg) {
-                    if (!slot.attrs.fg_explicit) slot.fg = c;
+        const Set = struct {
+            fg: bool,
+            c: Color,
+            fn apply(ctx: @This(), st: *Style) void {
+                if (ctx.fg) {
+                    if (!st.attrs.fg_explicit) st.fg = ctx.c;
                 } else {
-                    if (!slot.attrs.bg_explicit) slot.bg = c;
+                    if (!st.attrs.bg_explicit) st.bg = ctx.c;
                 }
             }
+        };
+        self.styles.recolor(Set{ .fg = fg, .c = c }, Set.apply);
+        for (&self.grids) |*g| {
             if (fg) {
                 if (!g.attrs.fg_explicit) g.fg = c;
                 if (!g.saved_attrs.fg_explicit) g.saved_fg = c;
@@ -279,36 +352,517 @@ pub const VtState = struct {
     }
 
     pub fn feedRuns(self: *VtState, runs: []const Run) void {
-        for (runs) |run| {
-            const slice = self.storage[run.off .. run.off + run.len];
+        self.feedFrom(runs, &.{});
+    }
+
+    /// Runs with `stream` set are backed by `stream` instead of the ring.
+    pub fn feedFrom(self: *VtState, runs: []const Run, stream: []const u8) void {
+        _ = self.feedOwned(runs, stream, null);
+    }
+
+    /// `feedFrom` for a drain: `owner` is the ring whose stream buffer backs
+    /// the runs, so a kitty image whose payload is the last string in it can
+    /// keep the buffer instead of copying out of it.
+    pub fn feedOwned(self: *VtState, runs: []const Run, stream: []const u8, owner: ?*Ring.CircBuffer) usize {
+        defer self.ghost = false;
+        // The drain's scanner parsed every CSI: its k-th result is the k-th
+        // CSI run's (`owner.preparser.csis`). Without it, parse here.
+        const parsed: ?*const @import("preparser.zig").Preparser = if (owner) |o| (if (o.preparser.csi_ok) &o.preparser else null) else null;
+        var next_csi: usize = 0;
+        // An obsolete prefix can reframe its live frontier against newer
+        // lookahead; otherwise consume enough to satisfy reader progress.
+        var obsolete_prefix = false;
+        for (runs, 0..) |run, run_index| {
+            const src = if (run.flags.stream) stream else self.storage;
+            const slice = src[run.off .. run.off + run.len];
+            self.ghost = if (owner) |o| o.preparser.isSpanObsolete(run_index) else run.flags.ghost;
+            if (owner) |o| {
+                if (o.retain_live) {
+                    if (!self.ghost and (run.kind == .text or run.role == .lf) and
+                        (obsolete_prefix or o.canPauseBefore(run))) return run_index;
+                    obsolete_prefix = obsolete_prefix or self.ghost;
+                }
+            }
+            // Only text and SGR keep a grapheme cluster open.
+            if (run.kind != .text and run.kind != .csi) self.join.ok = false;
             switch (run.kind) {
-                .plain => self.printPlain(slice),
-                .utf8 => {
-                    var view = std.unicode.Utf8View.init(slice) catch continue;
-                    var iter = view.iterator();
-                    while (iter.nextCodepoint()) |cp| {
-                        self.printCodepoint(cp);
-                    }
-                },
+                .text => if (!self.ghost or !self.skipDeadLine(slice)) self.feedTextFrom(slice, run.flags.plain),
                 .c0 => {
                     if (slice.len > 0) C0.dispatch(self, slice[0]);
                 },
-                .c1 => {
-                    if (slice.len > 0) C1.dispatch(self, slice[0]);
-                },
                 .esc => Esc.dispatch(self, slice),
                 .csi => {
-                    var params: [16]CsiSeq.Param = undefined;
-                    CsiSeq.parse(slice, &params).apply(self);
+                    var bufs: CsiSeq.Bufs = undefined;
+                    const seq = if (parsed) |o| blk: {
+                        next_csi += 1;
+                        break :blk CsiSeq.of(o.csiAt(next_csi - 1));
+                    } else CsiSeq.parse(slice, &bufs);
+                    if (seq.final == 'm' and seq.private == 0) {
+                        // The common case straight to SGR.
+                        CsiSeq.sgr(seq.params, seq.subs, self);
+                    } else {
+                        self.join.ok = false;
+                        seq.apply(self);
+                    }
                 },
                 .osc => Osc.dispatch(self, slice),
                 .str => {
-                    if (Kitty.isPrefix(slice)) self.feedKitty(slice) else Dcs.dispatch(self, slice);
+                    if (Kitty.isPrefix(slice)) {
+                        const donor: ?Kitty.Donor = if (run.flags.stream and owner != null)
+                            .{ .ctx = owner.?, .off = run.off, .len = run.len, .take = takeStream }
+                        else
+                            null;
+                        self.feedKitty(slice, true, donor);
+                    } else Dcs.dispatch(self, slice);
                 },
-                .esc_kitty => self.feedKitty(slice),
-                .esc_sixel => Dcs.dispatch(self, slice),
             }
         }
+        if (parsed) |o| assert(next_csi == o.csis.items.len);
+        return runs.len;
+    }
+
+    /// Dead text ending in CR whose wraps cannot move the cursor's row (it
+    /// is on the bottom row of a full-screen region, where a dead LF does
+    /// not scroll, or autowrap is off): its only effect is column 0 and the
+    /// last character for REP. Returns false when it must be fed.
+    fn skipDeadLine(self: *VtState, bytes: []const u8) bool {
+        var end = bytes.len;
+        while (end > 0 and bytes[end - 1] == '\r') end -= 1;
+        if (end == bytes.len) return false;
+        const body = bytes[0..end];
+        // HT, BS and the other C0 controls take the full path (DEL is a
+        // no-op, unless it is the last byte and REP's character is wanted).
+        if (SIMD.skipToLowerThan(body, 0x20) != body.len) return false;
+        const set = switch (self.gl) {
+            0 => self.g0,
+            1 => self.g1,
+            2 => self.g2,
+            3 => self.g3,
+        };
+        if (self.ss_active or set == .dec_special or self.flags.grapheme_shaping) return false;
+        const g = self.grid();
+        const bottom = g.scroll_top == 0 and g.scroll_bottom + 1 == self.rows and g.cursor.row + 1 == self.rows;
+        // A wrap must scroll for real when placements have to move.
+        if (self.flags.auto_wrap and (!bottom or self.kitty.placements.items.len != 0)) return false;
+        // REP's character is the last one the line prints. Malformed UTF-8
+        // can swallow the bytes after it, so non-ASCII lines are decoded
+        // (as printing would) rather than read from the end.
+        var last = self.last_cp;
+        var buf: [256]u32 = undefined;
+        var i: usize = 0;
+        while (i < body.len) {
+            if (body[i] < 0x80) {
+                // Printable ASCII and DEL (a no-op).
+                const n = SIMD.skipToGreaterThan(body[i..], 0x7F);
+                var j = i + n;
+                while (j > i and body[j - 1] == 0x7F) j -= 1;
+                if (j > i) last = body[j - 1];
+                i += n;
+                continue;
+            }
+            // Decode up to the real end: a malformed sequence before the CR
+            // can swallow it, and then the line does not end at column 0.
+            const r = SIMD.decodeUtf8Run(.printable, bytes[i..], &buf);
+            // Zero-width code points join a cell (or are dropped): not REP's.
+            var k = r.written;
+            while (k > 0) : (k -= 1) {
+                const cp: u21 = @intCast(buf[k - 1]);
+                if (Grapheme.props(cp).width != 0) {
+                    last = cp;
+                    break;
+                }
+            }
+            i += @max(r.read, 1);
+            if (i > end) return false;
+        }
+        g.cursor.col = 0;
+        g.wrap_pending = false;
+        self.last_cp = last;
+        self.join.ok = false;
+        return true;
+    }
+
+    /// Decode one UTF-8 sequence whose length came from its lead byte.
+    /// Rejects bad continuation bytes, overlongs, surrogates and > U+10FFFF.
+    const decodeUtf8 = SIMD.decodeUtf8Seq;
+
+    /// Printable ASCII and space (0x20..0x7E) in bulk; other C0 and DEL through C0;
+    /// UTF-8 from its first non-ASCII byte through `printUtf8` (which also
+    /// takes the printable ASCII mixed into it); stray 0x80..0xBF/0xF8.. are
+    /// ignored (raw 8-bit C1 controls are not recognized in UTF-8 text).
+    pub fn feedText(self: *VtState, bytes: []const u8) void {
+        self.feedTextAt(bytes, 0, false);
+    }
+
+    /// `feedText` of a scanned run whose first `plain` bytes are printable
+    /// ASCII (`Run.Flags.plain`): those print without a second scan, and
+    /// below `Run.max_plain` the byte after them is known not to be.
+    inline fn feedTextFrom(self: *VtState, bytes: []const u8, plain: u9) void {
+        if (plain != 0) self.printPlain(bytes[0..plain]);
+        // A zero prefix also occurs in manually constructed, unscanned runs.
+        self.feedTextAt(bytes, plain, plain != 0 and plain != Run.max_plain);
+    }
+
+    /// `feedText` from `start`; `known`: `bytes[start]` is not printable ASCII.
+    fn feedTextAt(self: *VtState, bytes: []const u8, start: usize, known: bool) void {
+        var i: usize = start;
+        var skip = known;
+        while (i < bytes.len) {
+            if (!skip) {
+                const n = SIMD.skipOutRange(bytes[i..], 0x20, 0x7E);
+                if (n != 0) self.printPlain(bytes[i..][0..n]);
+                i += n;
+                if (i >= bytes.len) break;
+            }
+            skip = false;
+            const c = bytes[i];
+            if (c < 0x80) {
+                C0.dispatch(self, c);
+                i += 1;
+                continue;
+            }
+            i = self.printUtf8(bytes, i);
+        }
+    }
+
+    /// Print the run of text at `bytes[start]` (a byte >= 0x80); returns
+    /// where it ends. The run is decoded in chunks (`SIMD.decodeUtf8Run`),
+    /// then each chunk is printed in a tight loop. With the ASCII charset
+    /// the run takes printable ASCII too (as `printPlain` would print it)
+    /// and ends at C0/DEL; otherwise it ends at any ASCII byte. Within the
+    /// run the pen cannot change, so cells are written straight into the
+    /// row with one template; wraps, wide characters at the margin, insert
+    /// mode and single shifts take `printCodepoint`.
+    // Not inlined into `feedOwned`: its own frame keeps more of the loop in registers.
+    noinline fn printUtf8(self: *VtState, bytes: []const u8, start: usize) usize {
+        var buf: [256]u32 = undefined;
+        if (self.flags.insert_mode or self.ss_active) {
+            var i = start;
+            while (true) {
+                const r = SIMD.decodeUtf8Run(.non_ascii, bytes[i..], &buf);
+                i += r.read;
+                for (buf[0..r.written]) |v| self.printCodepoint(@intCast(v));
+                if (r.done) return i;
+            }
+        }
+        const set = switch (self.gl) {
+            0 => self.g0,
+            1 => self.g1,
+            2 => self.g2,
+            3 => self.g3,
+        };
+        const shaping = self.flags.grapheme_shaping;
+        if (set == .dec_special) {
+            if (shaping) return if (self.ghost) self.printUtf8Fast(.non_ascii, false, true, bytes, start, &buf) else self.printUtf8Fast(.non_ascii, true, true, bytes, start, &buf);
+            return if (self.ghost) self.printUtf8Fast(.non_ascii, false, false, bytes, start, &buf) else self.printUtf8Fast(.non_ascii, true, false, bytes, start, &buf);
+        }
+        if (shaping) return if (self.ghost) self.printUtf8Fast(.printable, false, true, bytes, start, &buf) else self.printUtf8Fast(.printable, true, true, bytes, start, &buf);
+        return if (self.ghost) self.printUtf8Fast(.printable, false, false, bytes, start, &buf) else self.printUtf8Fast(.printable, true, false, bytes, start, &buf);
+    }
+
+    /// `printUtf8` without insert mode or a single shift. `paint` false
+    /// (ghost text) only moves the cursor. `.printable` needs the ASCII
+    /// charset: printable ASCII is then width 1 and printed as itself.
+    /// Each code point costs one `Grapheme.props` lookup (width and break
+    /// class). Code points that may continue a cluster leave the loop:
+    /// without `shaping` (mode 2027) a run of zero-width ones joins the
+    /// cell just printed in one go (`joinMarks`); with it, anything that
+    /// does not break from the previous code point in every UAX #29 state
+    /// takes `printCodepoint`. The `join` state is written back only
+    /// before those calls and on return.
+    inline fn printUtf8Fast(self: *VtState, comptime mode: SIMD.Utf8Mode, comptime paint: bool, comptime shaping: bool, bytes: []const u8, start: usize, buf: *[256]u32) usize {
+        var i = start;
+        const cols = self.cols;
+        var g = self.grid();
+        var row_cells: [*]u64 = @ptrCast(g.cellPtr(g.cursor.row, 0));
+        // The template id is fetched again after `printCodepoint`, which
+        // may intern a new (erase) style and so compact the table. Ghost
+        // text writes no cells and interns nothing here.
+        var bits: u64 = if (paint) @bitCast(Cell{ .codepoint = 0, .style = self.penId() }) else 0;
+        // The cursor column lives in a local for the loop (cell stores
+        // through `row_cells` could alias `self`) and is written back
+        // before any call and on return. The fast path never reaches the
+        // last column: a character that would (or a pending wrap: `limit`
+        // 0) takes `printCodepoint`, so `wrap_pending` stays false here
+        // and is never written.
+        var col = g.cursor.col;
+        var limit: u16 = if (g.wrap_pending) 0 else cols;
+        // Column at the last sync: cells `[seg, col)` are new since then,
+        // printed from this chunk, and when there are any the code point
+        // before the current one is the open cluster's base and REP's
+        // character (`last_cp`). Each chunk ends synced, so the loop keeps
+        // nothing else.
+        var seg = col;
+        // Break class before the next code point (shaping only): what
+        // `alwaysBreaks` checks against.
+        var prev: Grapheme.Class = if (shaping and self.joinable()) self.join.lastProps().class else .control;
+        while (true) {
+            const r = SIMD.decodeUtf8Run(mode, bytes[i..], buf);
+            i += r.read;
+            const n = r.written;
+            var k: usize = 0;
+            chunk: while (k < n) {
+                for (buf[k..n], k..) |cp, at| {
+                    const v: u21 = @intCast(cp);
+                    const p = Grapheme.props(v);
+                    const w: u16 = p.width;
+                    const joins = if (shaping) w == 0 or !Grapheme.alwaysBreaks(prev, p.class) else w == 0;
+                    if (!joins and col + w < limit) {
+                        if (paint) {
+                            row_cells[col] = bits | v;
+                            if (w == 2) row_cells[col + 1] = bits;
+                        }
+                        col += w;
+                        if (shaping) prev = p.class;
+                        continue;
+                    }
+                    g.cursor.col = col;
+                    if (col > seg) {
+                        self.syncPrinted(col, @intCast(buf[at - 1]), paint);
+                        seg = col;
+                    }
+                    if (!shaping and w == 0) {
+                        // Interning a cluster neither moves the cursor nor
+                        // changes style ids: the locals stay valid.
+                        var e = at + 1;
+                        while (e < n and Grapheme.props(@intCast(buf[e])).width == 0) e += 1;
+                        self.joinMarks(buf[at..e]);
+                        k = e;
+                        continue :chunk;
+                    }
+                    self.printCodepoint(v);
+                    g = self.grid();
+                    row_cells = @ptrCast(g.cellPtr(g.cursor.row, 0));
+                    if (paint) bits = @bitCast(Cell{ .codepoint = 0, .style = self.penId() });
+                    col = g.cursor.col;
+                    limit = if (g.wrap_pending) 0 else cols;
+                    seg = col;
+                    if (shaping) prev = if (self.joinable()) self.join.lastProps().class else .control;
+                    k = at + 1;
+                    continue :chunk;
+                }
+                break;
+            }
+            if (col > seg) {
+                g.cursor.col = col;
+                self.syncPrinted(col, @intCast(buf[n - 1]), paint);
+                seg = col;
+            }
+            if (r.done) break;
+        }
+        return i;
+    }
+
+    /// The fast loop printed up to `col`, ending with `cp`: REP's
+    /// character, the open cluster, the written extent and dirty row.
+    inline fn syncPrinted(self: *VtState, col: u16, cp: u21, comptime paint: bool) void {
+        self.last_cp = cp;
+        self.joinLast(col, cp);
+        if (paint) self.flushRow(col);
+    }
+
+    /// The fast loop's last character `cp` ended at `col` (no pending wrap).
+    inline fn joinLast(self: *VtState, col: u16, cp: u21) void {
+        const w = Grapheme.props(cp).width;
+        self.startJoin(self.grid().cursor.row, col - w, col, false, w == 2, cp);
+    }
+
+    /// Start a cluster at `col` of `row` (the cursor is then at `cur_col`).
+    inline fn startJoin(self: *VtState, row: u16, col: u16, cur_col: u16, pending: bool, wide: bool, cp: u21) void {
+        self.join = .{
+            .ok = true,
+            .which = self.which,
+            .row = row,
+            .col = col,
+            .cur_col = cur_col,
+            .pending = pending,
+            .wide = wide,
+            .len = 1,
+            .base = cp,
+        };
+    }
+
+    /// The last printed cluster is still open: the cursor is where its
+    /// print left it and nothing but text and SGR came since.
+    pub inline fn joinable(self: *const VtState) bool {
+        const j = &self.join;
+        const g = self.gridConst();
+        return j.ok and j.which == self.which and g.cursor.row == j.row and g.cursor.col == j.cur_col and g.wrap_pending == j.pending;
+    }
+
+    /// Mode 2027 off: zero-width code points join the open cluster as they
+    /// come (VS15/VS16 only after an emoji base, as Ghostty); with none
+    /// open, or past `Clusters.max_len`, they are dropped. One intern for
+    /// the whole run.
+    fn joinMarks(self: *VtState, marks: []const u32) void {
+        if (!self.joinable()) return;
+        const j = &self.join;
+        const g = self.grid();
+        const slot = &g.cellPtr(j.row, j.col)[0];
+        var buf: [Clusters.max_len]u32 = undefined;
+        var n: usize = 0;
+        if (!self.ghost) {
+            var one: u32 = undefined;
+            const cur = self.styles.text(slot.*, &one);
+            n = @min(cur.len, buf.len);
+            @memcpy(buf[0..n], cur[0..n]);
+        }
+        const len0 = j.len;
+        var kept: u21 = 0;
+        for (marks) |m| {
+            const cp: u21 = @intCast(m);
+            if ((cp == 0xFE0E or cp == 0xFE0F) and Grapheme.props(j.base).class != .ext_pict) continue;
+            if (j.len >= Clusters.max_len) break;
+            j.len += 1;
+            kept = cp;
+            if (!self.ghost and n < buf.len) {
+                buf[n] = m;
+                n += 1;
+            }
+        }
+        if (j.len == len0) return;
+        // Without 2027 nothing reads the break state, and switching 2027
+        // (a CSI) ends the cluster; keep `last`/`state` defined anyway.
+        j.last = Grapheme.props(kept);
+        j.state = .{};
+        if (self.ghost) return;
+        slot.codepoint = self.styles.internCluster(buf[0..n]);
+        g.noteWrite(j.row, j.col + 1);
+        self.markDirty(j.row);
+    }
+
+    /// Mode 2027 on: `cp` continues the open cluster (no UAX #29 break).
+    /// Its width effect (`Grapheme.effect`) widens or narrows the cell as
+    /// Ghostty does: a narrow cluster at the last column that turns wide
+    /// moves to the next line (autowrap) or drops `cp` (no autowrap).
+    fn joinShaped(self: *VtState, cp: u21, p: Grapheme.Props) void {
+        const j = &self.join;
+        const eff = Grapheme.effect(j.lastProps(), cp, p);
+        if (eff == .ignore) return;
+        const widen = eff == .wide and !j.wide;
+        if (widen and j.col + 1 >= self.cols and (!self.flags.auto_wrap or self.cols < 2)) return;
+        // Set before `len` grows past 1, which makes them the ones read.
+        j.state = j.breakState().advance(p.class);
+        j.last = p;
+        if (j.len >= Clusters.max_len) return;
+        j.len += 1;
+        if (widen) {
+            self.widenJoin();
+        } else if (eff == .narrow and j.wide) {
+            self.narrowJoin();
+        }
+        if (self.ghost) return;
+        const g = self.grid();
+        const slot = &g.cellPtr(j.row, j.col)[0];
+        var buf: [Clusters.max_len]u32 = undefined;
+        var one: u32 = undefined;
+        const cur = self.styles.text(slot.*, &one);
+        const n: usize = @min(cur.len, buf.len - 1);
+        @memcpy(buf[0..n], cur[0..n]);
+        buf[n] = cp;
+        slot.codepoint = self.styles.internCluster(buf[0 .. n + 1]);
+        g.noteWrite(j.row, j.col + 1);
+        self.markDirty(j.row);
+    }
+
+    /// The open cluster becomes two cells wide.
+    fn widenJoin(self: *VtState) void {
+        const j = &self.join;
+        var g = self.grid();
+        if (j.col + 1 >= self.cols) {
+            // No room: blank its cell and print it again on the next line.
+            if (!self.ghost) {
+                const id = self.penId();
+                const slot = &g.cellPtr(j.row, j.col)[0];
+                const moved = slot.*;
+                slot.* = .{ .codepoint = ' ', .style = id };
+                g.cursor.col = j.col;
+                g.wrap_pending = false;
+                self.doWrap();
+                g = self.grid();
+                const row = g.cellPtr(g.cursor.row, 0);
+                row[0] = moved;
+                row[1] = .{ .codepoint = 0, .style = moved.style };
+                g.noteWrite(g.cursor.row, 2);
+                self.markDirty(g.cursor.row);
+            } else {
+                g.cursor.col = j.col;
+                g.wrap_pending = false;
+                self.doWrap();
+                g = self.grid();
+            }
+            j.row = g.cursor.row;
+            j.col = 0;
+        } else if (!self.ghost) {
+            const row = g.cellPtr(j.row, 0);
+            row[j.col + 1] = .{ .codepoint = 0, .style = row[j.col].style };
+            g.noteWrite(j.row, j.col + 2);
+            self.markDirty(j.row);
+        }
+        const end = j.col + 2;
+        if (end >= self.cols) {
+            g.cursor.col = self.cols - 1;
+            g.wrap_pending = self.flags.auto_wrap;
+        } else {
+            g.cursor.col = end;
+            g.wrap_pending = false;
+        }
+        j.ok = true;
+        j.wide = true;
+        j.cur_col = g.cursor.col;
+        j.pending = g.wrap_pending;
+    }
+
+    /// The open cluster becomes one cell wide; its second cell turns blank.
+    fn narrowJoin(self: *VtState) void {
+        const j = &self.join;
+        const g = self.grid();
+        if (!self.ghost and j.col + 1 < self.cols) {
+            const row = g.cellPtr(j.row, 0);
+            row[j.col + 1] = .{ .codepoint = ' ', .style = row[j.col].style };
+            self.markDirty(j.row);
+        }
+        g.cursor.col = @min(j.col + 1, self.cols - 1);
+        g.wrap_pending = false;
+        j.wide = false;
+        j.cur_col = g.cursor.col;
+        j.pending = false;
+    }
+
+    /// Record cells `[0, end)` of the cursor row as written and dirty.
+    inline fn flushRow(self: *VtState, end: u16) void {
+        if (end == 0) return;
+        const g = self.grid();
+        g.noteWrite(g.cursor.row, end);
+        self.markDirty(g.cursor.row);
+    }
+
+    /// The drain target for `CircBuffer.drain` / `readSource`.
+    pub fn sink(self: *VtState) Ring.Sink {
+        return .{ .ctx = self, .feed = sinkFeed, .view = sinkView };
+    }
+
+    fn sinkFeed(ctx: *anyopaque, runs: []const Run, stream: []const u8, owner: *Ring.CircBuffer) usize {
+        const self: *VtState = @ptrCast(@alignCast(ctx));
+        return self.feedOwned(runs, stream, owner);
+    }
+
+    fn takeStream(ctx: *anyopaque, off: usize, len: usize, allocator: std.mem.Allocator) ?[]u8 {
+        const cb: *Ring.CircBuffer = @ptrCast(@alignCast(ctx));
+        return cb.takeStream(allocator, off, len);
+    }
+
+    fn sinkView(ctx: *anyopaque) Ring.View {
+        const self: *const VtState = @ptrCast(@alignCast(ctx));
+        var full: [2]bool = undefined;
+        for (&self.grids, 0..) |*g, i| full[i] = g.scroll_top == 0 and g.scroll_bottom + 1 == self.rows;
+        return .{
+            .rows = self.rows,
+            .alt = self.which == 1,
+            .full_region = full,
+            .origin = self.flags.origin_mode,
+            .reverse_wrap = self.flags.reverse_wrap,
+        };
     }
 
     pub inline fn grid(self: *VtState) *Grid {
@@ -367,12 +921,56 @@ pub const VtState = struct {
         return self.gridConst().scroll;
     }
 
+    /// Decode the images about to be drawn; they stay encoded until then.
+    pub fn prepareImages(self: *VtState) void {
+        self.kitty.setCellSize(self.cell_px_w, self.cell_px_h);
+        self.kitty.decodeVisible(self.which, self.imageBase(), self.rows, self.cell_px_h);
+    }
+
+    /// Absolute line shown on view row 0 (image placements use these lines).
+    pub fn imageBase(self: *const VtState) i64 {
+        const g = self.gridConst();
+        return @as(i64, @intCast(g.base)) - g.scroll;
+    }
+
+    /// Oldest absolute line still held by the current grid.
+    fn oldestLine(self: *const VtState) i64 {
+        const g = self.gridConst();
+        return @as(i64, @intCast(g.base)) - (g.used -| self.rows);
+    }
+
+    fn imageCursor(self: *VtState) Kitty.Cursor {
+        const g = self.grid();
+        return .{ .row = g.cursor.row, .col = g.cursor.col, .base = @intCast(g.base), .cell_w = self.cell_px_w, .cell_h = self.cell_px_h };
+    }
+
     pub fn resize(self: *VtState, cols: u16, rows: u16) !void {
         if (cols == 0 or rows == 0) return;
         if (cols == self.cols and rows == self.rows) return;
+        self.join.ok = false;
         const old_cols = self.cols;
         const old_rows = self.rows;
-        try (&self.grids[0]).resize(self.allocator, old_cols, old_rows, cols, rows, self.grids[0].cap, true);
+        var anchors: [Kitty.max_placements + 1]Grid.Anchor = undefined;
+        var indices: [Kitty.max_placements]usize = undefined;
+        var n: usize = 0;
+        for (self.kitty.placements.items, 0..) |p, placement_index| {
+            if (p.screen != 0) continue;
+            anchors[n] = .{ .row = p.row, .col = p.col };
+            indices[n] = placement_index;
+            n += 1;
+        }
+        const keep_view = self.grids[0].scroll != 0;
+        if (keep_view) anchors[n] = .{ .row = @as(i64, @intCast(self.grids[0].base)) - self.grids[0].scroll, .col = 0 };
+        try (&self.grids[0]).resizeAnchored(self.allocator, old_cols, old_rows, cols, rows, self.grids[0].cap, true, anchors[0 .. n + @intFromBool(keep_view)]);
+        if (keep_view) {
+            const offset = @as(i64, @intCast(self.grids[0].base)) - anchors[n].row;
+            self.grids[0].scroll = @intCast(@min(@as(i64, self.grids[0].used -| @as(u32, rows)), @max(0, offset)));
+        }
+        for (anchors[0..n], indices[0..n]) |anchor, placement_index| {
+            self.kitty.placements.items[placement_index].row = anchor.row;
+            self.kitty.placements.items[placement_index].col = anchor.col;
+        }
+        self.kitty.placementsChanged(self.cell_px_w, self.cell_px_h);
         try (&self.grids[1]).resize(self.allocator, old_cols, old_rows, cols, rows, rows, false);
 
         const dirty_len = (rows + 63) / 64;
@@ -429,10 +1027,31 @@ pub const VtState = struct {
         self.index();
     }
 
+    /// Print one code point: it joins the open cluster (`Join`) or starts
+    /// a cell. Mode 2027 off: zero-width code points join (`joinMarks`),
+    /// everything else takes its own width. Mode 2027 on: a code point
+    /// joins when UAX #29 has no break before it (`joinShaped`); a
+    /// zero-width one that breaks is dropped (as Ghostty does).
     pub fn printCodepoint(self: *VtState, cp: u21) void {
         const mapped = self.mapCp(cp);
-        if (self.flags.grapheme_shaping and EastAsian.isCombining(mapped)) return;
-        var width: u16 = @max(1, EastAsian.cellWidth(mapped));
+        const p = Grapheme.props(mapped);
+        if (self.flags.grapheme_shaping) {
+            if (self.joinable() and !Grapheme.breaks(self.join.breakState(), self.join.lastProps().class, p.class)) {
+                self.joinShaped(mapped, p);
+                return;
+            }
+            if (p.width == 0) return;
+        } else if (p.width == 0) {
+            const one = [1]u32{mapped};
+            self.joinMarks(&one);
+            return;
+        }
+        self.printCell(mapped, p);
+    }
+
+    /// `mapped` (width >= 1) in a new cell at the cursor.
+    fn printCell(self: *VtState, mapped: u21, p: Grapheme.Props) void {
+        var width: u16 = p.width;
         var g = self.grid();
 
         if (g.wrap_pending) {
@@ -465,26 +1084,16 @@ pub const VtState = struct {
         g = self.grid();
         if (g.cursor.col >= self.cols) g.cursor.col = self.cols - 1;
 
-        const attrs = self.paintAttrs();
-        const ul = self.penUl();
-        const slot = g.getCell(g.cursor.row, g.cursor.col);
-        slot.* = .{
-            .codepoint = mapped,
-            .attrs = attrs,
-            .fg = g.fg,
-            .bg = g.bg,
-            .ul = ul,
-        };
+        // After `ich`: an id fetched before it could be compacted away.
+        const id = self.penId();
+        const slot = &g.cellPtr(g.cursor.row, g.cursor.col)[0];
+        g.noteWrite(g.cursor.row, @min(g.cursor.col + width, self.cols));
+        slot.* = .{ .codepoint = mapped, .style = id };
         if (width == 2 and g.cursor.col + 1 < self.cols) {
-            g.getCell(g.cursor.row, g.cursor.col + 1).* = .{
-                .codepoint = 0,
-                .attrs = attrs,
-                .fg = g.fg,
-                .bg = g.bg,
-                .ul = ul,
-            };
+            g.cellPtr(g.cursor.row, g.cursor.col + 1)[0] = .{ .codepoint = 0, .style = id };
         }
         self.markDirty(g.cursor.row);
+        const at = g.cursor.col;
         g.cursor.col += width;
         if (g.cursor.col >= self.cols) {
             g.cursor.col = self.cols - 1;
@@ -493,9 +1102,10 @@ pub const VtState = struct {
             g.wrap_pending = false;
         }
         self.last_cp = mapped;
+        self.startJoin(g.cursor.row, at, g.cursor.col, g.wrap_pending, width == 2, mapped);
     }
 
-    /// Bulk `printCodepoint` for a `.plain` run (0x21..0x7E: width 1, never
+    /// Bulk `printCodepoint` for printable ASCII and space (0x20..0x7E: width 1, never
     /// combining). Fills the rest of the row at once; wrap, insert mode and
     /// charset mapping take the per-codepoint path.
     pub fn printPlain(self: *VtState, bytes: []const u8) void {
@@ -510,6 +1120,11 @@ pub const VtState = struct {
             return;
         }
         var rest = bytes;
+        // Mode 2027: ASCII only continues a cluster after Prepend (GB9b).
+        if (self.flags.grapheme_shaping and self.joinable() and self.join.lastProps().class == .prepend) {
+            self.printCodepoint(rest[0]);
+            rest = rest[1..];
+        }
         while (rest.len != 0) {
             const g = self.grid();
             if (g.wrap_pending or g.cursor.col >= self.cols) {
@@ -518,13 +1133,14 @@ pub const VtState = struct {
                 continue;
             }
             const n = @min(self.cols - g.cursor.col, rest.len);
-            const template: Cell = .{ .attrs = self.paintAttrs(), .fg = g.fg, .bg = g.bg, .ul = self.penUl() };
-            const cells = @as([*]Cell, @ptrCast(g.getCell(g.cursor.row, g.cursor.col)))[0..n];
-            for (cells, rest[0..n]) |*slot, b| {
-                slot.* = template;
-                slot.codepoint = b;
+            const at = g.cursor.col + @as(u16, @intCast(n)) - 1;
+            if (!self.ghost) {
+                const id = self.penId();
+                const cells = g.cellPtr(g.cursor.row, g.cursor.col)[0..n];
+                g.noteWrite(g.cursor.row, g.cursor.col + @as(u16, @intCast(n)));
+                for (cells, rest[0..n]) |*slot, b| slot.* = .{ .codepoint = b, .style = id };
+                self.markDirty(g.cursor.row);
             }
-            self.markDirty(g.cursor.row);
             g.cursor.col += @intCast(n);
             if (g.cursor.col >= self.cols) {
                 g.cursor.col = self.cols - 1;
@@ -533,6 +1149,7 @@ pub const VtState = struct {
                 g.wrap_pending = false;
             }
             self.last_cp = rest[n - 1];
+            self.startJoin(g.cursor.row, at, g.cursor.col, g.wrap_pending, false, rest[n - 1]);
             rest = rest[n..];
         }
     }
@@ -565,9 +1182,27 @@ pub const VtState = struct {
         return .{ .r = self.ul_color.r, .g = self.ul_color.g, .b = self.ul_color.b };
     }
 
-    pub fn eraseCell(self: *const VtState) Cell {
+    /// The style printed characters get: the pen with the hyperlink and
+    /// underline-color state.
+    pub fn penStyle(self: *const VtState) Style {
         const g = self.gridConst();
-        return .{ .fg = g.fg, .bg = g.bg, .attrs = .{ .fg_explicit = g.attrs.fg_explicit, .bg_explicit = g.attrs.bg_explicit } };
+        return .{ .fg = g.fg, .bg = g.bg, .ul = self.penUl(), .attrs = self.paintAttrs() };
+    }
+
+    /// `penStyle`'s id: a lookup in the table's memo of recent interns unless
+    /// the pen changed. May intern (see `Styles`).
+    pub inline fn penId(self: *const VtState) StyleId {
+        return self.styles.intern(self.penStyle());
+    }
+
+    /// A blank in the erase style (BCE). May intern (see `Styles`).
+    pub fn eraseCell(self: *const VtState) Cell {
+        return .{ .style = self.styles.intern(self.gridConst().blankStyle()) };
+    }
+
+    /// The style a cell refers to.
+    pub inline fn styleOf(self: *const VtState, c: Cell) Style {
+        return self.styles.of(c);
     }
 
     pub fn cup(self: *VtState, row1: u16, col1: u16) void {
@@ -648,28 +1283,6 @@ pub const VtState = struct {
                     break;
                 }
             }
-            if (start < dest) {
-                const attrs = self.paintAttrs();
-                const ul = self.penUl();
-                g.getCell(g.cursor.row, start).* = .{
-                    .codepoint = '\t',
-                    .attrs = attrs,
-                    .fg = g.fg,
-                    .bg = g.bg,
-                    .ul = ul,
-                };
-                var x = start + 1;
-                while (x < dest) : (x += 1) {
-                    g.getCell(g.cursor.row, x).* = .{
-                        .codepoint = ' ',
-                        .attrs = attrs,
-                        .fg = g.fg,
-                        .bg = g.bg,
-                        .ul = ul,
-                    };
-                }
-                self.markDirty(g.cursor.row);
-            }
             g.cursor.col = dest;
         }
     }
@@ -732,6 +1345,10 @@ pub const VtState = struct {
     pub fn index(self: *VtState) void {
         const g = self.grid();
         g.wrap_pending = false;
+        // A dead LF at the bottom of the screen: the drain guarantees that
+        // live LFs scroll everything on screen away, so skip the scroll.
+        // Placements are anchored to lines, so a scroll must still move them.
+        if (self.ghost and g.cursor.row == g.scroll_bottom and g.scroll_top == 0 and g.scroll_bottom + 1 == self.rows and self.kitty.placements.items.len == 0) return;
         if (g.cursor.row == g.scroll_bottom) {
             self.regionScrollUp(1);
         } else if (g.cursor.row + 1 < self.rows) {
@@ -754,49 +1371,67 @@ pub const VtState = struct {
         const blank = self.eraseCell();
         switch (mode) {
             0 => {
-                @memset(g.rowSlice(g.cursor.row, self.cols)[g.cursor.col..], blank);
+                if (g.cursor.row == 0 and g.cursor.col == 0) self.dropScreenImages();
+                GridMod.fillCells(g.rowSlice(g.cursor.row, self.cols)[g.cursor.col..], blank);
+                // An erased line end does not continue on the next row.
+                g.setRowWrap(g.cursor.row, false);
                 self.markDirty(g.cursor.row);
                 var r = g.cursor.row + 1;
                 while (r < self.rows) : (r += 1) {
-                    @memset(g.rowSlice(r, self.cols), blank);
+                    g.clearRange(r, 0, self.cols);
+                    g.setRowWrap(r, false);
                     self.markDirty(r);
                 }
             },
             1 => {
                 var r: u16 = 0;
                 while (r < g.cursor.row) : (r += 1) {
-                    @memset(g.rowSlice(r, self.cols), blank);
+                    g.clearRange(r, 0, self.cols);
+                    g.setRowWrap(r, false);
                     self.markDirty(r);
                 }
                 const end = @min(@as(usize, g.cursor.col) + 1, self.cols);
-                @memset(g.rowSlice(g.cursor.row, self.cols)[0..end], blank);
+                GridMod.fillCells(g.rowSlice(g.cursor.row, self.cols)[0..end], blank);
                 self.markDirty(g.cursor.row);
             },
             3 => {
                 if (self.which == 0) {
                     g.used = self.rows;
                     g.scroll = 0;
-                    self.kitty.dropHistory(0);
+                    self.kitty.dropHistory(0, @intCast(g.base));
                 }
             },
             else => {
+                self.dropScreenImages();
                 var r: u16 = 0;
                 while (r < self.rows) : (r += 1) {
-                    @memset(g.rowSlice(r, self.cols), blank);
+                    g.clearRange(r, 0, self.cols);
+                    g.setRowWrap(r, false);
                     self.markDirty(r);
                 }
             },
         }
     }
 
+    /// A full clear removes the images on screen with the text.
+    fn dropScreenImages(self: *VtState) void {
+        self.kitty.setCellSize(self.cell_px_w, self.cell_px_h);
+        self.kitty.dropVisible(self.which, @intCast(self.grid().base), self.rows, self.cell_px_h);
+    }
+
     pub fn el(self: *VtState, mode: u16) void {
         const g = self.grid();
+        if (mode == 2) {
+            g.clearRange(g.cursor.row, 0, self.cols);
+            self.markDirty(g.cursor.row);
+            return;
+        }
         const line = g.rowSlice(g.cursor.row, self.cols);
         const blank = self.eraseCell();
         switch (mode) {
-            0 => @memset(line[g.cursor.col..], blank),
-            1 => @memset(line[0..@min(@as(usize, g.cursor.col) + 1, line.len)], blank),
-            else => @memset(line, blank),
+            0 => GridMod.fillCells(line[g.cursor.col..], blank),
+            1 => GridMod.fillCells(line[0..@min(@as(usize, g.cursor.col) + 1, line.len)], blank),
+            else => GridMod.fillCells(line, blank),
         }
         self.markDirty(g.cursor.row);
     }
@@ -817,7 +1452,7 @@ pub const VtState = struct {
         const g = self.grid();
         const end = @min(self.cols, g.cursor.col +| n);
         if (end > g.cursor.col) {
-            @memset(g.rowSlice(g.cursor.row, self.cols)[g.cursor.col..end], self.eraseCell());
+            GridMod.fillCells(g.rowSlice(g.cursor.row, self.cols)[g.cursor.col..end], self.eraseCell());
             self.markDirty(g.cursor.row);
         }
     }
@@ -838,26 +1473,44 @@ pub const VtState = struct {
 
     pub fn rep(self: *VtState, n: u16) void {
         const cp = self.last_cp;
+        const set = switch (self.gl) {
+            0 => self.g0,
+            1 => self.g1,
+            2 => self.g2,
+            3 => self.g3,
+        };
+        // Plain ASCII on the bulk path: fill cells a row at a time.
+        if (cp >= 0x20 and cp <= 0x7E and !self.flags.insert_mode and !self.ss_active and set != .dec_special) {
+            var buf: [256]u8 = undefined;
+            @memset(&buf, @intCast(cp));
+            var left: usize = n;
+            while (left != 0) {
+                const k = @min(left, buf.len);
+                self.printPlain(buf[0..k]);
+                left -= k;
+            }
+            return;
+        }
         var k: u16 = 0;
         while (k < n) : (k += 1) self.printCodepoint(cp);
     }
 
     pub fn regionScrollUp(self: *VtState, n: u16) void {
+        self.join.ok = false;
+        self.kitty.setCellSize(self.cell_px_w, self.cell_px_h);
         const g = self.grid();
         if (self.which == 0 and g.scroll_top == 0 and g.scroll_bottom + 1 == self.rows) {
             g.historyScrollUp(n, self.cols, self.rows);
+            self.kitty.expire(0, self.oldestLine());
         } else {
             g.scrollUp(g.scroll_top, g.scroll_bottom, n, self.cols);
-        }
-        const extra: u32 = if (self.which == 0) g.cap - self.rows else 0;
-        var k: u16 = 0;
-        while (k < n) : (k += 1) {
-            self.kitty.scrollUp(self.which, extra);
+            self.kitty.scrollRegion(self.which, @intCast(g.base), g.scroll_top, g.scroll_bottom, n);
         }
         self.markDirtyAll();
     }
 
     pub fn regionScrollDown(self: *VtState, n: u16) void {
+        self.join.ok = false;
         const g = self.grid();
         g.scrollDown(g.scroll_top, g.scroll_bottom, n, self.cols);
         self.markDirtyAll();
@@ -893,13 +1546,14 @@ pub const VtState = struct {
         g.bg = self.scheme.bg;
         g.attrs = .{};
         self.ul_set = false;
+        self.ul_color = .{ .r = 0, .g = 0, .b = 0 };
     }
 
     pub fn takeColor(self: *VtState, rest: []const u16, fg: bool) usize {
         if (rest.len == 0) return 0;
         if (rest[0] == 5) {
             if (rest.len < 2) return rest.len;
-            const c = indexedColor(self.scheme, rest[1]);
+            const c = self.colorIndex(rest[1]);
             if (fg) {
                 self.grid().fg = c;
                 self.grid().attrs.fg_explicit = true;
@@ -1056,6 +1710,7 @@ pub const VtState = struct {
         self.ss_active = false;
         self.flags.reverse_wrap = true;
         self.last_cp = ' ';
+        self.join.ok = false;
         self.resetPen();
         const g = self.grid();
         g.wrap_pending = false;
@@ -1162,7 +1817,7 @@ pub const VtState = struct {
     }
 
     pub fn colorIndex(self: *const VtState, i: u32) Color {
-        return indexedColor(self.scheme, @intCast(@min(i, 255)));
+        return self.table[@min(i, 255)];
     }
 
     pub fn setUnderlineColor(self: *VtState, c: Color) void {
@@ -1255,7 +1910,9 @@ pub const VtState = struct {
             }
             if (c == ';' or c == 'q') {
                 if (nparam == 1) p2 = if (have) val else 0;
-                nparam += 1;
+                // Only the first three parameters have meaning. Keep the
+                // counter past them without wrapping back onto P2.
+                nparam +|= 1;
                 val = 0;
                 have = false;
                 i += 1;
@@ -1280,26 +1937,49 @@ pub const VtState = struct {
         }
         const max_w = if (self.sixel_geo_w != 0) @as(u32, self.sixel_geo_w) else @as(u32, self.pixelWidth(false));
         const max_h = if (self.sixel_geo_h != 0) @as(u32, self.sixel_geo_h) else @as(u32, self.pixelHeight(false));
-        const bmp = Sixel.decode(self.allocator, body, .{
+        const params: Sixel.Params = .{
             .transparent = p2 == 1,
             .max_w = @max(1, max_w),
             .max_h = @max(1, max_h),
             .palette = &self.sixel_palette,
             .registers = self.sixel_reg,
-        }) catch return;
+        };
+        // A private palette starts from the default for every image, so the
+        // pixels can wait until the image is drawn; only its size is needed
+        // now. A shared palette is updated by decoding, in order.
+        var img: Kitty.Image = undefined;
+        if (self.flags.sixel_private_palette) {
+            const size = Sixel.measure(body, params);
+            const data = self.allocator.dupe(u8, body) catch return;
+            img = .{ .id = 0, .width = size.width, .height = size.height, .rgba = &.{}, .pending = .{
+                .data = data,
+                .sixel = .{ .transparent = params.transparent, .max_w = params.max_w, .max_h = params.max_h, .registers = params.registers },
+            } };
+        } else {
+            const b = Sixel.decode(self.allocator, body, params) catch return;
+            img = .{ .id = 0, .width = b.width, .height = b.height, .rgba = b.rgba };
+        }
+        const bmp = img;
         const cell_w = @max(@as(u32, 1), self.cell_px_w);
         const cell_h = @max(@as(u32, 1), self.cell_px_h);
         const cols_used: u32 = (bmp.width + cell_w - 1) / cell_w;
         const rows_used: u32 = (bmp.height + cell_h - 1) / cell_h;
-        const cur = self.grid().cursor;
-        if (!self.flags.sixel_display) {
+        var cur = self.grid().cursor;
+        // The normal cursor advance below performs the required scrolling.
+        // Right-of-image mode instead makes room before placing the bitmap.
+        if (self.flags.sixel_cursor_right and !self.flags.sixel_display) {
             const need: u16 = sat16vt(rows_used);
             const room = self.rows -| cur.row;
-            if (need > room) self.regionScrollUp(need - room);
+            if (need > room) {
+                self.regionScrollUp(need - room);
+                self.grid().cursor.row -|= need - room;
+                cur = self.grid().cursor;
+            }
         }
-        self.kitty.placeBitmap(bmp.rgba, bmp.width, bmp.height, .{ .row = cur.row, .col = cur.col }, self.which, cols_used, rows_used);
+        self.kitty.placeImage(img, self.imageCursor(), self.which, cols_used, rows_used);
         const g = self.grid();
         if (self.flags.sixel_cursor_right) {
+            g.wrap_pending = false;
             g.cursor.col = @min(self.cols - 1, cur.col +| sat16vt(cols_used));
         } else {
             g.wrap_pending = false;
@@ -1409,12 +2089,11 @@ pub const VtState = struct {
         const g = self.grid();
         g.scroll_top = 0;
         g.scroll_bottom = self.rows - 1;
-        const attrs = self.paintAttrs();
+        // The pen without its underline color (only the flag).
+        const id = self.styles.intern(.{ .attrs = self.paintAttrs(), .fg = g.fg, .bg = g.bg });
         var r: u16 = 0;
         while (r < self.rows) : (r += 1) {
-            for (g.rowSlice(r, self.cols)) |*c| {
-                c.* = .{ .codepoint = 'E', .attrs = attrs, .fg = g.fg, .bg = g.bg };
-            }
+            GridMod.fillCells(g.rowSlice(r, self.cols), .{ .codepoint = 'E', .style = id });
             self.markDirty(r);
         }
         self.goHome();
@@ -1450,7 +2129,8 @@ pub const VtState = struct {
             var c = area.left;
             while (c <= area.right) : (c += 1) {
                 const slot = self.grid().getCell(r, c);
-                var a = slot.attrs;
+                var st = self.styles.of(slot.*);
+                var a = st.attrs;
                 var i: usize = 4;
                 while (i < params.len) : (i += 1) {
                     switch (params[i].value) {
@@ -1475,7 +2155,10 @@ pub const VtState = struct {
                         else => {},
                     }
                 }
-                slot.attrs = a;
+                st.attrs = a;
+                // Interning may compact, which rewrites `slot` in place first.
+                const id = self.styles.intern(st);
+                slot.style = id;
             }
             self.markDirty(r);
         }
@@ -1488,7 +2171,8 @@ pub const VtState = struct {
             var c = area.left;
             while (c <= area.right) : (c += 1) {
                 const slot = self.grid().getCell(r, c);
-                var a = slot.attrs;
+                var st = self.styles.of(slot.*);
+                var a = st.attrs;
                 var i: usize = 4;
                 while (i < params.len) : (i += 1) {
                     switch (params[i].value) {
@@ -1505,7 +2189,10 @@ pub const VtState = struct {
                         else => {},
                     }
                 }
-                slot.attrs = a;
+                st.attrs = a;
+                // Interning may compact, which rewrites `slot` in place first.
+                const id = self.styles.intern(st);
+                slot.style = id;
             }
             self.markDirty(r);
         }
@@ -1546,13 +2233,13 @@ pub const VtState = struct {
         const ch: u8 = @truncate(paramVal(params, 0, 0));
         if (!((ch >= 32 and ch < 126) or ch >= 160)) return;
         const area = self.rectArea(params, 1) orelse return;
-        const attrs = self.paintAttrs();
         const g = self.grid();
+        const id = self.styles.intern(.{ .attrs = self.paintAttrs(), .fg = g.fg, .bg = g.bg });
         var r = area.top;
         while (r <= area.bottom) : (r += 1) {
             var c = area.left;
             while (c <= area.right) : (c += 1) {
-                g.getCell(r, c).* = .{ .codepoint = ch, .attrs = attrs, .fg = g.fg, .bg = g.bg };
+                g.getCell(r, c).* = .{ .codepoint = ch, .style = id };
             }
             self.markDirty(r);
         }
@@ -1563,12 +2250,13 @@ pub const VtState = struct {
         const blank = self.eraseCell();
         var r = area.top;
         while (r <= area.bottom) : (r += 1) {
-            @memset(self.grid().rowSlice(r, self.cols)[area.left .. area.right + 1], blank);
+            GridMod.fillCells(self.grid().rowSlice(r, self.cols)[area.left .. area.right + 1], blank);
             self.markDirty(r);
         }
     }
 
     fn setAlt(self: *VtState, on: bool, save: bool, wipe: bool) void {
+        self.join.ok = false;
         if (on) {
             if (self.which == 1) return;
             if (save) self.saveCursor();
@@ -1585,9 +2273,8 @@ pub const VtState = struct {
         self.markDirtyAll();
     }
 
-    fn feedKitty(self: *VtState, bytes: []const u8) void {
-        const cur = self.grid().cursor;
-        const next = self.kitty.feed(bytes, .{ .row = cur.row, .col = cur.col }, self.cols, self.rows, self.which);
+    fn feedKitty(self: *VtState, bytes: []const u8, place: bool, donor: ?Kitty.Donor) void {
+        const next = self.kitty.feedDonor(bytes, self.imageCursor(), self.cols, self.rows, self.which, place, donor);
         if (self.kitty.reply_len != 0) {
             self.respond(self.kitty.reply[0..self.kitty.reply_len]);
         }
@@ -1595,6 +2282,7 @@ pub const VtState = struct {
             const g = self.grid();
             g.cursor.row = c.row;
             g.cursor.col = c.col;
+            g.wrap_pending = false;
         }
         if (self.kitty.dirty) self.markDirtyAll();
     }
@@ -1606,16 +2294,30 @@ pub const VtState = struct {
         while (y < self.rows) : (y += 1) {
             if (y != 0) try out.append(allocator, '\n');
             for (self.rowCells(y)) |c| {
-                const cp: u21 = if (c.codepoint == 0) ' ' else c.codepoint;
-                var buf: [4]u8 = undefined;
-                const n = std.unicode.utf8Encode(cp, &buf) catch {
-                    try out.append(allocator, '?');
-                    continue;
-                };
-                try out.appendSlice(allocator, buf[0..n]);
+                var one: u32 = undefined;
+                // A cluster is all its code points, in one cell.
+                for (self.styles.text(c, &one)) |v| {
+                    const cp: u21 = if (v == 0) ' ' else @intCast(v);
+                    var buf: [4]u8 = undefined;
+                    const n = std.unicode.utf8Encode(cp, &buf) catch {
+                        try out.append(allocator, '?');
+                        continue;
+                    };
+                    try out.appendSlice(allocator, buf[0..n]);
+                }
             }
         }
         return out.toOwnedSlice(allocator);
+    }
+
+    /// `U+XXXX` for a cell; a cluster as `U+XXXX+YYYY+...`.
+    fn cellName(self: *const VtState, c: Cell, buf: []u8) []const u8 {
+        var one: u32 = undefined;
+        var w: std.Io.Writer = .fixed(buf);
+        for (self.styles.text(c, &one), 0..) |v, i| {
+            w.print("{s}{X:0>4}", .{ if (i == 0) "U+" else "+", v }) catch break;
+        }
+        return w.buffered();
     }
 
     pub fn dumpCellsAlloc(self: *const VtState, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
@@ -1627,20 +2329,22 @@ pub const VtState = struct {
             var x: u16 = 0;
             while (x < self.cols) : (x += 1) {
                 const c = line[x];
-                if (cellIsBlank(self.scheme, c)) continue;
+                const st = self.styleOf(c);
+                if (cellIsBlank(self.scheme, c, st)) continue;
                 var attr_buf: [9]u8 = undefined;
-                const attrs = attrLetters(c.attrs, &attr_buf);
-                var buf: [96]u8 = undefined;
-                const n = std.fmt.bufPrint(&buf, "{d} {d} U+{X:0>4} #{x:0>2}{x:0>2}{x:0>2} #{x:0>2}{x:0>2}{x:0>2} {s}\n", .{
+                const attrs = attrLetters(st.attrs, &attr_buf);
+                var name_buf: [8 * Clusters.max_len]u8 = undefined;
+                var buf: [96 + name_buf.len]u8 = undefined;
+                const n = std.fmt.bufPrint(&buf, "{d} {d} {s} #{x:0>2}{x:0>2}{x:0>2} #{x:0>2}{x:0>2}{x:0>2} {s}\n", .{
                     y,
                     x,
-                    c.codepoint,
-                    c.fg.r,
-                    c.fg.g,
-                    c.fg.b,
-                    c.bg.r,
-                    c.bg.g,
-                    c.bg.b,
+                    self.cellName(c, &name_buf),
+                    st.fg.r,
+                    st.fg.g,
+                    st.fg.b,
+                    st.bg.r,
+                    st.bg.g,
+                    st.bg.b,
                     attrs,
                 }) catch unreachable;
                 try out.appendSlice(allocator, n);
@@ -1680,11 +2384,7 @@ fn remapColor(c: Color, prev: Scheme, next: Scheme) Color {
     return c;
 }
 
-fn remapGrid(g: *Grid, prev: Scheme, next: Scheme) void {
-    for (g.cells) |*cell| {
-        cell.fg = remapColor(cell.fg, prev, next);
-        cell.bg = remapColor(cell.bg, prev, next);
-    }
+fn remapPen(g: *Grid, prev: Scheme, next: Scheme) void {
     g.fg = remapColor(g.fg, prev, next);
     g.bg = remapColor(g.bg, prev, next);
     g.saved_fg = remapColor(g.saved_fg, prev, next);
@@ -1735,27 +2435,12 @@ fn clip(v: u16) u8 {
     return @truncate(@min(v, 255));
 }
 
-fn indexedColor(scheme: Scheme, i: u16) Color {
-    const n: u8 = clip(i);
-    if (n < 16) return scheme.palette[n];
-    if (n < 232) {
-        const x = n - 16;
-        const r6 = x / 36;
-        const g6 = (x % 36) / 6;
-        const b6 = x % 6;
-        const levels = [_]u8{ 0, 95, 135, 175, 215, 255 };
-        return .{ .r = levels[r6], .g = levels[g6], .b = levels[b6] };
-    }
-    const v: u8 = 8 + 10 * (n - 232);
-    return .{ .r = v, .g = v, .b = v };
-}
-
-fn cellIsBlank(scheme: Scheme, c: Cell) bool {
+fn cellIsBlank(scheme: Scheme, c: Cell, st: Style) bool {
     if (c.codepoint != ' ' and c.codepoint != 0) return false;
-    if (c.fg.r != scheme.fg.r or c.fg.g != scheme.fg.g or c.fg.b != scheme.fg.b) return false;
-    if (c.bg.r != scheme.bg.r or c.bg.g != scheme.bg.g or c.bg.b != scheme.bg.b) return false;
+    if (st.fg.r != scheme.fg.r or st.fg.g != scheme.fg.g or st.fg.b != scheme.fg.b) return false;
+    if (st.bg.r != scheme.bg.r or st.bg.g != scheme.bg.g or st.bg.b != scheme.bg.b) return false;
     const z: Attrs = .{};
-    return std.meta.eql(c.attrs, z);
+    return std.meta.eql(st.attrs, z);
 }
 
 fn attrLetters(a: Attrs, buf: *[9]u8) []const u8 {
@@ -1804,8 +2489,17 @@ fn attrLetters(a: Attrs, buf: *[9]u8) []const u8 {
 }
 
 fn applyCsi(vt: *VtState, seq: []const u8) void {
-    var params: [16]CsiSeq.Param = undefined;
-    CsiSeq.parse(seq, &params).apply(vt);
+    var bufs: CsiSeq.Bufs = undefined;
+    CsiSeq.parse(seq, &bufs).apply(vt);
+}
+
+test "unscanned text runs retain their leading ASCII" {
+    var bytes = "abc日本語".*;
+    var vt = try VtState.init(std.testing.allocator, 16, 2, 2, &bytes);
+    defer vt.deinit();
+    vt.feedRuns(&.{.{ .kind = .text, .off = 0, .len = bytes.len }});
+    try std.testing.expectEqual(@as(u21, 'a'), vt.grid().getCell(0, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, '日'), vt.grid().getCell(0, 3).codepoint);
 }
 
 test "sgr truecolor bg" {
@@ -1817,9 +2511,9 @@ test "sgr truecolor bg" {
     vt.printCodepoint('Y');
     const c = vt.grid().cellAt(0, 0);
     try std.testing.expectEqual(@as(u21, 'X'), c.codepoint);
-    try std.testing.expectEqual(@as(u8, 0x1e), c.bg.r);
-    try std.testing.expectEqual(@as(u8, 0x3c), c.bg.g);
-    try std.testing.expectEqual(@as(u8, 0x5a), c.bg.b);
+    try std.testing.expectEqual(@as(u8, 0x1e), vt.styleOf(c).bg.r);
+    try std.testing.expectEqual(@as(u8, 0x3c), vt.styleOf(c).bg.g);
+    try std.testing.expectEqual(@as(u8, 0x5a), vt.styleOf(c).bg.b);
 }
 
 test "sgr bold italic underline" {
@@ -1832,10 +2526,10 @@ test "sgr bold italic underline" {
     vt.printCodepoint('B');
     applyCsi(&vt, "\x1b[0;4m");
     vt.printCodepoint('C');
-    try std.testing.expect(vt.grid().cellAt(0, 0).attrs.bold);
-    try std.testing.expectEqual(vt.scheme.palette[1], vt.grid().cellAt(0, 0).fg);
-    try std.testing.expect(vt.grid().cellAt(0, 1).attrs.italic);
-    try std.testing.expect(vt.grid().cellAt(0, 2).attrs.underline);
+    try std.testing.expect(vt.styleOf(vt.grid().cellAt(0, 0)).attrs.bold);
+    try std.testing.expectEqual(vt.scheme.palette[1], vt.styleOf(vt.grid().cellAt(0, 0)).fg);
+    try std.testing.expect(vt.styleOf(vt.grid().cellAt(0, 1)).attrs.italic);
+    try std.testing.expect(vt.styleOf(vt.grid().cellAt(0, 2)).attrs.underline);
 }
 
 test "cup el keeps pen on blanks" {
@@ -1851,7 +2545,7 @@ test "cup el keeps pen on blanks" {
     applyCsi(&vt, "\x1b[K");
     try std.testing.expectEqual(@as(u21, 'A'), vt.grid().cellAt(0, 0).codepoint);
     try std.testing.expectEqual(@as(u21, ' '), vt.grid().cellAt(0, 2).codepoint);
-    try std.testing.expectEqual(vt.scheme.palette[1], vt.grid().cellAt(0, 2).bg);
+    try std.testing.expectEqual(vt.scheme.palette[1], vt.styleOf(vt.grid().cellAt(0, 2)).bg);
 }
 
 test "alt 1049 wipes" {
@@ -1913,9 +2607,9 @@ test "sgr colon truecolor" {
     applyCsi(&vt, "\x1b[38:2:30:60:90m");
     vt.printCodepoint('X');
     const c = vt.grid().cellAt(0, 0);
-    try std.testing.expectEqual(@as(u8, 30), c.fg.r);
-    try std.testing.expectEqual(@as(u8, 60), c.fg.g);
-    try std.testing.expectEqual(@as(u8, 90), c.fg.b);
+    try std.testing.expectEqual(@as(u8, 30), vt.styleOf(c).fg.r);
+    try std.testing.expectEqual(@as(u8, 60), vt.styleOf(c).fg.g);
+    try std.testing.expectEqual(@as(u8, 90), vt.styleOf(c).fg.b);
 }
 
 test "decrqm cursor visible" {
@@ -2092,15 +2786,23 @@ test "ed 3 drops scrollback" {
     try std.testing.expectEqual(@as(u32, 0), vt.grid().scroll);
 }
 
-test "tab writes tab and spaces" {
+test "HT and CHT preserve cells and styles while moving to tab stops" {
     var dummy: [1]u8 = .{0};
-    var vt = try VtState.init(std.testing.allocator, 16, 1, 2, &dummy);
+    var vt = try VtState.init(std.testing.allocator, 24, 1, 2, &dummy);
     defer vt.deinit();
-    vt.printCodepoint('A');
+    applyCsi(&vt, "\x1b[41m");
+    vt.feedText("ABCDEFGHIJKLMNOPQRSTUVWX");
+    var before: [24]Cell = undefined;
+    @memcpy(&before, vt.rowCells(0));
+    vt.carriageReturn();
+    applyCsi(&vt, "\x1b[44m");
     C0.dispatch(&vt, 0x09);
-    try std.testing.expectEqual(@as(u21, '\t'), vt.grid().cellAt(0, 1).codepoint);
-    try std.testing.expectEqual(@as(u21, ' '), vt.grid().cellAt(0, 2).codepoint);
     try std.testing.expectEqual(@as(u16, 8), vt.grid().cursor.col);
+    applyCsi(&vt, "\x1b[2I");
+    try std.testing.expectEqual(@as(u16, 23), vt.grid().cursor.col);
+    for (before, vt.rowCells(0)) |expected, actual| try std.testing.expectEqual(expected, actual);
+    vt.printCodepoint('Z');
+    try std.testing.expectEqual(@as(u21, 'Z'), vt.grid().cellAt(0, 23).codepoint);
 }
 
 test "sgr underline color on cell" {
@@ -2110,24 +2812,13 @@ test "sgr underline color on cell" {
     applyCsi(&vt, "\x1b[4;58:2:1:2:3m");
     vt.printCodepoint('X');
     const c = vt.grid().cellAt(0, 0);
-    try std.testing.expect(c.attrs.underline);
-    try std.testing.expect(c.attrs.ul_color);
-    try std.testing.expectEqual(@as(u8, 1), c.ul.r);
-    try std.testing.expectEqual(@as(u8, 2), c.ul.g);
-    try std.testing.expectEqual(@as(u8, 3), c.ul.b);
+    try std.testing.expect(vt.styleOf(c).attrs.underline);
+    try std.testing.expect(vt.styleOf(c).attrs.ul_color);
+    try std.testing.expectEqual(@as(u8, 1), vt.styleOf(c).ul.r);
+    try std.testing.expectEqual(@as(u8, 2), vt.styleOf(c).ul.g);
+    try std.testing.expectEqual(@as(u8, 3), vt.styleOf(c).ul.b);
 }
 
-test "grapheme clustering skips combining" {
-    var dummy: [1]u8 = .{0};
-    var vt = try VtState.init(std.testing.allocator, 8, 1, 2, &dummy);
-    defer vt.deinit();
-    applyCsi(&vt, "\x1b[?2027h");
-    vt.printCodepoint('e');
-    vt.printCodepoint(0x0301);
-    try std.testing.expectEqual(@as(u16, 1), vt.grid().cursor.col);
-    try std.testing.expectEqual(@as(u21, 'e'), vt.grid().cellAt(0, 0).codepoint);
-    try std.testing.expectEqual(@as(u21, ' '), vt.grid().cellAt(0, 1).codepoint);
-}
 
 test "xtsmgraphics color registers" {
     var dummy: [1]u8 = .{0};
@@ -2261,6 +2952,28 @@ test "reflow retains trailing wide continuation" {
     try std.testing.expectEqual(@as(u21, 'X'), vt.grid().cellAt(0, 4).codepoint);
 }
 
+test "OSC palette updates and resets are used by every indexed SGR target" {
+    var vt = try VtState.init(std.testing.allocator, 8, 2, 2, &.{});
+    defer vt.deinit();
+    const original = vt.colorIndex(200);
+    const changed = Color{ .r = 0x12, .g = 0x34, .b = 0x56 };
+    @import("osc.zig").dispatch(&vt, "\x1b]4;200;#123456\x07");
+    applyCsi(&vt, "\x1b[38;5;200;48:5:200;58;5;200m");
+    vt.printCodepoint('X');
+    const st = vt.styleOf(vt.cell(0, 0));
+    try std.testing.expectEqual(changed, st.fg);
+    try std.testing.expectEqual(changed, st.bg);
+    try std.testing.expectEqual(changed.r, st.ul.r);
+    try std.testing.expectEqual(changed.g, st.ul.g);
+    try std.testing.expectEqual(changed.b, st.ul.b);
+    try std.testing.expectEqual(@as(usize, 2), vt.takeColor(&.{ 5, 200 }, true));
+    try std.testing.expectEqual(changed, vt.grid().fg);
+    @import("osc.zig").dispatch(&vt, "\x1b]104;200\x07");
+    applyCsi(&vt, "\x1b[38:5:200m");
+    vt.printCodepoint('Y');
+    try std.testing.expectEqual(original, vt.styleOf(vt.cell(0, 1)).fg);
+}
+
 test "osc default and palette resets preserve explicit colors" {
     var dummy: [1]u8 = .{0};
     var vt = try VtState.init(std.testing.allocator, 8, 2, 2, &dummy);
@@ -2277,18 +2990,18 @@ test "osc default and palette resets preserve explicit colors" {
     @import("osc.zig").dispatch(&vt, "\x1b]11;#123456\x07");
     const fg = Color{ .r = 0x11, .g = 0x22, .b = 0x33 };
     const bg = Color{ .r = 0x12, .g = 0x34, .b = 0x56 };
-    try std.testing.expectEqual(fg, vt.grid().cellAt(0, 0).fg);
-    try std.testing.expectEqual(bg, vt.grid().cellAt(0, 0).bg);
-    try std.testing.expectEqual(original.fg, vt.grid().cellAt(0, 1).fg);
-    try std.testing.expectEqual(original.bg, vt.grid().cellAt(0, 1).bg);
+    try std.testing.expectEqual(fg, vt.styleOf(vt.grid().cellAt(0, 0)).fg);
+    try std.testing.expectEqual(bg, vt.styleOf(vt.grid().cellAt(0, 0)).bg);
+    try std.testing.expectEqual(original.fg, vt.styleOf(vt.grid().cellAt(0, 1)).fg);
+    try std.testing.expectEqual(original.bg, vt.styleOf(vt.grid().cellAt(0, 1)).bg);
     applyCsi(&vt, "\x1b[39;49m");
     vt.printCodepoint('c');
-    try std.testing.expectEqual(fg, vt.grid().cellAt(0, 2).fg);
-    try std.testing.expectEqual(bg, vt.grid().cellAt(0, 2).bg);
+    try std.testing.expectEqual(fg, vt.styleOf(vt.grid().cellAt(0, 2)).fg);
+    try std.testing.expectEqual(bg, vt.styleOf(vt.grid().cellAt(0, 2)).bg);
     @import("osc.zig").dispatch(&vt, "\x1b]110\x07");
     @import("osc.zig").dispatch(&vt, "\x1b]111\x07");
-    try std.testing.expectEqual(original.fg, vt.grid().cellAt(0, 2).fg);
-    try std.testing.expectEqual(original.bg, vt.grid().cellAt(0, 2).bg);
+    try std.testing.expectEqual(original.fg, vt.styleOf(vt.grid().cellAt(0, 2)).fg);
+    try std.testing.expectEqual(original.bg, vt.styleOf(vt.grid().cellAt(0, 2)).bg);
 }
 
 
@@ -2305,12 +3018,12 @@ test "color stack restores default cells and pens" {
     vt.printCodepoint('c');
     vt.xtPopColors(0);
     try std.testing.expectEqual(original, vt.scheme.bg);
-    try std.testing.expectEqual(original, vt.grid().cellAt(0, 0).bg);
-    try std.testing.expectEqual(original, vt.grid().cellAt(0, 1).bg);
-    try std.testing.expectEqual(Color{ .r = 18, .g = 52, .b = 86 }, vt.grid().cellAt(0, 2).bg);
+    try std.testing.expectEqual(original, vt.styleOf(vt.grid().cellAt(0, 0)).bg);
+    try std.testing.expectEqual(original, vt.styleOf(vt.grid().cellAt(0, 1)).bg);
+    try std.testing.expectEqual(Color{ .r = 18, .g = 52, .b = 86 }, vt.styleOf(vt.grid().cellAt(0, 2)).bg);
     applyCsi(&vt, "\x1b[49m");
     vt.printCodepoint('d');
-    try std.testing.expectEqual(original, vt.grid().cellAt(0, 3).bg);
+    try std.testing.expectEqual(original, vt.styleOf(vt.grid().cellAt(0, 3)).bg);
 }
 
 test "printPlain matches per-codepoint printing" {
@@ -2345,7 +3058,7 @@ test "printPlain matches per-codepoint printing" {
             for (text[0..len]) |ch| b.printCodepoint(ch);
             var r: u16 = 0;
             while (r < 4) : (r += 1) {
-                try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(b.rowCells(r)), std.mem.sliceAsBytes(a.rowCells(r)));
+                try expectSameCells(&b, b.rowCells(r), &a, a.rowCells(r));
                 try std.testing.expectEqual(b.lineDirty(r), a.lineDirty(r));
             }
             try std.testing.expectEqual(b.cursor(), a.cursor());
@@ -2353,4 +3066,842 @@ test "printPlain matches per-codepoint printing" {
             try std.testing.expectEqual(b.last_cp, a.last_cp);
         }
     }
+}
+
+test "sixel extra header parameters never wrap back onto P2" {
+    var vt = try VtState.init(std.testing.allocator, 8, 8, 8, &.{});
+    defer vt.deinit();
+    vt.flags.sixel_private_palette = false;
+    const prefix = "\x1bP0;1;";
+    var extra: [512]u8 = @splat(';');
+    for (0..256) |i| extra[i * 2] = '0';
+    const suffix = "q?\x1b\\";
+    var bytes: [prefix.len + extra.len + suffix.len]u8 = undefined;
+    @memcpy(bytes[0..prefix.len], prefix);
+    @memcpy(bytes[prefix.len..][0..extra.len], &extra);
+    @memcpy(bytes[prefix.len + extra.len ..], suffix);
+    vt.feedSixel(&bytes);
+    try std.testing.expectEqual(@as(usize, 1), vt.kitty.images.items.len);
+    const rgba = vt.kitty.images.items[0].rgba;
+    try std.testing.expect(rgba.len != 0);
+    var i: usize = 3;
+    while (i < rgba.len) : (i += 4) try std.testing.expectEqual(@as(u8, 0), rgba[i]);
+}
+
+test "sixel follows its scrollback line until history drops it" {
+    var dummy: [1]u8 = .{0};
+    var vt = try VtState.init(std.testing.allocator, 8, 4, 8, &dummy);
+    defer vt.deinit();
+    vt.cell_px_w = 1;
+    vt.cell_px_h = 6;
+    vt.index();
+    vt.feedSixel("\x1bPq#0;2;100;0;0#0~~\x1b\\");
+    try std.testing.expectEqual(@as(usize, 1), vt.kitty.placements.items.len);
+    try std.testing.expectEqual(@as(i64, 1), vt.kitty.placements.items[0].row);
+    try std.testing.expectEqual(@as(i64, 1), vt.kitty.placements.items[0].row - vt.imageBase());
+    var k: u16 = 0;
+    while (k < 3) : (k += 1) vt.regionScrollUp(1);
+    // Scrolled off screen but still in history; visible when scrolled back.
+    try std.testing.expectEqual(@as(i64, -2), vt.kitty.placements.items[0].row - vt.imageBase());
+    vt.grid().scroll = 3;
+    try std.testing.expectEqual(@as(i64, 1), vt.kitty.placements.items[0].row - vt.imageBase());
+    vt.grid().scroll = 0;
+    while (vt.oldestLine() <= 1) vt.regionScrollUp(1);
+    try std.testing.expectEqual(@as(usize, 0), vt.kitty.placements.items.len);
+    try std.testing.expectEqual(@as(usize, 0), vt.kitty.images.items.len);
+}
+
+test "kitty placement advances the cursor and clears pending text wrap" {
+    const gpa = std.testing.allocator;
+    var storage: [4096]u8 = undefined;
+    var vt = try VtState.init(gpa, 8, 8, 20, &storage);
+    defer vt.deinit();
+    vt.cell_px_w = 4;
+    vt.cell_px_h = 4;
+    vt.grid().cursor = .{ .row = 1, .col = 7 };
+    vt.grid().wrap_pending = true;
+    vt.feedKitty("\x1b_Ga=T,f=32,s=1,v=1,i=8,q=2;/wAA/w==\x1b\\", true, null);
+    try std.testing.expectEqual(@as(u16, 2), vt.cursor().row);
+    try std.testing.expectEqual(@as(u16, 7), vt.cursor().col);
+    try std.testing.expect(!vt.grid().wrap_pending);
+    vt.printPlain("Z");
+    try std.testing.expectEqual(@as(u21, 'Z'), vt.grid().cellAt(2, 7).codepoint);
+}
+
+test "image cursor insertion point survives reflow through blank cells" {
+    const gpa = std.testing.allocator;
+    var storage: [4096]u8 = undefined;
+    var vt = try VtState.init(gpa, 8, 4, 20, &storage);
+    defer vt.deinit();
+    vt.cell_px_w = 4;
+    vt.cell_px_h = 4;
+    vt.feedKitty("\x1b_Ga=T,f=32,s=1,v=1,i=8,q=2;/wAA/w==\x1b\\", true, null);
+    try std.testing.expectEqual(@as(u16, 1), vt.cursor().row);
+    try std.testing.expectEqual(@as(u16, 1), vt.cursor().col);
+    try vt.resize(4, 4);
+    try std.testing.expectEqual(@as(u16, 1), vt.cursor().row);
+    try std.testing.expectEqual(@as(u16, 1), vt.cursor().col);
+}
+
+test "scrolling sixel anchors before cursor advance without double scrolling" {
+    const gpa = std.testing.allocator;
+    var storage: [4096]u8 = undefined;
+    var vt = try VtState.init(gpa, 4, 4, 8, &storage);
+    defer vt.deinit();
+    vt.cell_px_w = 4;
+    vt.cell_px_h = 4;
+    vt.grid().cursor = .{ .row = 3, .col = 0 };
+    vt.feedSixel("\x1bPq#1;2;100;0;0#1~\x1b\\");
+    try std.testing.expectEqual(@as(u64, 2), vt.grid().base);
+    try std.testing.expectEqual(@as(u16, 3), vt.cursor().row);
+    try std.testing.expectEqual(@as(u16, 0), vt.cursor().col);
+    try std.testing.expectEqual(@as(i64, 3), vt.kitty.placements.items[0].row);
+    try std.testing.expectEqual(@as(i64, 1), vt.kitty.placements.items[0].row - vt.imageBase());
+}
+
+test "large kitty images arrive through the ring, chunked or as one string" {
+    const gpa = std.testing.allocator;
+    const w = 3840;
+    const h = 2160;
+    const rgba = try gpa.alloc(u8, w * h * 4);
+    defer gpa.free(rgba);
+    for (rgba, 0..) |*b, i| b.* = @truncate(i *% 2654435761 >> 7);
+    const b64 = try gpa.alloc(u8, std.base64.standard.Encoder.calcSize(rgba.len));
+    defer gpa.free(b64);
+    _ = std.base64.standard.Encoder.encode(b64, rgba);
+
+    for ([_]bool{ true, false }) |chunked| {
+        var stream: std.ArrayListUnmanaged(u8) = .empty;
+        defer stream.deinit(gpa);
+        if (chunked) {
+            var off: usize = 0;
+            while (off < b64.len) {
+                const end = @min(off + 4096, b64.len);
+                const more: u8 = @intFromBool(end < b64.len);
+                if (off == 0) {
+                    try stream.print(gpa, "\x1b_Ga=T,f=32,s={d},v={d},i=7,q=2,c=20,r=10,m={d};", .{ w, h, more });
+                } else try stream.print(gpa, "\x1b_Gm={d};", .{more});
+                try stream.appendSlice(gpa, b64[off..end]);
+                try stream.appendSlice(gpa, "\x1b\\");
+                off = end;
+            }
+        } else {
+            try stream.print(gpa, "\x1b_Ga=T,f=32,s={d},v={d},i=7,q=2,c=20,r=10;", .{ w, h });
+            try stream.appendSlice(gpa, b64);
+            try stream.appendSlice(gpa, "\x1b\\");
+        }
+        var ring = try Ring.CircBuffer.create(gpa, 64 * 1024);
+        defer ring.destroy();
+        var vt = try VtState.init(gpa, 80, 24, 100, ring.storage);
+        defer vt.deinit();
+        var off: usize = 0;
+        while (off < stream.items.len) {
+            const free: usize = @intCast(ring.capacity - (ring.head - ring.tail));
+            const n = @min(free, stream.items.len - off);
+            Ring.append(&ring, stream.items[off..][0..n]);
+            off += n;
+            if (ring.capacity - (ring.head - ring.tail) < ring.capacity / 4) ring.drain(vt.sink(), true);
+        }
+        ring.drain(vt.sink(), false);
+        const img = vt.kitty.find(7) orelse return error.ImageDropped;
+        try std.testing.expectEqual(@as(u32, w), img.width);
+        try std.testing.expectEqual(@as(usize, 1), vt.kitty.placements.items.len);
+        vt.prepareImages();
+        const shown = vt.kitty.find(7).?;
+        try std.testing.expectEqualSlices(u8, rgba, shown.rgba);
+        // The transfer buffers gave their memory back.
+        try std.testing.expectEqual(@as(usize, 0), vt.kitty.chunks.capacity);
+        try std.testing.expect(ring.stream.capacity <= 1024 * 1024);
+    }
+}
+
+test "REP of plain ASCII matches printing it" {
+    var dummy: [1]u8 = .{0};
+    var a = try VtState.init(std.testing.allocator, 7, 3, 8, &dummy);
+    defer a.deinit();
+    var b = try VtState.init(std.testing.allocator, 7, 3, 8, &dummy);
+    defer b.deinit();
+    a.printCodepoint('z');
+    a.rep(12);
+    for (0..13) |_| b.printCodepoint('z');
+    const da = try a.dumpAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(da);
+    const db = try b.dumpAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(db);
+    try std.testing.expectEqualStrings(db, da);
+    try std.testing.expectEqual(b.cursor(), a.cursor());
+    try std.testing.expectEqual(b.grid().wrap_pending, a.grid().wrap_pending);
+}
+
+test "inline UTF-8 decode matches std" {
+    const cases = [_][]const u8{ "\xc3\xa9", "\xe6\x97\xa6", "\xf0\x9f\x98\x80", "\xc0\x80", "\xed\xa0\x80", "\xf4\x90\x80\x80", "\xe6\x97\x41" };
+    for (cases) |c| {
+        const want: ?u21 = std.unicode.utf8Decode(c) catch null;
+        try std.testing.expectEqual(want, VtState.decodeUtf8(c));
+    }
+}
+
+test "bulk UTF-8 printing matches printCodepoint" {
+    const gpa = std.testing.allocator;
+    const sample = "旦海司有幼雞‘’“”😀😛 —–§¶ ÀÁÂ ū̀n̂o᷵H̨ a\u{301}\u{302}\u{303}x\xff\xc3\n\té最後";
+    var dummy: [1]u8 = .{0};
+    for ([_]u16{ 5, 7, 13 }) |cols| for ([_]bool{ true, false }) |shaping| {
+        var a = try VtState.init(gpa, cols, 4, 8, &dummy);
+        defer a.deinit();
+        var b = try VtState.init(gpa, cols, 4, 8, &dummy);
+        defer b.deinit();
+        a.flags.grapheme_shaping = shaping;
+        b.flags.grapheme_shaping = shaping;
+        for (0..3) |_| a.feedText(sample);
+        for (0..3) |_| {
+            var k: usize = 0;
+            while (k < sample.len) {
+                const c = sample[k];
+                if (c < 0x80) {
+                    if (c >= 0x21 and c <= 0x7E) b.printCodepoint(c) else C0.dispatch(&b, c);
+                    k += 1;
+                    continue;
+                }
+                const len = std.unicode.utf8ByteSequenceLength(c) catch 1;
+                if (len == 1) {
+                    k += 1;
+                    continue;
+                }
+                if (k + len > sample.len) break;
+                const cp: ?u21 = std.unicode.utf8Decode(sample[k..][0..len]) catch null;
+                k += len;
+                if (cp) |v| b.printCodepoint(v);
+            }
+        }
+        const da = try a.dumpCellsAlloc(gpa);
+        defer gpa.free(da);
+        const db = try b.dumpCellsAlloc(gpa);
+        defer gpa.free(db);
+        try std.testing.expectEqualStrings(db, da);
+        try std.testing.expectEqual(b.cursor(), a.cursor());
+        try std.testing.expectEqual(b.grid().wrap_pending, a.grid().wrap_pending);
+    };
+}
+
+/// Same characters (clusters by content) and resolved styles (ids depend
+/// on interning order).
+fn expectSameCells(va: *const VtState, want: []const Cell, vb: *const VtState, got: []const Cell) !void {
+    try std.testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| {
+        var a: u32 = undefined;
+        var b: u32 = undefined;
+        try std.testing.expectEqualSlices(u32, va.styles.text(w, &a), vb.styles.text(g, &b));
+        try std.testing.expectEqual(va.styleOf(w).key(), vb.styleOf(g).key());
+    }
+}
+
+/// Per-codepoint reference for `feedText`: printable ASCII and decoded
+/// UTF-8 through `printCodepoint`, other ASCII through C0.
+fn feedTextReference(vt: *VtState, bytes: []const u8) void {
+    var k: usize = 0;
+    while (k < bytes.len) {
+        const c = bytes[k];
+        if (c < 0x80) {
+            if (c >= 0x20 and c <= 0x7E) vt.printCodepoint(c) else C0.dispatch(vt, c);
+            k += 1;
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(c) catch 1;
+        if (len == 1) {
+            k += 1;
+            continue;
+        }
+        if (k + len > bytes.len) break;
+        const cp: ?u21 = std.unicode.utf8Decode(bytes[k..][0..len]) catch null;
+        k += len;
+        if (cp) |v| vt.printCodepoint(v);
+    }
+}
+
+test "chunked UTF-8 printing matches printCodepoint on random text" {
+    const gpa = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xc0de_0017);
+    const rnd = prng.random();
+    const pieces = [_][]const u8{
+        "旦", "海", "：", "雞", "é", "ß", "Ω", "😀", "\u{301}", "\u{36f}", "\u{200d}", "a", "Zq", " ", "hello world ",
+        "\n", "\r", "\t", "\x08", "\x0e", "\x0f", "\x7f", "\xff", "\x80", "\xc3", "\xe6\x97", "\xed\xa0\x80", "\xe6\x41\x42",
+        "0123456789012345678901234567890123456789",
+    };
+    var dummy: [1]u8 = .{0};
+    var text: [700]u8 = undefined;
+    for (0..400) |_| {
+        var len: usize = 0;
+        const target = rnd.uintLessThan(usize, text.len - 64);
+        const clean = rnd.boolean();
+        while (len < target) {
+            const piece = pieces[rnd.uintLessThan(usize, if (clean) 15 else pieces.len)];
+            @memcpy(text[len..][0..piece.len], piece);
+            len += piece.len;
+        }
+        const cols: u16 = 2 + rnd.uintLessThan(u16, 30);
+        var a = try VtState.init(gpa, cols, 5, 12, &dummy);
+        defer a.deinit();
+        var b = try VtState.init(gpa, cols, 5, 12, &dummy);
+        defer b.deinit();
+        const shaping = rnd.boolean();
+        const wrap = rnd.uintLessThan(u8, 4) != 0;
+        const insert = rnd.uintLessThan(u8, 6) == 0;
+        const g1_special = rnd.boolean();
+        const ghost = rnd.uintLessThan(u8, 5) == 0;
+        for ([_]*VtState{ &a, &b }) |vt| {
+            vt.flags.grapheme_shaping = shaping;
+            vt.flags.auto_wrap = wrap;
+            vt.flags.insert_mode = insert;
+            if (g1_special) vt.g1 = .dec_special;
+            applyCsi(vt, "\x1b[1;31m");
+            vt.ghost = ghost;
+        }
+        a.feedText(text[0..len]);
+        feedTextReference(&b, text[0..len]);
+        if (!ghost) {
+            const da = try a.dumpCellsAlloc(gpa);
+            defer gpa.free(da);
+            const db = try b.dumpCellsAlloc(gpa);
+            defer gpa.free(db);
+            try std.testing.expectEqualStrings(db, da);
+        }
+        try std.testing.expectEqual(b.cursor(), a.cursor());
+        try std.testing.expectEqual(b.grid().wrap_pending, a.grid().wrap_pending);
+        try std.testing.expectEqual(b.last_cp, a.last_cp);
+        try std.testing.expectEqual(b.gl, a.gl);
+    }
+}
+
+test "a tiny style table compacts often and every cell keeps its style" {
+    const gpa = std.testing.allocator;
+    const pieces = [_][]const u8{
+        "hello", " world", "\r\n", "\n", "\t", "\x1b[41m", "\x1b[0m", "\x1b[1;4:3;58:2:9:8:7m", "\x1b[K", "\x1b[1K", "\x1b[2K",
+        "\x1b[J", "\x1b[2J", "\x1b[3J", "\x1b[3@", "\x1b[2P", "\x1b[4X", "\x1b[2;5r", "\x1b[r", "\x1b[S", "\x1b[T", "\x1b[2L",
+        "\x1b[M", "\x1b[H", "\x1b[5;9H", "\x1bM", "\x1b[?1049h", "\x1b[?1049l", "\x1b#8", "旦海😀", "e\u{301}", "x\x1b[7b",
+        "\x1b]11;#102030\x07", "\x1b]10;#c0c0c0\x07", "\x1b]111\x07", "\x1b[2;3;4;6$z", "\x1b[1;1;3;5;7$r", "\x1b[65;2;2;3;5$x",
+        "\x1b]8;;http://x\x07", "\x1b]8;;\x07", "\x1b[39;49m", "\x1b[7m", "\x1b[2;3;4;6;1;1;1$v",
+    };
+    var prng = std.Random.DefaultPrng.init(11);
+    const rand = prng.random();
+    for (0..12) |_| {
+        var ring_a = try Ring.CircBuffer.create(gpa, 4096);
+        defer ring_a.destroy();
+        var ring_b = try Ring.CircBuffer.create(gpa, 4096);
+        defer ring_b.destroy();
+        ring_a.exact = true;
+        ring_b.exact = true;
+        var a = try VtState.init(gpa, 13, 6, 30, ring_a.storage);
+        defer a.deinit();
+        var b = try VtState.init(gpa, 13, 6, 30, ring_b.storage);
+        defer b.deinit();
+        a.styles.limit = 16;
+        var gens: u32 = 0;
+        for (0..1500) |step| {
+            var color_buf: [40]u8 = undefined;
+            const piece = if (rand.uintLessThan(u8, 3) == 0)
+                std.fmt.bufPrint(&color_buf, "\x1b[38;2;{d};{d};{d};48;5;{d}m", .{ rand.int(u8), rand.int(u8), rand.uintLessThan(u8, 4), rand.int(u8) }) catch unreachable
+            else
+                pieces[rand.uintLessThan(usize, pieces.len)];
+            const gen = a.styles.gen;
+            for ([_]*Ring.CircBuffer{ &ring_a, &ring_b }, [_]*VtState{ &a, &b }) |ring, vt| {
+                Ring.append(ring, piece);
+                ring.drain(vt.sink(), true);
+            }
+            if (a.styles.gen != gen) gens += 1;
+            if (step % 211 == 210) {
+                const cols: u16 = @intCast(8 + rand.uintLessThan(u16, 10));
+                try a.resize(cols, 6);
+                try b.resize(cols, 6);
+            }
+            if (step % 307 == 306) {
+                var next = a.scheme;
+                next.palette[rand.uintLessThan(usize, 16)] = .{ .r = rand.int(u8), .g = 1, .b = 2 };
+                a.applyScheme(next);
+                b.applyScheme(next);
+            }
+            // Every cell of both rings (scrollback and unused rows too).
+            for (0..2) |k| try expectSameCells(&b, b.grids[k].cells, &a, a.grids[k].cells);
+        }
+        try std.testing.expect(gens > 20);
+        try std.testing.expect(a.styles.list.items.len <= a.styles.limit);
+    }
+}
+
+test "row extents never change what the grid holds" {
+    const gpa = std.testing.allocator;
+    const pieces = [_][]const u8{
+        "hello", " world", "\r\n", "\n", "\t", "\x1b[41m", "\x1b[0m", "\x1b[44;33m", "\x1b[K", "\x1b[1K", "\x1b[2K",
+        "\x1b[J", "\x1b[1J", "\x1b[2J", "\x1b[3J", "\x1b[3@", "\x1b[2P", "\x1b[4X", "\x1b[2;5r", "\x1b[r", "\x1b[S",
+        "\x1b[T", "\x1b[2L", "\x1b[M", "\x1b[H", "\x1b[5;9H", "\x1bM", "\x1bD", "\x1b[4h", "\x1b[4l", "x\x1b[7b",
+        "旦海😀", "e\u{301}", "\x1b[?1049h", "\x1b[?1049l", "\x1b#8", "\x1b[?7l", "\x1b[?7h", "\x1b]11;#102030\x07",
+        "\x1b[2;3;4;6$z", "\x1b[65;2;2;3;5$x", "0123456789012345678901234567890",
+    };
+    var prng = std.Random.DefaultPrng.init(7);
+    const rand = prng.random();
+    for (0..40) |round| {
+        var ring_a = try Ring.CircBuffer.create(gpa, 4096);
+        defer ring_a.destroy();
+        var ring_b = try Ring.CircBuffer.create(gpa, 4096);
+        defer ring_b.destroy();
+        ring_a.exact = true;
+        ring_b.exact = true;
+        var a = try VtState.init(gpa, 13, 6, 20, ring_a.storage);
+        defer a.deinit();
+        var b = try VtState.init(gpa, 13, 6, 20, ring_b.storage);
+        defer b.deinit();
+        for (&b.grids) |*g| g.lazy_clear = false;
+        for (0..400) |step| {
+            const piece = pieces[rand.uintLessThan(usize, pieces.len)];
+            for ([_]*Ring.CircBuffer{ &ring_a, &ring_b }, [_]*VtState{ &a, &b }) |ring, vt| {
+                Ring.append(ring, piece);
+                ring.drain(vt.sink(), true);
+            }
+            if (step % 97 == 96) {
+                const cols: u16 = @intCast(8 + rand.uintLessThan(u16, 10));
+                try a.resize(cols, 6);
+                try b.resize(cols, 6);
+                for (&b.grids) |*g| g.lazy_clear = false;
+            }
+            for (0..2) |k| {
+                std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(b.grids[k].cells), std.mem.sliceAsBytes(a.grids[k].cells)) catch |err| {
+                    std.debug.print("round {d} step {d} grid {d} after {any}\n", .{ round, step, k, piece });
+                    return err;
+                };
+            }
+        }
+    }
+}
+
+test "pressure text pruning preserves the pen and screen of an exact parse" {
+    const gpa = std.testing.allocator;
+    const pieces = [_][]const u8{
+        "hello ", "x", "\r\n", "\r\n", "\x1b[m", "\x1b[0m", "\x1b[1m", "\x1b[31m", "\x1b[44;33m", "\x1b[0;4m", "\x1b[;7m",
+        "\x1b[38;5;9m", "\x1b[38;2;1;2;3m", "\x1b[3m", "\x1b[22m", "\x1b7", "\x1b8", "\x1b[s", "\x1b[2J", "\x1b[H",
+        "\x1b[?1049h", "\x1b[?1049l", "\x1bc",
+    };
+    for (0..60) |round| {
+        var ring_a = try Ring.CircBuffer.create(gpa, 4096);
+        defer ring_a.destroy();
+        var ring_b = try Ring.CircBuffer.create(gpa, 4096);
+        defer ring_b.destroy();
+        ring_b.exact = true;
+        var a = try VtState.init(gpa, 13, 4, 20, ring_a.storage);
+        defer a.deinit();
+        var b = try VtState.init(gpa, 13, 4, 20, ring_b.storage);
+        defer b.deinit();
+        for (0..40) |step| {
+            for ([_]*Ring.CircBuffer{ &ring_a, &ring_b }, [_]*VtState{ &a, &b }) |ring, vt| {
+                var local = std.Random.DefaultPrng.init(round * 1000 + step);
+                const lr = local.random();
+                for (0..30) |_| {
+                    const piece = pieces[lr.uintLessThan(usize, pieces.len)];
+                    Ring.append(ring, piece);
+                }
+                ring.drain(vt.sink(), true);
+            }
+            for (0..2) |k| {
+                const ga = &a.grids[k];
+                const gb = &b.grids[k];
+                try std.testing.expectEqual(gb.attrs, ga.attrs);
+                try std.testing.expectEqual(gb.fg, ga.fg);
+                try std.testing.expectEqual(gb.bg, ga.bg);
+            }
+            try std.testing.expectEqual(b.ul_set, a.ul_set);
+        }
+    }
+}
+
+test "skipDeadLine ends where feeding the dead line would" {
+    const gpa = std.testing.allocator;
+    var dummy: [1]u8 = .{0};
+    const pool = [_][]const u8{ "a", "Z", " ", "~", "\x7f", "é", "旦", "😀", "\xc2", "\xe6\x97", "\xf0\x9f", "\x80", "\xff", "\xc2A", "\xe6A\x97", "\xcc\x81" };
+    var prng = std.Random.DefaultPrng.init(11);
+    const rand = prng.random();
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(gpa);
+    for (0..3000) |_| {
+        line.clearRetainingCapacity();
+        const n = rand.uintLessThan(usize, 60);
+        for (0..n) |_| try line.appendSlice(gpa, pool[rand.uintLessThan(usize, pool.len)]);
+        try line.append(gpa, '\r');
+        for ([_]bool{ true, false }) |wrap| {
+            var a = try VtState.init(gpa, 9, 4, 8, &dummy);
+            defer a.deinit();
+            var b = try VtState.init(gpa, 9, 4, 8, &dummy);
+            defer b.deinit();
+            for ([_]*VtState{ &a, &b }) |vt| {
+                vt.flags.auto_wrap = wrap;
+                vt.grid().cursor.row = 3;
+                vt.last_cp = 'Q';
+                vt.ghost = true;
+            }
+            if (!a.skipDeadLine(line.items)) continue;
+            b.feedText(line.items);
+            try std.testing.expectEqual(b.last_cp, a.last_cp);
+            try std.testing.expectEqual(b.grid().cursor, a.grid().cursor);
+            try std.testing.expectEqual(b.grid().wrap_pending, a.grid().wrap_pending);
+        }
+    }
+}
+
+
+// ---------------------------------------------------------------- clusters
+
+/// A VT behind an exact ring: `feed` parses bytes like the app does.
+const TestTerm = struct {
+    ring: Ring.CircBuffer,
+    vt: VtState,
+
+    fn create(cols: u16, rows: u16) !*TestTerm {
+        const gpa = std.testing.allocator;
+        const t = try gpa.create(TestTerm);
+        errdefer gpa.destroy(t);
+        t.ring = try Ring.CircBuffer.create(gpa, 4096);
+        errdefer t.ring.destroy();
+        t.ring.exact = true;
+        t.vt = try VtState.init(gpa, cols, rows, 20, t.ring.storage);
+        return t;
+    }
+
+    fn destroy(t: *TestTerm) void {
+        t.vt.deinit();
+        t.ring.destroy();
+        std.testing.allocator.destroy(t);
+    }
+
+    fn feed(t: *TestTerm, bytes: []const u8) void {
+        var rest = bytes;
+        while (rest.len != 0) {
+            const n = @min(rest.len, 1024);
+            Ring.append(&t.ring, rest[0..n]);
+            t.ring.drain(t.vt.sink(), true);
+            rest = rest[n..];
+        }
+    }
+
+    /// The text of the cell at row/col (UTF-8; a spacer is "").
+    fn text(t: *TestTerm, row: u16, col: u16, buf: []u8) []const u8 {
+        var one: u32 = undefined;
+        var n: usize = 0;
+        const c = t.vt.cell(row, col);
+        if (c.codepoint == 0) return "";
+        for (t.vt.styles.text(c, &one)) |v| n += std.unicode.utf8Encode(@intCast(v), buf[n..]) catch unreachable;
+        return buf[0..n];
+    }
+
+    fn expectCell(t: *TestTerm, row: u16, col: u16, want: []const u8) !void {
+        var buf: [256]u8 = undefined;
+        const got = t.text(row, col, &buf);
+        if (!std.mem.eql(u8, want, got)) {
+            std.debug.print("cell {d},{d}: want {any} got {any}\n", .{ row, col, want, got });
+            return error.TestExpectedEqual;
+        }
+    }
+
+    fn expectCursor(t: *TestTerm, row: u16, col: u16, pending: bool) !void {
+        try std.testing.expectEqual(Cursor{ .row = row, .col = col }, t.vt.cursor());
+        try std.testing.expectEqual(pending, t.vt.grid().wrap_pending);
+    }
+};
+
+test "mode 2027 off: zero-width code points join the previous cell" {
+    const t = try TestTerm.create(8, 3);
+    defer t.destroy();
+    t.feed("e\u{301}\u{302}x");
+    try t.expectCell(0, 0, "e\u{301}\u{302}");
+    try t.expectCell(0, 1, "x");
+    try t.expectCursor(0, 2, false);
+    try std.testing.expect(t.vt.cell(0, 0).isCluster());
+    try std.testing.expect(!t.vt.cell(0, 1).isCluster());
+    // Nothing to join at the start of a line: dropped.
+    t.feed("\r\n\u{301}a");
+    try t.expectCell(1, 0, "a");
+    // Hangul V/T jamo are zero width; ZWJ joins, the next emoji is its own.
+    t.feed("\u{1100}\u{1161}\u{11a8}\u{1f468}\u{200d}\u{1f469}");
+    try t.expectCell(1, 1, "\u{1100}\u{1161}\u{11a8}");
+    try t.expectCell(1, 3, "\u{1f468}\u{200d}");
+    try t.expectCell(1, 4, "");
+    try t.expectCell(1, 5, "\u{1f469}");
+    try t.expectCursor(1, 7, false);
+    // VS16 only joins an emoji base, and changes no width here.
+    t.feed("\r\na\u{fe0f}\u{2764}\u{fe0f}b");
+    try t.expectCell(2, 0, "a");
+    try t.expectCell(2, 1, "\u{2764}\u{fe0f}");
+    try t.expectCell(2, 2, "b");
+}
+
+test "a cluster ends at any control, escape or cursor move, not at SGR" {
+    const t = try TestTerm.create(10, 4);
+    defer t.destroy();
+    t.feed("e\x1b[31m\u{301}");
+    try t.expectCell(0, 0, "e\u{301}");
+    try t.expectCursor(0, 1, false);
+    // Moved away and back: the cluster is closed.
+    t.feed("\x1b[D\x1b[C\u{302}");
+    try t.expectCell(0, 0, "e\u{301}");
+    t.feed("a\r\x1b[2C\u{302}");
+    try t.expectCell(0, 1, "a");
+    t.feed("\x1b[H\x1b[?2027hb\x1b[1m\u{301}\x1b[?2027l\u{302}");
+    try t.expectCell(0, 0, "b\u{301}");
+    // A direct cursor move (no parser in between) is noticed too.
+    t.vt.printCodepoint('q');
+    t.vt.cup(3, 3);
+    t.vt.printCodepoint(0x301);
+    try t.expectCell(0, 1, "q");
+    try t.expectCell(2, 2, " ");
+}
+
+test "a mark at the last column joins the cell under the pending wrap" {
+    const t = try TestTerm.create(4, 3);
+    defer t.destroy();
+    t.feed("abcd\u{301}");
+    try t.expectCell(0, 3, "d\u{301}");
+    try t.expectCursor(0, 3, true);
+    t.feed("e");
+    try t.expectCell(1, 0, "e");
+    // Same with 2027 and a cluster that stays narrow.
+    t.feed("\x1b[?2027h\r\nwxyz\u{301}\u{302}");
+    try t.expectCell(2, 3, "z\u{301}\u{302}");
+    try t.expectCursor(2, 3, true);
+}
+
+test "mode 2027: extended grapheme clusters and their widths" {
+    const t = try TestTerm.create(20, 6);
+    defer t.destroy();
+    t.feed("\x1b[?2027h");
+    // ZWJ sequence: one wide cell.
+    t.feed("\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}x");
+    try t.expectCell(0, 0, "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}");
+    try t.expectCell(0, 1, "");
+    try t.expectCell(0, 2, "x");
+    // Flags pair up; a third indicator starts a new cluster.
+    t.feed("\r\n\u{1f1fa}\u{1f1f8}\u{1f1eb}\u{1f1f7}\u{1f1e9}");
+    try t.expectCell(1, 0, "\u{1f1fa}\u{1f1f8}");
+    try t.expectCell(1, 2, "\u{1f1eb}\u{1f1f7}");
+    try t.expectCell(1, 4, "\u{1f1e9}");
+    try t.expectCursor(1, 6, false);
+    // Hangul L V T and LV T; skin tone modifier.
+    t.feed("\r\n\u{1100}\u{1161}\u{11a8}\u{ac00}\u{11a8}\u{1f44d}\u{1f3fd}");
+    try t.expectCell(2, 0, "\u{1100}\u{1161}\u{11a8}");
+    try t.expectCell(2, 2, "\u{ac00}\u{11a8}");
+    try t.expectCell(2, 4, "\u{1f44d}\u{1f3fd}");
+    try t.expectCursor(2, 6, false);
+    // VS16 widens a text-style emoji, VS15 narrows a wide one; a VS after
+    // a non-base is dropped.
+    t.feed("\r\n\u{2764}\u{fe0f}|\u{231a}\u{fe0e}|a\u{fe0f}|");
+    try t.expectCell(3, 0, "\u{2764}\u{fe0f}");
+    try t.expectCell(3, 1, "");
+    try t.expectCell(3, 2, "|");
+    try t.expectCell(3, 3, "\u{231a}\u{fe0e}");
+    try t.expectCell(3, 4, "|");
+    try t.expectCell(3, 5, "a");
+    try t.expectCell(3, 6, "|");
+    // Spacing mark (GB9a) and Prepend (GB9b) join and make the cluster wide
+    // (a code point with a width of its own, as Ghostty counts it).
+    t.feed("\r\n\u{915}\u{93f}|\u{600}1|");
+    try t.expectCell(4, 0, "\u{915}\u{93f}");
+    try t.expectCell(4, 2, "|");
+    try t.expectCell(4, 3, "\u{600}1");
+    try t.expectCell(4, 5, "|");
+    // GB9c: consonant + virama + consonant is one (wide) cluster.
+    t.feed("\r\n\u{915}\u{94d}\u{924}x");
+    try t.expectCell(5, 0, "\u{915}\u{94d}\u{924}");
+    try t.expectCell(5, 2, "x");
+}
+
+test "mode 2027: a cluster that turns wide at the margin moves to the next line" {
+    const t = try TestTerm.create(4, 3);
+    defer t.destroy();
+    t.feed("\x1b[?2027habc\u{2764}\u{fe0f}");
+    try t.expectCell(0, 3, " ");
+    try t.expectCell(1, 0, "\u{2764}\u{fe0f}");
+    try t.expectCell(1, 1, "");
+    try t.expectCursor(1, 2, false);
+    try std.testing.expect(t.vt.grid().wraps[t.vt.grid().lineIndex(0)] != 0);
+    // One column from the margin it fits, and the wrap is pending.
+    t.feed("\r\x1b[Kab\u{2764}\u{fe0f}");
+    try t.expectCell(1, 2, "\u{2764}\u{fe0f}");
+    try t.expectCursor(1, 3, true);
+    // Without autowrap the selector is dropped.
+    t.feed("\x1b[?7l\r\n\x1b[Kabc\u{2764}\u{fe0f}");
+    try t.expectCell(2, 3, "\u{2764}");
+    try t.expectCursor(2, 3, false);
+}
+
+test "cluster length is bounded" {
+    for ([_]bool{ false, true }) |shaping| {
+        const t = try TestTerm.create(8, 2);
+        defer t.destroy();
+        if (shaping) t.feed("\x1b[?2027h");
+        t.feed("e");
+        for (0..3 * Clusters.max_len) |_| t.feed("\u{301}");
+        t.feed("x");
+        var one: u32 = undefined;
+        const got = t.vt.styles.text(t.vt.cell(0, 0), &one);
+        try std.testing.expectEqual(@as(usize, Clusters.max_len), got.len);
+        try std.testing.expectEqual(@as(u32, 'e'), got[0]);
+        try t.expectCell(0, 1, "x");
+        try t.expectCursor(0, 2, false);
+    }
+}
+
+test "REP repeats a cluster's base character" {
+    const t = try TestTerm.create(8, 2);
+    defer t.destroy();
+    t.feed("e\u{301}\x1b[2b");
+    try t.expectCell(0, 0, "e\u{301}");
+    try t.expectCell(0, 1, "e");
+    try t.expectCell(0, 2, "e");
+    try t.expectCursor(0, 3, false);
+}
+
+test "insert, delete, erase and reflow keep clusters in their cells" {
+    const t = try TestTerm.create(6, 4);
+    defer t.destroy();
+    t.feed("ae\u{301}b\x1b[H\x1b[2@");
+    try t.expectCell(0, 3, "e\u{301}");
+    t.feed("\x1b[P");
+    try t.expectCell(0, 2, "e\u{301}");
+    t.feed("\x1b[1;2H\x1b[X");
+    try t.expectCell(0, 2, "e\u{301}");
+    t.feed("\r\nabcde\u{301}fgh");
+    try t.expectCell(1, 4, "e\u{301}");
+    try t.vt.resize(10, 4);
+    try t.expectCell(1, 4, "e\u{301}");
+    try t.expectCell(1, 7, "h");
+    try t.vt.resize(3, 6);
+    const dump = try t.vt.dumpAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(dump);
+    try std.testing.expect(std.mem.indexOf(u8, dump, "abc\nde\u{301}f\ngh") != null);
+    // Scrolled into history and back: same cell.
+    t.feed("\r\n\n\n\n\n\n");
+    try t.vt.resize(10, 4);
+    t.vt.viewScroll(10);
+    var found = false;
+    var r: u16 = 0;
+    while (r < 4) : (r += 1) {
+        var buf: [64]u8 = undefined;
+        if (std.mem.eql(u8, t.text(r, 4, &buf), "e\u{301}")) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "GraphemeBreakTest.txt clusters print as one cell each (mode 2027)" {
+    const Table = @import("type/grapheme_table.zig");
+    const gpa = std.testing.allocator;
+    var dummy: [1]u8 = .{0};
+    var checked: usize = 0;
+    cases: for (Table.break_tests) |case| {
+        // Controls are not printed, and a cluster that starts with a
+        // zero-width code point is dropped (nothing to join): skip those.
+        for (case) |v| {
+            const p = Grapheme.props(@intCast(v & 0x1FFFFF));
+            if (p.class == .control or p.class == .cr or p.class == .lf) continue :cases;
+            if (v & 0x8000_0000 != 0 and p.width == 0) continue :cases;
+        }
+        var vt = try VtState.init(gpa, 200, 1, 1, &dummy);
+        defer vt.deinit();
+        vt.flags.grapheme_shaping = true;
+        for (case) |v| vt.printCodepoint(@intCast(v & 0x1FFFFF));
+        // Expected cells: each cluster without the selectors it ignores.
+        var col: u16 = 0;
+        var i: usize = 0;
+        while (i < case.len) {
+            var want: [64]u32 = undefined;
+            var n: usize = 0;
+            var prev: Grapheme.Props = undefined;
+            var j = i;
+            while (j < case.len and (j == i or case[j] & 0x8000_0000 == 0)) : (j += 1) {
+                const cp: u21 = @intCast(case[j] & 0x1FFFFF);
+                const p = Grapheme.props(cp);
+                if (j != i and Grapheme.effect(prev, cp, p) == .ignore) continue;
+                want[n] = cp;
+                n += 1;
+                prev = p;
+            }
+            var one: u32 = undefined;
+            const c = vt.cell(0, col);
+            try std.testing.expectEqualSlices(u32, want[0..n], vt.styles.text(c, &one));
+            col += 1;
+            if (col < 200 and vt.cell(0, col).codepoint == 0) col += 1;
+            i = j;
+        }
+        try std.testing.expectEqual(col, vt.cursor().col);
+        checked += 1;
+    }
+    try std.testing.expect(checked > 300);
+}
+
+test "a tiny cluster table compacts often and every cell keeps its cluster" {
+    const pieces = [_][]const u8{
+        "e\u{301}", "a\u{302}\u{303}", "\u{1f468}\u{200d}\u{1f469}", "x", " ", "\r\n", "\n", "\x1b[2J", "\x1b[H", "\x1b[3@",
+        "\x1b[2P", "\x1b[K", "\x1b[?1049h", "\x1b[?1049l", "\x1b[?2027h", "\x1b[?2027l", "\u{2764}\u{fe0f}", "\u{1f1fa}\u{1f1f8}",
+        "\x1b[31m", "\x1b[S", "\x1b[T", "\x1b[3b", "\x1b[2J\x1b[3J", "\x1b[2J\x1b[3J",
+    };
+    var prng = std.Random.DefaultPrng.init(5);
+    const rand = prng.random();
+    for (0..6) |_| {
+        const a = try TestTerm.create(13, 6);
+        defer a.destroy();
+        const b = try TestTerm.create(13, 6);
+        defer b.destroy();
+        a.vt.styles.clusters.limit = 4;
+        var gens: u32 = 0;
+        for (0..1500) |step| {
+            var buf: [16]u8 = undefined;
+            // Mostly fresh clusters: a base and up to three random marks.
+            const piece = if (rand.uintLessThan(u8, 2) == 0) blk: {
+                var n: usize = 0;
+                buf[n] = 'a' + rand.uintLessThan(u8, 26);
+                n += 1;
+                for (0..1 + rand.uintLessThan(u8, 3)) |_| n += std.unicode.utf8Encode(0x300 + rand.uintLessThan(u21, 0x70), buf[n..]) catch unreachable;
+                break :blk buf[0..n];
+            } else pieces[rand.uintLessThan(usize, pieces.len)];
+            const gen = a.vt.styles.gen;
+            a.feed(piece);
+            b.feed(piece);
+            if (a.vt.styles.gen != gen) gens += 1;
+            if (step % 211 == 210) {
+                const cols: u16 = @intCast(8 + rand.uintLessThan(u16, 10));
+                try a.vt.resize(cols, 6);
+                try b.vt.resize(cols, 6);
+            }
+            for (0..2) |k| try expectSameCells(&b.vt, b.vt.grids[k].cells, &a.vt, a.vt.grids[k].cells);
+            try std.testing.expect(a.vt.styles.clusters.spans.items.len <= a.vt.styles.clusters.limit);
+        }
+        try std.testing.expect(gens > 10);
+    }
+}
+
+test "vt fixtures stay byte-identical" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var dir = std.Io.Dir.cwd().openDir(io, "tests/vt", .{ .iterate = true }) catch return error.SkipZigTest;
+    defer dir.close(io);
+    var it = dir.iterate();
+    var n: usize = 0;
+    while (try it.next(io)) |entry| {
+        if (!std.mem.endsWith(u8, entry.name, ".in")) continue;
+        const raw = try dir.readFileAlloc(io, entry.name, gpa, .unlimited);
+        defer gpa.free(raw);
+        const nl = std.mem.indexOfScalar(u8, raw, '\n') orelse return error.InvalidFixture;
+        var dims = std.mem.tokenizeScalar(u8, raw[0..nl], ' ');
+        const cols = try std.fmt.parseInt(u16, dims.next().?, 10);
+        const rows = try std.fmt.parseInt(u16, dims.next().?, 10);
+        const t = try TestTerm.create(cols, rows);
+        defer t.destroy();
+        t.feed(raw[nl + 1 ..]);
+        const stem = entry.name[0 .. entry.name.len - 3];
+        for ([_][]const u8{ ".dump", ".cells" }) |ext| {
+            var name_buf: [128]u8 = undefined;
+            const name = try std.fmt.bufPrint(&name_buf, "{s}{s}", .{ stem, ext });
+            const want = try dir.readFileAlloc(io, name, gpa, .unlimited);
+            defer gpa.free(want);
+            const got = if (ext[1] == 'd') try t.vt.dumpAlloc(gpa) else try t.vt.dumpCellsAlloc(gpa);
+            defer gpa.free(got);
+            try std.testing.expectEqualStrings(std.mem.trimEnd(u8, want, "\n"), std.mem.trimEnd(u8, got, "\n"));
+        }
+        n += 1;
+    }
+    try std.testing.expect(n >= 5);
 }
