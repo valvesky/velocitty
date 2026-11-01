@@ -34,22 +34,17 @@
 
 Velocitty is a lightning-fast terminal for Omarchy. 
 
-Releases for Windows and MacOS are available.
-
-
-
-It's a streamlined version of my GPU-accelerated terminal multiplexer [VT](https://github.com/valvesky/vt).
+Releases for Linux, Windows and macOS are available.
 
 ## Features
-- Lightning fast (literally bottlenecked by the kernel)
-- `cat` large files.
-- Cross-platform through Peak: Linux (Wayland/X11), Windows (ConPTY), and macOS (AppKit).
+- Lightning fast.
 - CPU rendered.
-- Image support (sixel)
+- Graphics support.
 - Extensive unicode support.
 - Simple config file.
-- Uses native system libraries and fonts.
+- Automatically load native system libraries and fonts.
 - Omarchy color palette change and font change (live reloaded).
+- Cross-platform thanks to [godstack/Peak](https://github.com/godxgun/godstack)
 
 ## Anti-Features
 - No kitty style CTL.
@@ -60,7 +55,17 @@ It's a streamlined version of my GPU-accelerated terminal multiplexer [VT](https
 
 Download from [releases](https://github.com/valvesky/velocitty/releases).
 
-- **Linux:** GNU and musl tarballs for x86_64 and aarch64. Extract the archive and install the binary, desktop entry, icon, and man page under your preferred prefix.
+- **Linux:** Download the GNU or musl tarball for your architecture. For example, on x86_64 GNU/Linux, set `VERSION` to a release version and run:
+
+  ```sh
+  VERSION=1.3.0  # Replace with the desired release version
+  curl -fLO "https://github.com/valvesky/velocitty/releases/download/v${VERSION}/velocitty-${VERSION}-x86_64-linux-gnu.tar.gz"
+  tar xf "velocitty-${VERSION}-x86_64-linux-gnu.tar.gz"
+  cd "velocitty-${VERSION}-x86_64-linux-gnu"
+  sudo make install
+  ```
+
+  This installs to `/usr/local`; use `sudo make install PREFIX=/usr` for `/usr`, or `sudo make uninstall` to remove it (with the same `PREFIX` if customized).
 - **Windows 10 1903+:** run the per-user installer `.exe`, or extract the portable `.zip` and launch `velocitty.exe`.
 - **macOS 11+:** open the universal `.dmg` and drag `Velocitty.app` into Applications. It supports Intel and Apple Silicon.
 
@@ -99,16 +104,10 @@ See [example.config.toml](example.config.toml). The TOML subset is similar to Al
 
 Desktop notifications and kitty file/temporary-file image transfers currently use the Linux implementation. Streamed kitty graphics and sixel work across platforms; use `icat --transfer-mode=stream` on Windows/macOS.
 
-
-## Special Thanks
-- Mitchell Hashimoto 
-    1. https://x.com/mitchellh/status/2115292243443519571
-    2. 
-
 ## Shoutouts
 
-- [refterm](https://github.com/cmuratori/refterm) --- Most of the
-- [kitty](https://sw.kovidgoyal.net/kitty/) --- how to meow
-- [ghostty](https://ghostty.org) --- how to render glyph good
-- [foot](https://codeberg.org/dnkl/foot) --- Profile optimized glyph parsing.
+- [refterm](https://github.com/cmuratori/refterm) --- Original motivation.
+- [kitty](https://sw.kovidgoyal.net/kitty/) --- Gow to meow.
+- [ghostty](https://ghostty.org) --- Glyph rendering and style caching.
+- [foot](https://codeberg.org/dnkl/foot) --- Profile optimized builds and VT features.
 - [vt](https://github.com/valvesky/vt) --- My previous shot at a terminal.
