@@ -172,7 +172,8 @@
 
             <figure>
                 <img src="velocitty-vs-ghostty.png" alt="Headless VT throughput: Velocitty exact and text skipping versus Ghostty 1.4.0 exact">
-                <figcaption>Velocitty worktree (<code>74fb03457bae-dirty</code>) in exact and <code>--drop</code> text-skipping modes versus ghostty-bench 1.4.0 exact, on an Intel i7-10610U. Median of five CPU-time runs on 2026-11-01, generated via <code>scripts/bench_vs_ghostty.py</code>; no rendering or window presentation.</figcaption>
+                <figcaption>velocitty-bench 1.3 in exact and <code>--drop</code> text-skipping modes versus ghostty-bench 1.4.0 exact, on an Intel i7-10610U.
+                    Median of five CPU-time runs on 2026-11-01, generated via <code>scripts/bench_vs_ghostty.py</code>. No rendering or window presentation.</figcaption>
             </figure>
 
             <p>The compatible <code>+terminal-stream</code> mode in <code>velocitty-bench</code>
@@ -180,11 +181,6 @@
             It doesn't require the two programs to take exactly the same wall-clock time. Using
             the same stream also avoids differences caused by applications choosing different
             output for <code>TERM=xterm-256color</code> and <code>xterm-ghostty</code>.</p>
-
-            <p>This chart is a snapshot of that worktree, not a measurement of every change made
-            since. Each workload has its own zero-based linear scale, so compare bars
-            <em>within</em> a workload, not between workloads. Redrawing the chart doesn't rerun
-            the benchmark.</p>
 
             <h2 id="appendix">Early designs</h2>
 
