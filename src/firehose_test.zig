@@ -82,15 +82,16 @@ const Pair = struct {
         while (rest.len != 0) {
             var free = p.freeSpace(i);
             if (free == 0) {
-                p.ring[i].drain(p.vt[i].sink());
+                p.ring[i].drain(p.vt[i].sink(), true);
                 free = p.freeSpace(i);
                 if (free == 0) return error.RingStalled;
             }
             const n = @min(free, rest.len);
             p.put(i, rest[0..n]);
-            p.ring[i].drain(p.vt[i].sink());
+            p.ring[i].drain(p.vt[i].sink(), true);
             rest = rest[n..];
         }
+        p.ring[i].drain(p.vt[i].sink(), false);
     }
 
     /// Through `readSource` with a fake nonblocking source.
@@ -100,7 +101,7 @@ const Pair = struct {
         while (src.pos < bytes.len) {
             const before = src.pos;
             p.ring[i].readSource(&src, 1_000_000_000, null, p.vt[i].sink()) catch return error.Hangup;
-            p.ring[i].drain(p.vt[i].sink());
+            p.ring[i].drain(p.vt[i].sink(), false);
             if (src.pos == before) {
                 stalls += 1;
                 if (stalls > 2) return error.RingStalled;
@@ -440,7 +441,7 @@ fn sweep(name: []const u8, cols: u16, rows: u16, bytes: []const u8) !void {
 }
 
 /// Odd-sized reads that end exactly at each `cuts` offset; counts the reads
-/// that went outside the ring (straight into the spill buffer).
+/// that went outside the ring (straight into the stream buffer).
 const PieceSource = struct {
     data: []const u8,
     cuts: []const usize,
@@ -472,7 +473,7 @@ const PieceSource = struct {
     }
 };
 
-test "one-string kitty image larger than the ring: read into spill, then handed to the image" {
+test "one-string kitty image larger than the ring: read into stream, then handed to the image" {
     // Not subject to the drain/exact mismatches below: ring 4096 and an
     // image of 64x64 RGBA (21848 base64 bytes) in a single APC.
     const p = try Pair.create("one-apc-image", 20, 5, 4096);
@@ -495,15 +496,15 @@ test "one-string kitty image larger than the ring: read into spill, then handed 
     while (src.pos < stream.items.len) {
         try p.ring[1].readSource(&src, 1_000_000_000, null, p.vt[1].sink());
     }
-    p.ring[1].drain(p.vt[1].sink());
+    p.ring[1].drain(p.vt[1].sink(), true);
 
     try std.testing.expect(src.direct > 4);
     const img = p.vt[1].kitty.find(9) orelse return error.NoImage;
     const pend = img.pending orelse return error.NotPending;
-    // The base64 stayed where read(2) wrote it: the image owns the spill buffer.
+    // The base64 stayed where read(2) wrote it: the image owns the stream buffer.
     try std.testing.expect(pend.owned.len != 0);
     try std.testing.expectEqualSlices(u8, &b64, pend.data);
-    try std.testing.expectEqual(@as(usize, 0), p.ring[1].spill.capacity);
+    try std.testing.expectEqual(@as(usize, 0), p.ring[1].stream.capacity);
     try std.testing.expect(p.compare());
     const shown = p.vt[1].kitty.find(9).?;
     try std.testing.expectEqualSlices(u8, &raw, shown.rgba);
@@ -513,6 +514,61 @@ test "one-string kitty image larger than the ring: read into spill, then handed 
 }
 
 // ------------------------------------------------------------ reviewer cases
+
+test "repeated obsolete-span consumption preserves state queries images and incomplete suffixes" {
+    for ([_]usize{ 1024, 4096 }) |ring_size| {
+        for (0..12) |seed| {
+            var random = std.Random.DefaultPrng.init(0xD34D_20AE + seed);
+            const rnd = random.random();
+            var bytes: std.ArrayList(u8) = .empty;
+            defer bytes.deinit(gpa);
+            for (0..2000) |_| {
+                const idx = rnd.uintLessThan(u32, text_pieces.len + ctl_pieces.len);
+                try bytes.appendSlice(gpa, pieceBytes(idx));
+            }
+            const p = try Pair.create("obsolete spans", 12, 5, ring_size);
+            defer p.destroy();
+            var at: usize = 0;
+            var trims: usize = 0;
+            while (at < bytes.items.len) {
+                const n = @min(@min(p.freeSpace(1), 113), bytes.items.len - at);
+                try std.testing.expect(n != 0);
+                try p.write(0, bytes.items[at..][0..n]);
+                p.put(1, bytes.items[at..][0..n]);
+                at += n;
+                if (p.ring[1].head - p.ring[1].tail > ring_size - ring_size / 4) {
+                    const before = p.ring[1].tail;
+                    p.ring[1].drain(p.vt[1].sink(), true);
+                    try std.testing.expect(p.ring[1].tail > before);
+                    trims += 1;
+                    if (trims % 5 == 0) {
+                        p.ring[1].drain(p.vt[1].sink(), true);
+                        try std.testing.expect(p.compare());
+                    }
+                }
+            }
+            p.ring[1].drain(p.vt[1].sink(), true);
+            try std.testing.expect(trims > 5);
+            try std.testing.expect(p.compare());
+        }
+    }
+}
+
+test "large SGR-heavy reads do not prune visible ASCII or UTF-8" {
+    const p = try Pair.create("visible pressure text", 80, 4, 4096);
+    defer p.destroy();
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(gpa);
+    for (0..10) |i| {
+        try bytes.appendSlice(gpa, if (i % 2 == 0) "x" else "旦");
+        for (0..1000) |_| try bytes.appendSlice(gpa, "\x1b[31m");
+    }
+    try bytes.appendSlice(gpa, "\x1b[6n");
+    try p.write(0, bytes.items);
+    try p.writeSource(1, bytes.items, 1024);
+    try std.testing.expect(p.compare());
+    try std.testing.expectEqual(@as(u16, 15), p.vt[1].grid().cursor.col);
+}
 
 test "CPR after dropped text" {
     try one("cpr", 8, 3, "ABC\x1b[6n\x1b[H\x1b[2J");
@@ -719,7 +775,7 @@ test "split at every byte: DCS DECRQSS" {
     try sweep("split-decrqss", 8, 3, "\x1b[2;3r\x1bP$qr\x1b\\\x1b[H\x1b[2J\x1bP$qm\x1b\\");
 }
 
-test "strings longer than the ring: OSC (spill)" {
+test "strings longer than the ring: OSC (stream)" {
     try one("long-osc", 8, 3, "A\x1b]2;" ++ rep("t", 5000) ++ "\x07\x1b[H\x1b[2JX");
 }
 
@@ -964,4 +1020,27 @@ test "an invalid DECSTBM keeps the region" {
 
 test "SGR 0 clears the underline color" {
     try one("ul-color", 8, 3, "\x1b[58;2;1;2;3m\x1b[m\x1b[2J");
+}
+
+test "one MiB lookahead preserves graphemes replies modes and chunked graphics across bounded worksets" {
+    var bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer bytes.deinit(gpa);
+    try bytes.appendSlice(gpa, "\x1b[?2027h\x1b_Ga=t,f=32,s=1,v=1,i=77,q=2,m=1;/wAA\x1b\\");
+    for (0..60000) |i| {
+        try bytes.print(gpa, "\x1b[38;2;{d};{d};{d}me\u{301}\x1b[1m\u{302}\u{2764}\u{fe0f} bounded\r\n", .{ i % 256, (i / 256) % 256, (i * 7) % 256 });
+        if (i % 257 == 0) try bytes.appendSlice(gpa, "\x1b[?2027s\x1b[?2027l\x1b[?2027r\x1b]2;bounded\x07\x1b[6n");
+        if (i % 2048 == 0) try bytes.appendSlice(gpa, "\x1b[2;5r\x1b[?6hX\x1b[?6l\x1b[r");
+    }
+    try bytes.appendSlice(gpa, "\x1b[H\x1b[2J\x1b_Gm=0;/w==\x1b\\\x1b_Ga=p,i=77,q=2,c=1,r=1;\x1b\\e\u{301}\x1b[31m\u{302}\x1b[6n");
+    try std.testing.expect(bytes.items.len > 2 * CircBuffer.default_capacity);
+    const p = try Pair.create("bounded-lookahead", 13, 6, CircBuffer.default_capacity);
+    defer p.destroy();
+    for (0..2) |i| try p.writeSource(i, bytes.items, 4093);
+    try std.testing.expect(p.compare());
+    try std.testing.expect(p.vt[1].kitty.find(77) != null);
+    try std.testing.expectEqual(@as(usize, 1), p.vt[1].kitty.placements.items.len);
+    for (&p.ring) |*ring| {
+        try std.testing.expectEqual(ring.head, ring.tail);
+        try std.testing.expect(ring.preparser.metadataCapacityBytes() <= @import("preparser.zig").Preparser.max_metadata_bytes);
+    }
 }

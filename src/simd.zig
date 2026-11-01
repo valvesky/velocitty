@@ -109,6 +109,66 @@ pub inline fn skipToAny(slice: []const u8, comptime set: []const u8) u32 {
     return offset;
 }
 
+pub const TextScan = struct {
+    /// `skipToAny(slice, set)`.
+    stop: u32,
+    /// Leading bytes in 0x20..0x7E (at most `stop`).
+    plain: u32,
+};
+
+/// `skipToAny` that also finds, in the same pass, where the printable
+/// ASCII prefix ends (every byte of `set` must be outside 0x20..0x7E).
+pub inline fn scanText(slice: []const u8, comptime set: []const u8) TextScan {
+    inline for (set) |b| comptime std.debug.assert(b < 0x20 or b > 0x7E);
+    var offset: u32 = 0;
+    const slice_len: u32 = @intCast(slice.len);
+    var plain: u32 = std.math.maxInt(u32);
+    const lo: Vec = @splat(0x20);
+    const span: Vec = @splat(0x7E - 0x20);
+    while (offset + vec_len <= slice_len) {
+        const chunk: Vec = slice[offset..][0..vec_len].*;
+        var matches: @Vector(vec_len, bool) = @splat(false);
+        inline for (set) |b| matches = matches | (chunk == @as(Vec, @splat(b)));
+        if (plain == std.math.maxInt(u32)) {
+            const other: Mask = @bitCast(chunk -% lo > span);
+            if (other != 0) plain = offset + @ctz(other);
+        }
+        const mask: Mask = @bitCast(matches);
+        if (mask != 0) {
+            const stop = offset + @ctz(mask);
+            return .{ .stop = stop, .plain = @min(plain, stop) };
+        }
+        offset += vec_len;
+    }
+    while (offset < slice_len) : (offset += 1) {
+        const c = slice[offset];
+        if (plain == std.math.maxInt(u32) and (c < 0x20 or c > 0x7E)) plain = offset;
+        inline for (set) |b| if (c == b) return .{ .stop = offset, .plain = @min(plain, offset) };
+    }
+    return .{ .stop = offset, .plain = @min(plain, offset) };
+}
+
+test "scanText finds the stop and the printable prefix in one pass" {
+    var buf: [200]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(3);
+    const rnd = prng.random();
+    const set = [_]u8{ 0x0A, 0x1B };
+    for (0..2000) |_| {
+        const n = rnd.uintLessThan(usize, buf.len);
+        for (buf[0..n]) |*b| b.* = switch (rnd.uintLessThan(u8, 10)) {
+            0 => 0x0A,
+            1 => 0x1B,
+            2 => 0x09,
+            3 => 0xC3,
+            4 => 0x7F,
+            else => 0x20 + rnd.uintLessThan(u8, 0x5F),
+        };
+        const got = scanText(buf[0..n], &set);
+        try std.testing.expectEqual(skipToAny(buf[0..n], &set), got.stop);
+        try std.testing.expectEqual(@min(skipOutRange(buf[0..n], 0x20, 0x7E), got.stop), got.plain);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // UTF-8 runs
 //

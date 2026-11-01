@@ -6,7 +6,7 @@
 <!-- </p> -->
 
 <p align="center">
-  <img src="icon.png" alt="Velocitty icon" width="128">
+  <img src="assets/icon.png" alt="Velocitty icon" width="128">
 </p>
 
 <p align="center">

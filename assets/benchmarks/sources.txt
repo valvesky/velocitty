@@ -1,0 +1,12 @@
+Comparison-chart marker assets (not application icons)
+
+Ghost: ghost-emoji.png is U+1F47B (👻). Lightning: lightning.png is
+U+26A1 (⚡). Both were rendered from Noto Color Emoji using pango-view,
+trimmed and centered in a 96x96 transparent PNG.
+Source font: https://github.com/googlefonts/noto-emoji
+The font is SIL OFL 1.1; that license does not apply to documents created
+using the font. No font software is embedded or redistributed here.
+
+The chart embeds these PNGs directly in SVG. lightning-inverted.png is the
+same lightning image with RGB channels inverted (ImageMagick -channel RGB
+-negate +channel); alpha is unchanged.

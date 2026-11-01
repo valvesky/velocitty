@@ -14,7 +14,7 @@ const Type = @import("type.zig");
 const Select = @import("select.zig");
 
 // Same ring, scrollback and glyph cache as main.zig.
-const default_ring_cap = 64 * 1024;
+const default_ring_cap = CircBuffer.default_capacity;
 /// `--ring KIB` (power of two); set once in main before any section runs.
 var ring_cap: usize = default_ring_cap;
 const scrollback = 1000;
@@ -57,7 +57,7 @@ const usage =
     \\  --quick           1 MiB per workload, 40 samples (explicit values still win)
     \\  --mib N           bytes per PTY workload in MiB (1..256; default 4)
     \\  --burst KIB       bytes read per frame (1..48; default 16)
-    \\  --ring KIB        ring size, power of two (default 64, as main.zig)
+    \\  --ring KIB        ring size, power of two (default 1024, as main.zig)
     \\  --grid COLSxROWS  pipeline/render grid (default 120x40)
     \\  --samples N       render frames / glyph batches per row (10..10000; default 200)
     \\  --font PATH       primary font (default: fc-match monospace, like main.zig)
@@ -79,7 +79,7 @@ const usage =
     \\Pipeline rows: one frame = read one burst from a real PTY (writer thread,
     \\raw slave), drain (scan + feed), renderSel, damaged-rows copy (present).
     \\io is time inside read(2); time blocked in poll(2) is io-wait, excluded.
-    \\Logs: bench/<UTC>-<git12>[-dirty].txt and last_bench.
+    \\Logs: bench/<UTC>-<git12>[-dirty].txt.
     \\
 ;
 
@@ -231,7 +231,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 continue;
             };
             if (i != 0) try fallbacks.append(gpa, id);
-            if (ctx_store.faces.items[@intFromEnum(id)].font.color != null) env.emoji = true;
+            if (ctx_store.faces.items[@backingInt(id)].font.color != null) env.emoji = true;
             try log.print("font {s} {s} bytes={d}\n", .{ if (i == 0) "primary " else "fallback", b.path, b.bytes.len });
         }
         if (ctx_store.primary != null) {
@@ -247,7 +247,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
     }
     if (env.ctx == null) try log.print("font NONE: placeholder render, glyph section skipped\n", .{});
-    try log.print("size_px={d} cell={d}x{d} glyph-cache={d} atlas=1024x1024 ring={d}\n", .{ size_px, env.cell_w, env.cell_h, cache_capacity, ring_cap });
+    try log.print("size_px={d} cell={d}x{d} glyph-cache={d} atlas=1024x1024 ring={d} parser-metadata-max={d}\n", .{ size_px, env.cell_w, env.cell_h, cache_capacity, ring_cap, @import("preparser.zig").Preparser.max_metadata_bytes });
     try log.print("p50/p95 are nearest-rank over frames (pipeline/render) or 64-lookup batches (glyph).\n", .{});
 
     if (opt.spin) spinUp();
@@ -827,7 +827,7 @@ fn runPipeline(log: *Log, env: *Env, wl: Workload, bytes: []const u8) !void {
         fed += want;
         var timed = TimedSink{ .term = &p.term };
         const t0 = nowNs();
-        p.ring.drain(timed.sink());
+        p.ring.drain(timed.sink(), false);
         const t2 = nowNs();
         // scan = drain minus the time spent feeding the VT.
         const t1 = t2 - timed.ns;
@@ -852,7 +852,7 @@ fn runPipeline(log: *Log, env: *Env, wl: Workload, bytes: []const u8) !void {
     const kept = frames - warm;
     try log.print("\npipeline {s}: {s}\n", .{ wl.name, wl.about });
     try log.print("  bytes={d} frames={d} (+{d} warm discarded) burst={d} B grid={d}x{d} reads/frame={d:.1} runs/frame={d:.0}\n", .{
-        bytes.len - @min(bytes.len, warm * burst), kept, warm, burst, opt.cols, opt.rows,
+        bytes.len - @min(bytes.len, warm * burst),                        kept,                                                            warm, burst, opt.cols, opt.rows,
         @as(f64, @floatFromInt(reads)) / @as(f64, @floatFromInt(frames)), @as(f64, @floatFromInt(runs)) / @as(f64, @floatFromInt(frames)),
     });
     try log.print("  {s:<8} {s:>10} {s:>10} {s:>10} {s:>7}\n", .{ "stage", "p50 us", "p95 us", "mean us", "share" });
@@ -889,15 +889,17 @@ const TimedSink = struct {
     fn sink(self: *TimedSink) Ring.Sink {
         return .{ .ctx = self, .feed = feed, .view = view };
     }
-    fn feed(ctx: *anyopaque, runs: []const Run, spill: []const u8, owner: *CircBuffer) void {
+    fn feed(ctx: *anyopaque, runs: []const Run, stream: []const u8, owner: *CircBuffer) usize {
         const self: *TimedSink = @ptrCast(@alignCast(ctx));
         const t0 = nowNs();
-        self.term.feedOwned(runs, spill, owner);
+        const consumed = self.term.feedOwned(runs, stream, owner);
         const t1 = nowNs();
         self.ns += t1 - t0;
         self.drain_ns += t1 - self.t_view;
-        self.runs += runs.len;
-        for (runs) |run| self.bytes += run.len;
+        self.t_view = t1;
+        self.runs += consumed;
+        for (runs[0..consumed]) |run| self.bytes += run.len;
+        return consumed;
     }
     fn view(ctx: *anyopaque) Ring.View {
         const self: *TimedSink = @ptrCast(@alignCast(ctx));
@@ -931,9 +933,9 @@ fn runDrain(log: *Log, env: *Env, wl: Workload, bytes: []const u8) !void {
         ring.head += n;
         off += n;
         copy_ns += nowNs() - c0;
-        if (ring.capacity - (ring.head - ring.tail) < ring.capacity / 4) ring.drain(timed.sink());
+        if (ring.capacity - (ring.head - ring.tail) < ring.capacity / 4) ring.drain(timed.sink(), true);
     }
-    ring.drain(timed.sink());
+    ring.drain(timed.sink(), false);
     const total = nowNs() - t_start - copy_ns;
     const scan = total -| timed.ns;
     const nb: f64 = @floatFromInt(bytes.len);
@@ -1006,12 +1008,12 @@ fn terminalStream(args: []const [*:0]const u8) !void {
     defer term.deinit();
     var stream = StreamSink{ .term = &term };
     const sink = stream.sink();
-    // `readSource` like main.zig: ring reads, and straight into the spill
+    // `readSource` like main.zig: ring reads, and straight into the stream
     // buffer while a string is open.
     while (true) {
         ring.readSource(StreamSource{ .fd = fd }, 1_000_000_000, null, sink) catch break;
     }
-    ring.drain(sink);
+    ring.drain(sink, false);
     std.mem.doNotOptimizeAway(term.cursor());
 }
 
@@ -1045,10 +1047,11 @@ const StreamSink = struct {
     fn sink(self: *StreamSink) Ring.Sink {
         return .{ .ctx = self, .feed = feed, .view = view };
     }
-    fn feed(ctx: *anyopaque, runs: []const Run, spill: []const u8, owner: *CircBuffer) void {
+    fn feed(ctx: *anyopaque, runs: []const Run, stream: []const u8, owner: *CircBuffer) usize {
         const self: *StreamSink = @ptrCast(@alignCast(ctx));
-        self.term.feedOwned(runs, spill, owner);
+        const consumed = self.term.feedOwned(runs, stream, owner);
         self.term.reply.clearRetainingCapacity();
+        return consumed;
     }
     fn view(ctx: *anyopaque) Ring.View {
         const self: *StreamSink = @ptrCast(@alignCast(ctx));
@@ -1199,7 +1202,7 @@ fn kittenSuite(log: *Log, env: *Env) !void {
             const pieces = [_][]const u8{ if (rep == 0) "\x1b[?2026h" else "", unit, "\x1b[?2026l\x1b[?2026h" };
             for (pieces) |piece| {
                 // readSource like main.zig: ring reads, then straight into the
-                // spill buffer while a string is open. The copy stands in for
+                // stream buffer while a string is open. The copy stands in for
                 // read(2) and is not timed.
                 var src = MemSource{ .data = piece };
                 while (src.pos < piece.len) ring.readSource(&src, 1_000_000_000, null, sink) catch unreachable;
@@ -1208,7 +1211,7 @@ fn kittenSuite(log: *Log, env: *Env) !void {
             }
             term.reply.clearRetainingCapacity();
         }
-        ring.drain(sink);
+        ring.drain(sink, false);
         const ns = nowNs() - t0 - copy_ns;
         const mib = @as(f64, @floatFromInt(total)) / (1024 * 1024);
         try log.print("  {s:<18} {d:>9.1} {d:>9.1} {d:>10.1}\n", .{ name, mib, @as(f64, @floatFromInt(ns)) / 1e6, mib / (@as(f64, @floatFromInt(ns)) / 1e9) });
@@ -1258,9 +1261,9 @@ fn imageSuite(log: *Log, env: *Env) !void {
         if (!p.ring.mapped) mirror(&p.ring, at, n);
         p.ring.head += n;
         off += n;
-        if (p.ring.capacity - (p.ring.head - p.ring.tail) < p.ring.capacity / 4) p.ring.drain(p.term.sink());
+        if (p.ring.capacity - (p.ring.head - p.ring.tail) < p.ring.capacity / 4) p.ring.drain(p.term.sink(), true);
     }
-    p.ring.drain(p.term.sink());
+    p.ring.drain(p.term.sink(), false);
     const t1 = nowNs();
     p.term.prepareImages();
     const t2 = nowNs();
@@ -1318,21 +1321,23 @@ fn runFirehose(log: *Log, env: *Env, wl: Workload, bytes: []const u8) !void {
     var render_ns: u64 = 0;
     var timed = TimedSink{ .term = &p.term };
     const t_start = nowNs();
-    var last_head: u64 = 0;
+    // Direct stream-buffer reads do not advance ring.head.
+    var received: u64 = 0;
+    var last_received: u64 = 0;
     var last_progress = t_start;
     var done = false;
     while (!done) {
-        p.ring.readSource(FirehoseSource{ .fd = pty.master }, hz, null, timed.sink()) catch return error.PtyRead;
+        p.ring.readSource(FirehoseSource{ .fd = pty.master, .received = &received }, hz, null, timed.sink()) catch return error.PtyRead;
         if (write_failed) return error.PtyWrite;
-        done = p.ring.head >= bytes.len;
-        if (p.ring.head != last_head) {
-            last_head = p.ring.head;
+        done = received >= bytes.len;
+        if (received != last_received) {
+            last_received = received;
             last_progress = nowNs();
         } else if (!done and nowNs() - last_progress > 3 * std.time.ns_per_s) {
             std.debug.print("firehose stalled: head={d} tail={d} len={d} hold={d} open={} write_failed={}\n", .{ p.ring.head, p.ring.tail, bytes.len, p.ring.hold_at_head, p.ring.open != null, write_failed });
             return error.PtyStalled;
         }
-        p.ring.drain(timed.sink());
+        p.ring.drain(timed.sink(), false);
         p.drainHost();
         const t1 = nowNs();
         p.term.prepareImages();
@@ -1348,8 +1353,8 @@ fn runFirehose(log: *Log, env: *Env, wl: Workload, bytes: []const u8) !void {
     const got = visibleState(&p.term);
     const mib = @as(f64, @floatFromInt(bytes.len)) / (1024 * 1024);
     try log.print("  {s:<12} {d:>8.1} {d:>8.1} {d:>8.1} {d:>8.1} {d:>7} {d:>9.1} {s:>5} {s:>6}\n", .{
-        wl.name, @as(f64, @floatFromInt(wall)) / 1e6, @as(f64, @floatFromInt(timed.drain_ns)) / 1e6, @as(f64, @floatFromInt(timed.ns)) / 1e6, @as(f64, @floatFromInt(render_ns)) / 1e6,
-        frames, mib / (@as(f64, @floatFromInt(wall)) / 1e9), if (got.screen == want.screen) "yes" else "NO", if (got.images == want.images) "yes" else "NO",
+        wl.name, @as(f64, @floatFromInt(wall)) / 1e6,         @as(f64, @floatFromInt(timed.drain_ns)) / 1e6,  @as(f64, @floatFromInt(timed.ns)) / 1e6,        @as(f64, @floatFromInt(render_ns)) / 1e6,
+        frames,  mib / (@as(f64, @floatFromInt(wall)) / 1e9), if (got.screen == want.screen) "yes" else "NO", if (got.images == want.images) "yes" else "NO",
     });
 }
 
@@ -1357,8 +1362,11 @@ const hz = 60;
 
 const FirehoseSource = struct {
     fd: linux.fd_t,
+    received: *u64,
     pub fn read(self: FirehoseSource, dest: []u8) !usize {
-        return posix.read(self.fd, dest);
+        const n = try posix.read(self.fd, dest);
+        self.received.* += n;
+        return n;
     }
     pub fn wait(self: FirehoseSource, event_fd: ?c_int, timeout_ms: c_int) void {
         _ = event_fd;
@@ -1397,7 +1405,7 @@ fn referenceState(env: *const Env, bytes: []const u8) !Visible {
     if (!ring.mapped) mirror(&ring, 0, bytes.len);
     ring.head = bytes.len;
     ring.exact = true;
-    ring.drain(term.sink());
+    ring.drain(term.sink(), false);
     return visibleState(&term);
 }
 
@@ -1506,7 +1514,7 @@ fn collect(ctx: *Type.Context, gpa: std.mem.Allocator, out: *std.ArrayList(u21),
         while (cp < r[1] and out.items.len < max) : (cp += 1) {
             const g = ctx.glyph(cp, size_px) catch continue;
             if (g.glyph_id == 0 or g.width == 0) continue;
-            const key = (@as(u64, @intFromEnum(g.font_id)) << 32) | g.glyph_id;
+            const key = (@as(u64, @backingInt(g.font_id)) << 32) | g.glyph_id;
             if ((try seen.getOrPut(gpa, key)).found_existing) continue;
             try out.append(gpa, cp);
         }
@@ -1840,11 +1848,7 @@ fn saveLog(io: std.Io, log: *Log, stamp: [18]u8, hash: []const u8, dirty: bool) 
         std.debug.print("bench: save {s}: {s}\n", .{ name, @errorName(err) });
         return err;
     };
-    cwd.writeFile(io, .{ .sub_path = "last_bench", .data = data }) catch |err| {
-        std.debug.print("bench: save last_bench (stamped log saved): {s}\n", .{@errorName(err)});
-        return err;
-    };
-    std.debug.print("saved {s} and last_bench\n", .{name});
+    std.debug.print("saved {s}\n", .{name});
 }
 
 // ---------------------------------------------------------------- tests
@@ -1904,7 +1908,7 @@ test "benchmark workloads parse completely and images reach the store" {
             if (!ring.mapped) mirror(&ring, at, n);
             ring.head += n;
             off += n;
-            ring.drain(term.sink());
+            ring.drain(term.sink(), false);
         }
         try std.testing.expectEqual(ring.head, ring.tail);
         if (std.mem.eql(u8, wl.name, "kitty-image") or std.mem.eql(u8, wl.name, "sixel")) {
@@ -1922,6 +1926,19 @@ test "benchmark PTY pipeline delivers every byte" {
     defer log.buffer.deinit();
     try runPipeline(&log, &env, workloads[0], bytes);
     try std.testing.expect(std.mem.indexOf(u8, log.buffer.writer.buffered(), "pipeline ascii") != null);
+}
+
+test "benchmark firehose counts bytes read directly into stream storage" {
+    const gpa = std.testing.allocator;
+    var env: Env = .{ .gpa = gpa, .io = std.Io.Threaded.global_single_threaded.io(), .opt = .{ .cols = 40, .rows = 10 }, .ctx = null, .cell_w = 8, .cell_h = 16, .emoji = false };
+    var log: Log = .{ .buffer = .init(gpa), .echo = false };
+    defer log.buffer.deinit();
+    for (workloads) |wl| if (std.mem.eql(u8, wl.name, "long-escape")) {
+        const bytes = try generate(gpa, wl, 256 * 1024);
+        defer gpa.free(bytes);
+        try runFirehose(&log, &env, wl, bytes);
+        try std.testing.expect(std.mem.count(u8, log.buffer.writer.buffered(), "yes") == 2);
+    };
 }
 
 test "firehose drain keeps the final screen and images exact" {
@@ -1944,9 +1961,9 @@ test "firehose drain keeps the final screen and images exact" {
             if (!ring.mapped) mirror(&ring, at, n);
             ring.head += n;
             off += n;
-            if (ring.capacity - (ring.head - ring.tail) < ring.capacity / 4) ring.drain(term.sink());
+            if (ring.capacity - (ring.head - ring.tail) < ring.capacity / 4) ring.drain(term.sink(), true);
         }
-        ring.drain(term.sink());
+        ring.drain(term.sink(), false);
         const want = try referenceState(&env, bytes);
         const got = visibleState(&term);
         std.testing.expectEqual(want, got) catch |err| {

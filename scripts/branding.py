@@ -64,24 +64,9 @@ def render(source, destination, size=None):
 
 def main():
     art = (ROOT / 'assets/wordmark.txt').read_text().splitlines()
-    # Smooth vector bolt; a round same-ink stroke softens the corners.
-    bolt = 'M370 30 L128 280 L252 280 L146 486 L394 210 L268 210 Z'
-    icon = ('<g transform="translate(256 258) scale(.86) translate(-261 -258)">'
-            f'<path d="{bolt}" fill="url(#ink)" stroke="url(#ink)" stroke-width="14" stroke-linejoin="round" filter="url(#shadow)"/>'
-            f'<path d="{bolt}" fill="url(#gloss)" stroke-width="0"/></g>')
-    gradient = '''<defs>
-      <linearGradient id="plate" x2="0" y2="1"><stop stop-color="#252b34"/><stop offset=".48" stop-color="#141920"/><stop offset="1" stop-color="#0b0e13"/></linearGradient>
-      <linearGradient id="rim" x2="0" y2="1"><stop stop-color="#ffffff" stop-opacity=".24"/><stop offset=".4" stop-color="#ffffff" stop-opacity=".05"/><stop offset="1" stop-color="#ffffff" stop-opacity=".09"/></linearGradient>
-      <linearGradient id="ink" x1="0" y1="30" x2="0" y2="486" gradientUnits="userSpaceOnUse"><stop stop-color="#fff0a5"/><stop offset=".35" stop-color="#ffcb59"/><stop offset="1" stop-color="#ff8e00"/></linearGradient>
-      <linearGradient id="gloss" x1="0" y1="30" x2="0" y2="486" gradientUnits="userSpaceOnUse"><stop stop-color="#ffffff" stop-opacity=".22"/><stop offset=".45" stop-color="#ffffff" stop-opacity="0"/></linearGradient>
-      <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#000000" flood-opacity=".45"/></filter>
-      <linearGradient id="sheen" x2="0" y2="1"><stop stop-color="#ffffff" stop-opacity=".09"/><stop offset="1" stop-color="#ffffff" stop-opacity="0"/></linearGradient>
-      </defs>'''
-    plate = '<rect width="512" height="512" rx="112" fill="url(#plate)"/><rect x="1.5" y="1.5" width="509" height="509" rx="110.5" fill="none" stroke="url(#rim)" stroke-width="3"/><path d="M112 3H400A109 109 0 0 1 509 112V190C377 156 135 156 3 190V112A109 109 0 0 1 112 3Z" fill="url(#sheen)"/>'
     icon_svg = ROOT / 'assets/icon.svg'
-    icon_svg.write_text(f'<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">{gradient}{plate}{icon}</svg>\n')
-    render(icon_svg, ROOT / 'icon.png', 512)
-    subprocess.run(['magick', str(ROOT/'icon.png'), '-define', 'icon:auto-resize=256,128,64,48,32,16', str(ROOT/'icon.ico')], check=True)
+    render(icon_svg, ROOT / 'assets/icon.png', 512)
+    subprocess.run(['magick', str(ROOT/'assets/icon.png'), '-define', 'icon:auto-resize=256,128,64,48,32,16', str(ROOT/'assets/icon.ico')], check=True)
     with tempfile.TemporaryDirectory(prefix='velocitty-branding-') as temp:
         temp = Path(temp)
         entries = []
@@ -91,7 +76,7 @@ def main():
             data = png.read_bytes()
             entries.append(kind.encode()+struct.pack('>I',8+len(data))+data)
         payload = b''.join(entries)
-        (ROOT/'icon.icns').write_bytes(b'icns'+struct.pack('>I',8+len(payload))+payload)
+        (ROOT/'assets/icon.icns').write_bytes(b'icns'+struct.pack('>I',8+len(payload))+payload)
         if '--icon-only' in sys.argv:
             return
         command = ['ttfx','-i',str(ROOT/'assets/wordmark.txt'),'--frame-rate','10000',

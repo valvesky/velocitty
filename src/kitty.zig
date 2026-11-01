@@ -74,7 +74,7 @@ pub const Pending = struct {
     /// Base64 text (direct transmission), file bytes, or a sixel body.
     data: []u8,
     /// The whole allocation `data` lies in when it was handed over with its
-    /// spill buffer (empty: `data` is the allocation).
+    /// stream buffer (empty: `data` is the allocation).
     owned: []u8 = &.{},
     b64: bool = false,
     format: u32 = 0,
@@ -431,7 +431,7 @@ pub const Store = struct {
         }).len;
     }
 
-    /// `owned`: the allocation `cmd.payload` lies in (a taken spill buffer);
+    /// `owned`: the allocation `cmd.payload` lies in (a taken stream buffer);
     /// the image keeps it, or it is freed on failure.
     fn finish(self: *Store, cmd: Command, owned: ?[]u8, cursor: Cursor, cols: u16, rows: u16, which: u1) ?Cursor {
         const img = self.load(cmd, owned) catch {

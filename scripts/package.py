@@ -27,7 +27,7 @@ def bundle(binary, destination, version, universal=None):
     copy(binary, executable, True)
     if universal:
         subprocess.run(["lipo", "-create", str(binary), str(universal), "-output", str(executable)], check=True)
-    copy(ROOT / "icon.icns", contents / "Resources" / "velocitty.icns")
+    copy(ROOT / "assets/icon.icns", contents / "Resources" / "velocitty.icns")
     copy(ROOT / "example.config.toml", contents / "Resources" / "example.config.toml")
     copy(ROOT / "LICENSE", contents / "Resources" / "LICENSE")
     with (contents / "Info.plist").open("wb") as stream:
@@ -102,8 +102,8 @@ def package(version, triple, binary, output, *, portable_only=False, app_only=Fa
             print(f"wrote {archive}")
         elif "linux" in triple:
             copy(binary, root / "bin" / "velocitty", True)
-            copy(ROOT / "velocitty.desktop", root / "share/applications/velocitty.desktop")
-            copy(ROOT / "icon.png", root / "share/icons/hicolor/512x512/apps/velocitty.png")
+            copy(ROOT / "assets/velocitty.desktop", root / "share/applications/velocitty.desktop")
+            copy(ROOT / "assets/icon.png", root / "share/icons/hicolor/512x512/apps/velocitty.png")
             copy(ROOT / "velocitty.1", root / "share/man/man1/velocitty.1")
             copy(ROOT / "LICENSE", root / "LICENSE")
             copy(ROOT / "example.config.toml", root / "example.config.toml")

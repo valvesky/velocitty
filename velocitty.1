@@ -1,6 +1,6 @@
-.TH VELOCITTY 1 "October 2026" "velocitty 1.2.1" "Velocitty \- (not) a terminal"
+.TH VELOCITTY 1 "October 2026" "velocitty 1.2.1" "Velocitty \- terminal emulator"
 .SH NAME
-velocitty \- (not) a terminal
+velocitty \- terminal emulator
 .SH SYNOPSIS
 .B velocitty
 .RI [ options ]
@@ -8,14 +8,16 @@ velocitty \- (not) a terminal
 .IR command " [" arg "...]]"
 .SH DESCRIPTION
 .B velocitty
-is (not) a terminal for Linux, Windows, and macOS: CPU-rendered and designed
+is a terminal emulator for Linux, Windows, and macOS: CPU-rendered and designed
 first for Omarchy. Peak supplies Wayland/X11 on Linux, Win32/ConPTY on
 Windows 10 1903 or later, and AppKit/POSIX PTYs on macOS 11 or later.
 It is designed to keep up with high-volume output such as
 .BR cat (1)
-of large files: PTY input is truncated through a mirrored circular buffer,
-split into lines and runs with SIMD, then fed to a minimal-state VT emulator
-and drawn to a software framebuffer.
+of large files: PTY input passes through a mirrored 64 KiB circular buffer,
+is classified into runs with SIMD, then fed to the VT emulator and drawn
+to a software framebuffer. During floods, text that can no longer be seen
+may advance the cursor without painting or retaining history; state changes
+and graphics are still processed in order.
 .PP
 With no
 .B \-e

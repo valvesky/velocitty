@@ -14,6 +14,7 @@ const Grapheme = @import("type/grapheme.zig");
 const Ring = @import("circbuffer.zig");
 const Run = Ring.Run;
 const SIMD = @import("simd.zig");
+const assert = std.debug.assert;
 
 pub const Color = GridMod.Color;
 pub const Scheme = GridMod.Scheme;
@@ -354,39 +355,61 @@ pub const VtState = struct {
         self.feedFrom(runs, &.{});
     }
 
-    /// Runs with `spill` set are backed by `spill` instead of the ring.
-    pub fn feedFrom(self: *VtState, runs: []const Run, spill: []const u8) void {
-        self.feedOwned(runs, spill, null);
+    /// Runs with `stream` set are backed by `stream` instead of the ring.
+    pub fn feedFrom(self: *VtState, runs: []const Run, stream: []const u8) void {
+        _ = self.feedOwned(runs, stream, null);
     }
 
-    /// `feedFrom` for a drain: `owner` is the ring whose spill buffer backs
+    /// `feedFrom` for a drain: `owner` is the ring whose stream buffer backs
     /// the runs, so a kitty image whose payload is the last string in it can
     /// keep the buffer instead of copying out of it.
-    pub fn feedOwned(self: *VtState, runs: []const Run, spill: []const u8, owner: ?*Ring.CircBuffer) void {
+    pub fn feedOwned(self: *VtState, runs: []const Run, stream: []const u8, owner: ?*Ring.CircBuffer) usize {
         defer self.ghost = false;
-        for (runs) |run| {
-            const src = if (run.flags.spill) spill else self.storage;
+        // The drain's scanner parsed every CSI: its k-th result is the k-th
+        // CSI run's (`owner.preparser.csis`). Without it, parse here.
+        const parsed: ?*const @import("preparser.zig").Preparser = if (owner) |o| (if (o.preparser.csi_ok) &o.preparser else null) else null;
+        var next_csi: usize = 0;
+        // An obsolete prefix can reframe its live frontier against newer
+        // lookahead; otherwise consume enough to satisfy reader progress.
+        var obsolete_prefix = false;
+        for (runs, 0..) |run, run_index| {
+            const src = if (run.flags.stream) stream else self.storage;
             const slice = src[run.off .. run.off + run.len];
-            self.ghost = run.flags.ghost;
+            self.ghost = if (owner) |o| o.preparser.isSpanObsolete(run_index) else run.flags.ghost;
+            if (owner) |o| {
+                if (o.retain_live) {
+                    if (!self.ghost and (run.kind == .text or run.role == .lf) and
+                        (obsolete_prefix or o.canPauseBefore(run))) return run_index;
+                    obsolete_prefix = obsolete_prefix or self.ghost;
+                }
+            }
             // Only text and SGR keep a grapheme cluster open.
             if (run.kind != .text and run.kind != .csi) self.join.ok = false;
             switch (run.kind) {
-                .text => if (!run.flags.ghost or !self.skipDeadLine(slice)) self.feedText(slice),
+                .text => if (!self.ghost or !self.skipDeadLine(slice)) self.feedTextFrom(slice, run.flags.plain),
                 .c0 => {
                     if (slice.len > 0) C0.dispatch(self, slice[0]);
                 },
                 .esc => Esc.dispatch(self, slice),
                 .csi => {
-                    var params: [16]CsiSeq.Param = undefined;
-                    const seq = CsiSeq.parse(slice, &params);
-                    if (seq.final != 'm' or seq.private != 0) self.join.ok = false;
-                    seq.apply(self);
+                    var bufs: CsiSeq.Bufs = undefined;
+                    const seq = if (parsed) |o| blk: {
+                        next_csi += 1;
+                        break :blk CsiSeq.of(o.csiAt(next_csi - 1));
+                    } else CsiSeq.parse(slice, &bufs);
+                    if (seq.final == 'm' and seq.private == 0) {
+                        // The common case straight to SGR.
+                        CsiSeq.sgr(seq.params, seq.subs, self);
+                    } else {
+                        self.join.ok = false;
+                        seq.apply(self);
+                    }
                 },
                 .osc => Osc.dispatch(self, slice),
                 .str => {
                     if (Kitty.isPrefix(slice)) {
-                        const donor: ?Kitty.Donor = if (run.flags.spill and owner != null)
-                            .{ .ctx = owner.?, .off = run.off, .len = run.len, .take = takeSpill }
+                        const donor: ?Kitty.Donor = if (run.flags.stream and owner != null)
+                            .{ .ctx = owner.?, .off = run.off, .len = run.len, .take = takeStream }
                         else
                             null;
                         self.feedKitty(slice, true, donor);
@@ -394,6 +417,8 @@ pub const VtState = struct {
                 },
             }
         }
+        if (parsed) |o| assert(next_csi == o.csis.items.len);
+        return runs.len;
     }
 
     /// Dead text ending in CR whose wraps cannot move the cursor's row (it
@@ -466,12 +491,30 @@ pub const VtState = struct {
     /// takes the printable ASCII mixed into it); stray 0x80..0xBF/0xF8.. are
     /// ignored (raw 8-bit C1 controls are not recognized in UTF-8 text).
     pub fn feedText(self: *VtState, bytes: []const u8) void {
-        var i: usize = 0;
+        self.feedTextAt(bytes, 0, false);
+    }
+
+    /// `feedText` of a scanned run whose first `plain` bytes are printable
+    /// ASCII (`Run.Flags.plain`): those print without a second scan, and
+    /// below `Run.max_plain` the byte after them is known not to be.
+    inline fn feedTextFrom(self: *VtState, bytes: []const u8, plain: u9) void {
+        if (plain != 0) self.printPlain(bytes[0..plain]);
+        // A zero prefix also occurs in manually constructed, unscanned runs.
+        self.feedTextAt(bytes, plain, plain != 0 and plain != Run.max_plain);
+    }
+
+    /// `feedText` from `start`; `known`: `bytes[start]` is not printable ASCII.
+    fn feedTextAt(self: *VtState, bytes: []const u8, start: usize, known: bool) void {
+        var i: usize = start;
+        var skip = known;
         while (i < bytes.len) {
-            const n = SIMD.skipOutRange(bytes[i..], 0x20, 0x7E);
-            if (n != 0) self.printPlain(bytes[i..][0..n]);
-            i += n;
-            if (i >= bytes.len) break;
+            if (!skip) {
+                const n = SIMD.skipOutRange(bytes[i..], 0x20, 0x7E);
+                if (n != 0) self.printPlain(bytes[i..][0..n]);
+                i += n;
+                if (i >= bytes.len) break;
+            }
+            skip = false;
             const c = bytes[i];
             if (c < 0x80) {
                 C0.dispatch(self, c);
@@ -799,14 +842,14 @@ pub const VtState = struct {
         return .{ .ctx = self, .feed = sinkFeed, .view = sinkView };
     }
 
-    fn sinkFeed(ctx: *anyopaque, runs: []const Run, spill: []const u8, owner: *Ring.CircBuffer) void {
+    fn sinkFeed(ctx: *anyopaque, runs: []const Run, stream: []const u8, owner: *Ring.CircBuffer) usize {
         const self: *VtState = @ptrCast(@alignCast(ctx));
-        self.feedOwned(runs, spill, owner);
+        return self.feedOwned(runs, stream, owner);
     }
 
-    fn takeSpill(ctx: *anyopaque, off: usize, len: usize, allocator: std.mem.Allocator) ?[]u8 {
+    fn takeStream(ctx: *anyopaque, off: usize, len: usize, allocator: std.mem.Allocator) ?[]u8 {
         const cb: *Ring.CircBuffer = @ptrCast(@alignCast(ctx));
-        return cb.takeSpill(allocator, off, len);
+        return cb.takeStream(allocator, off, len);
     }
 
     fn sinkView(ctx: *anyopaque) Ring.View {
@@ -2439,8 +2482,17 @@ fn attrLetters(a: Attrs, buf: *[9]u8) []const u8 {
 }
 
 fn applyCsi(vt: *VtState, seq: []const u8) void {
-    var params: [16]CsiSeq.Param = undefined;
-    CsiSeq.parse(seq, &params).apply(vt);
+    var bufs: CsiSeq.Bufs = undefined;
+    CsiSeq.parse(seq, &bufs).apply(vt);
+}
+
+test "unscanned text runs retain their leading ASCII" {
+    var bytes = "abc日本語".*;
+    var vt = try VtState.init(std.testing.allocator, 16, 2, 2, &bytes);
+    defer vt.deinit();
+    vt.feedRuns(&.{.{ .kind = .text, .off = 0, .len = bytes.len }});
+    try std.testing.expectEqual(@as(u21, 'a'), vt.grid().getCell(0, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, '日'), vt.grid().getCell(0, 3).codepoint);
 }
 
 test "sgr truecolor bg" {
@@ -3046,9 +3098,9 @@ test "large kitty images arrive through the ring, chunked or as one string" {
             if (!ring.mapped) @memcpy(ring.storage[at + ring.capacity ..][0..n], ring.storage[at..][0..n]);
             ring.head += n;
             off += n;
-            if (ring.capacity - (ring.head - ring.tail) < ring.capacity / 4) ring.drain(vt.sink());
+            if (ring.capacity - (ring.head - ring.tail) < ring.capacity / 4) ring.drain(vt.sink(), true);
         }
-        ring.drain(vt.sink());
+        ring.drain(vt.sink(), false);
         const img = vt.kitty.find(7) orelse return error.ImageDropped;
         try std.testing.expectEqual(@as(u32, w), img.width);
         try std.testing.expectEqual(@as(usize, 1), vt.kitty.placements.items.len);
@@ -3057,7 +3109,7 @@ test "large kitty images arrive through the ring, chunked or as one string" {
         try std.testing.expectEqualSlices(u8, rgba, shown.rgba);
         // The transfer buffers gave their memory back.
         try std.testing.expectEqual(@as(usize, 0), vt.kitty.chunks.capacity);
-        try std.testing.expect(ring.spill.capacity <= 1024 * 1024);
+        try std.testing.expect(ring.stream.capacity <= 1024 * 1024);
     }
 }
 
@@ -3254,7 +3306,7 @@ test "a tiny style table compacts often and every cell keeps its style" {
                 @memcpy(ring.storage[at..][0..piece.len], piece);
                 if (!ring.mapped) @memcpy(ring.storage[at + ring.capacity ..][0..piece.len], piece);
                 ring.head += piece.len;
-                ring.drain(vt.sink());
+                ring.drain(vt.sink(), true);
             }
             if (a.styles.gen != gen) gens += 1;
             if (step % 211 == 210) {
@@ -3306,7 +3358,7 @@ test "row extents never change what the grid holds" {
                 @memcpy(ring.storage[at..][0..piece.len], piece);
                 if (!ring.mapped) @memcpy(ring.storage[at + ring.capacity ..][0..piece.len], piece);
                 ring.head += piece.len;
-                ring.drain(vt.sink());
+                ring.drain(vt.sink(), true);
             }
             if (step % 97 == 96) {
                 const cols: u16 = @intCast(8 + rand.uintLessThan(u16, 10));
@@ -3324,7 +3376,7 @@ test "row extents never change what the grid holds" {
     }
 }
 
-test "drain dropping dead SGRs ends with the pen and screen of an exact parse" {
+test "pressure text pruning preserves the pen and screen of an exact parse" {
     const gpa = std.testing.allocator;
     const pieces = [_][]const u8{
         "hello ", "x", "\r\n", "\r\n", "\x1b[m", "\x1b[0m", "\x1b[1m", "\x1b[31m", "\x1b[44;33m", "\x1b[0;4m", "\x1b[;7m",
@@ -3352,7 +3404,7 @@ test "drain dropping dead SGRs ends with the pen and screen of an exact parse" {
                     if (!ring.mapped) @memcpy(ring.storage[at + ring.capacity ..][0..piece.len], piece);
                     ring.head += piece.len;
                 }
-                ring.drain(vt.sink());
+                ring.drain(vt.sink(), true);
             }
             for (0..2) |k| {
                 const ga = &a.grids[k];
@@ -3432,7 +3484,7 @@ const TestTerm = struct {
             @memcpy(t.ring.storage[at..][0..n], rest[0..n]);
             if (!t.ring.mapped) @memcpy(t.ring.storage[at + t.ring.capacity ..][0..n], rest[0..n]);
             t.ring.head += n;
-            t.ring.drain(t.vt.sink());
+            t.ring.drain(t.vt.sink(), true);
             rest = rest[n..];
         }
     }

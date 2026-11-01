@@ -4,128 +4,28 @@ const std = @import("std");
 const Vt = @import("vt.zig").VtState;
 const Color = @import("vt.zig").Color;
 
+const Parse = @import("csiparse.zig");
+
 const CsiSeq = @This();
 
-pub const Param = struct {
-    value: u32 = 0,
-    sub: [8]u32 = @splat(0),
-    sub_len: u8 = 0,
-};
+pub const Param = Parse.Param;
+pub const Bufs = Parse.Bufs;
 
 /// Packed intermediates/privates (LSB = first), matching foot.
 private: u32 = 0,
 final: u8 = 0,
-seq: []const u8 = "",
-params: []Param = &.{},
+params: []const Param = &.{},
+/// Subparameters (`Param.sub_off`/`sub_len` index them).
+subs: []const u32 = &.{},
 
-const CharKind = enum(u3) { digit, semi, colon, collect, final, invalid };
-
-const CHAR_MAP: [256]CharKind = initMap: {
-    var map: [256]CharKind = @splat(.invalid);
-    for ('0'..'9' + 1) |c| map[c] = .digit;
-    map[';'] = .semi;
-    map[':'] = .colon;
-    for (0x20..0x2F + 1) |c| map[c] = .collect;
-    for (0x3C..0x3F + 1) |c| map[c] = .collect;
-    for (0x40..0x7E + 1) |c| map[c] = .final;
-    break :initMap map;
-};
-
-pub fn parse(seq: []const u8, param_buf: []Param) CsiSeq {
-    const stub = CsiSeq{ .final = 0, .seq = seq };
-    if (seq.len < 3 or seq[0] != 0x1b or seq[1] != '[') return stub;
-
-    var private: u32 = 0;
-    var priv_n: u5 = 0;
-    var n: usize = 0;
-    var val: u32 = 0;
-    var have: bool = false;
-    var in_sub: bool = false;
-    var ok: bool = true;
-
-    const max_body = seq.len - 1;
-    var i: usize = 2;
-    while (i < max_body) : (i += 1) {
-        const c = seq[i];
-        switch (CHAR_MAP[c]) {
-            .digit => {
-                have = true;
-                val = val *% 10 +% (c - '0');
-            },
-            .semi => {
-                pushValue(param_buf, &n, &val, &have, &in_sub);
-                if (n < param_buf.len) {
-                    param_buf[n] = .{};
-                    n += 1;
-                }
-                val = 0;
-                have = false;
-                in_sub = false;
-            },
-            .colon => {
-                ensureParam(param_buf, &n, have or in_sub or n == 0);
-                if (n > 0) {
-                    var p = &param_buf[n - 1];
-                    if (!in_sub) {
-                        p.value = val;
-                        in_sub = true;
-                    } else if (p.sub_len < p.sub.len) {
-                        p.sub[p.sub_len] = val;
-                        p.sub_len += 1;
-                    }
-                }
-                val = 0;
-                have = false;
-            },
-            .collect => {
-                if (priv_n < 4) {
-                    private |= @as(u32, c) << (8 * priv_n);
-                    priv_n += 1;
-                }
-            },
-            .final, .invalid => ok = false,
-        }
-    }
-
-    if (have or in_sub or n > 0 or seq.len > 3) {
-        pushValue(param_buf, &n, &val, &have, &in_sub);
-    }
-
-    const final_byte = seq[seq.len - 1];
-    if (!ok or CHAR_MAP[final_byte] != .final) return stub;
-
-    return .{
-        .private = private,
-        .final = final_byte,
-        .seq = seq,
-        .params = param_buf[0..n],
-    };
+/// A sequence the drain's scanner parsed (`CircBuffer.preparser.csis`).
+pub inline fn of(p: Parse.Seq) CsiSeq {
+    return .{ .private = p.private, .final = p.final, .params = p.params, .subs = p.subs };
 }
 
-fn ensureParam(buf: []Param, n: *usize, needed: bool) void {
-    if (!needed) return;
-    if (n.* == 0 and buf.len > 0) {
-        buf[0] = .{};
-        n.* = 1;
-    }
-}
-
-fn pushValue(buf: []Param, n: *usize, val: *u32, have: *bool, in_sub: *bool) void {
-    if (n.* == 0) {
-        if (buf.len == 0) return;
-        buf[0] = .{};
-        n.* = 1;
-    }
-    var p = &buf[n.* - 1];
-    if (in_sub.*) {
-        if (p.sub_len < p.sub.len) {
-            p.sub[p.sub_len] = val.*;
-            p.sub_len += 1;
-        }
-    } else {
-        p.value = val.*;
-    }
-    _ = have;
+/// Parse `seq` into `bufs` (for callers without a scanner result).
+pub fn parse(seq: []const u8, bufs: *Bufs) CsiSeq {
+    return of(Parse.parse(seq, &bufs.params, &bufs.subs));
 }
 
 pub fn apply(self: CsiSeq, vt: *Vt) void {
@@ -133,7 +33,7 @@ pub fn apply(self: CsiSeq, vt: *Vt) void {
     const params = self.params;
 
     switch (self.private) {
-        0 => applyAnsi(self.final, params, vt),
+        0 => applyAnsi(self.final, params, self.subs, vt),
         '?' => applyDec(self.final, params, vt),
         '>' => applyGt(self.final, params, vt),
         '<' => applyLt(self.final, params, vt),
@@ -157,7 +57,7 @@ fn sat16(v: u32) u16 {
     return @intCast(@min(v, 65535));
 }
 
-fn applyAnsi(final: u8, params: []const Param, vt: *Vt) void {
+fn applyAnsi(final: u8, params: []const Param, subs: []const u32, vt: *Vt) void {
     const p0 = sat16(if (params.len > 0) params[0].value else 0);
     const n1 = sat16(pget(params, 0, 1));
 
@@ -165,7 +65,7 @@ fn applyAnsi(final: u8, params: []const Param, vt: *Vt) void {
         'b' => vt.rep(n1),
         'c' => if (p0 == 0) vt.respond("\x1b[?62;22;28c"),
         'd' => vt.cup(n1, vt.grid().cursor.col + 1),
-        'm' => sgr(params, vt),
+        'm' => sgr(params, subs, vt),
         'n' => switch (p0) {
             5 => vt.respond("\x1b[0n"),
             6 => respondCursor(vt),
@@ -368,7 +268,8 @@ fn copyParams(params: []const Param, buf: *[16]u32) []const u32 {
     return buf[0..n];
 }
 
-fn sgr(params: []const Param, vt: *Vt) void {
+/// SGR; also called directly by the VT for scanner-parsed `CSI m`.
+pub fn sgr(params: []const Param, subs: []const u32, vt: *Vt) void {
     if (params.len == 0) {
         vt.resetPen();
         return;
@@ -383,7 +284,7 @@ fn sgr(params: []const Param, vt: *Vt) void {
             1 => g.attrs.bold = true,
             2 => g.attrs.dim = true,
             3 => g.attrs.italic = true,
-            4 => sgrUnderline(vt, p),
+            4 => sgrUnderline(vt, subs[p.sub_off..][0..p.sub_len]),
             5 => g.attrs.blink = true,
             6 => {}, // rapid blink ignored (foot)
             7 => g.attrs.inverse = true,
@@ -422,9 +323,9 @@ fn sgr(params: []const Param, vt: *Vt) void {
                 g.bg = vt.scheme.bg;
                 g.attrs.bg_explicit = false;
             },
-            38 => i += sgrColor(vt, params, i, .fg),
-            48 => i += sgrColor(vt, params, i, .bg),
-            58 => i += sgrColor(vt, params, i, .ul),
+            38 => i += sgrColor(vt, params, subs, i, .fg),
+            48 => i += sgrColor(vt, params, subs, i, .bg),
+            58 => i += sgrColor(vt, params, subs, i, .ul),
             59 => vt.clearUnderlineColor(),
             90...97 => {
                 g.fg = vt.colorIndex(p.value - 90 + 8);
@@ -440,14 +341,14 @@ fn sgr(params: []const Param, vt: *Vt) void {
     }
 }
 
-fn sgrUnderline(vt: *Vt, p: Param) void {
+fn sgrUnderline(vt: *Vt, sub: []const u32) void {
     const g = vt.grid();
-    if (p.sub_len == 0) {
+    if (sub.len == 0) {
         g.attrs.underline = true;
         g.attrs.underline_style = 1;
         return;
     }
-    const style = p.sub[0];
+    const style = sub[0];
     switch (style) {
         0 => {
             g.attrs.underline = false;
@@ -466,16 +367,17 @@ fn sgrUnderline(vt: *Vt, p: Param) void {
 
 const ColorTarget = enum { fg, bg, ul };
 
-fn sgrColor(vt: *Vt, params: []const Param, i: usize, target: ColorTarget) usize {
+fn sgrColor(vt: *Vt, params: []const Param, subs: []const u32, i: usize, target: ColorTarget) usize {
     const p = params[i];
-    if (p.sub_len >= 2 and p.sub[0] == 5) {
-        applyIndexed(vt, p.sub[1], target);
+    const sub = subs[p.sub_off..][0..p.sub_len];
+    if (sub.len >= 2 and sub[0] == 5) {
+        applyIndexed(vt, sub[1], target);
         return 0;
     }
-    if (p.sub_len >= 4 and p.sub[0] == 2) {
-        const have_cs = p.sub_len >= 5;
+    if (sub.len >= 4 and sub[0] == 2) {
+        const have_cs = sub.len >= 5;
         const r_i: usize = if (have_cs) 2 else 1;
-        applyRgb(vt, p.sub[r_i], p.sub[r_i + 1], p.sub[r_i + 2], target);
+        applyRgb(vt, sub[r_i], sub[r_i + 1], sub[r_i + 2], target);
         return 0;
     }
     if (i + 1 >= params.len) return 0;
@@ -534,8 +436,8 @@ fn clip(v: u32) u8 {
 }
 
 test "parse cup" {
-    var params: [16]Param = undefined;
-    const s = parse("\x1b[1;3H", &params);
+    var bufs: Bufs = .{};
+    const s = parse("\x1b[1;3H", &bufs);
     try std.testing.expectEqual(@as(u8, 'H'), s.final);
     try std.testing.expectEqual(@as(u32, 0), s.private);
     try std.testing.expectEqual(@as(usize, 2), s.params.len);
@@ -544,8 +446,8 @@ test "parse cup" {
 }
 
 test "parse private mode" {
-    var params: [16]Param = undefined;
-    const s = parse("\x1b[?1049h", &params);
+    var bufs: Bufs = .{};
+    const s = parse("\x1b[?1049h", &bufs);
     try std.testing.expectEqual(@as(u8, 'h'), s.final);
     try std.testing.expectEqual(@as(u32, '?'), s.private);
     try std.testing.expectEqual(@as(usize, 1), s.params.len);
@@ -553,8 +455,8 @@ test "parse private mode" {
 }
 
 test "parse sgr truecolor" {
-    var params: [16]Param = undefined;
-    const s = parse("\x1b[48;2;30;60;90m", &params);
+    var bufs: Bufs = .{};
+    const s = parse("\x1b[48;2;30;60;90m", &bufs);
     try std.testing.expectEqual(@as(u8, 'm'), s.final);
     try std.testing.expectEqual(@as(usize, 5), s.params.len);
     try std.testing.expectEqual(@as(u32, 48), s.params[0].value);
@@ -565,29 +467,26 @@ test "parse sgr truecolor" {
 }
 
 test "parse sgr colon truecolor" {
-    var params: [16]Param = undefined;
-    const s = parse("\x1b[38:2:30:60:90m", &params);
+    var bufs: Bufs = .{};
+    const s = parse("\x1b[38:2:30:60:90m", &bufs);
     try std.testing.expectEqual(@as(u8, 'm'), s.final);
     try std.testing.expectEqual(@as(usize, 1), s.params.len);
     try std.testing.expectEqual(@as(u32, 38), s.params[0].value);
     try std.testing.expectEqual(@as(u8, 4), s.params[0].sub_len);
-    try std.testing.expectEqual(@as(u32, 2), s.params[0].sub[0]);
-    try std.testing.expectEqual(@as(u32, 30), s.params[0].sub[1]);
-    try std.testing.expectEqual(@as(u32, 60), s.params[0].sub[2]);
-    try std.testing.expectEqual(@as(u32, 90), s.params[0].sub[3]);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 30, 60, 90 }, s.subs[s.params[0].sub_off..][0..4]);
 }
 
 test "parse decrqm" {
-    var params: [16]Param = undefined;
-    const s = parse("\x1b[?25$p", &params);
+    var bufs: Bufs = .{};
+    const s = parse("\x1b[?25$p", &bufs);
     try std.testing.expectEqual(@as(u8, 'p'), s.final);
     try std.testing.expectEqual(@as(u32, 0x243F), s.private);
     try std.testing.expectEqual(@as(u32, 25), s.params[0].value);
 }
 
 test "parse decscusr" {
-    var params: [16]Param = undefined;
-    const s = parse("\x1b[4 q", &params);
+    var bufs: Bufs = .{};
+    const s = parse("\x1b[4 q", &bufs);
     try std.testing.expectEqual(@as(u8, 'q'), s.final);
     try std.testing.expectEqual(@as(u32, ' '), s.private);
     try std.testing.expectEqual(@as(u32, 4), s.params[0].value);
