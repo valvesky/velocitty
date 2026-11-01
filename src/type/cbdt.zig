@@ -41,13 +41,17 @@ pub const ColorFont = struct {
     index_subtables: u32,
 
     pub fn parse(bytes: []const u8) ?ColorFont {
-        const cblc = findTable(bytes, "CBLC") orelse return null;
-        const cbdt = findTable(bytes, "CBDT") orelse return null;
-        const cmap = findTable(bytes, "cmap") orelse return null;
-        const head = findTable(bytes, "head") orelse return null;
-        const hhea = findTable(bytes, "hhea") orelse return null;
-        const hmtx = findTable(bytes, "hmtx") orelse return null;
-        const maxp = findTable(bytes, "maxp") orelse return null;
+        return parseAt(bytes, 0);
+    }
+
+    pub fn parseAt(bytes: []const u8, offset: usize) ?ColorFont {
+        const cblc = findTableAt(bytes, offset, "CBLC") orelse return null;
+        const cbdt = findTableAt(bytes, offset, "CBDT") orelse return null;
+        const cmap = findTableAt(bytes, offset, "cmap") orelse return null;
+        const head = findTableAt(bytes, offset, "head") orelse return null;
+        const hhea = findTableAt(bytes, offset, "hhea") orelse return null;
+        const hmtx = findTableAt(bytes, offset, "hmtx") orelse return null;
+        const maxp = findTableAt(bytes, offset, "maxp") orelse return null;
         if (head.len < 20 or hhea.len < 36 or maxp.len < 6 or cblc.len < 56) return null;
 
         const units_per_em = readU16(head, 18) orelse return null;
@@ -254,10 +258,14 @@ fn downsampleRgba(src: []const u8, sw: u32, sh: u32, dst: []u8, dw: u32, dh: u32
 }
 
 pub fn findTable(bytes: []const u8, tag: *const [4]u8) ?[]const u8 {
-    if (bytes.len < 12) return null;
-    const n = readU16(bytes, 4) orelse return null;
+    return findTableAt(bytes, 0, tag);
+}
+
+fn findTableAt(bytes: []const u8, offset: usize, tag: *const [4]u8) ?[]const u8 {
+    if (offset > bytes.len or bytes.len - offset < 12) return null;
+    const n = readU16(bytes, offset + 4) orelse return null;
     var i: u16 = 0;
-    var off: usize = 12;
+    var off: usize = offset + 12;
     while (i < n) : (i += 1) {
         if (off + 16 > bytes.len) return null;
         if (std.mem.eql(u8, bytes[off..][0..4], tag)) {

@@ -5,7 +5,7 @@ const assert = std.debug.assert;
 const Cbdt = @import("cbdt.zig");
 
 const c = struct {
-    extern fn zt_stb_init(storage: *anyopaque, data: [*]const u8, len: c_int) callconv(.c) c_int;
+    extern fn zt_stb_init(storage: *anyopaque, data: [*]const u8, len: c_int, offset: c_int) callconv(.c) c_int;
     extern fn zt_stb_vmetrics(storage: *const anyopaque, ascent: *c_int, descent: *c_int, line_gap: *c_int, upem: *c_int) callconv(.c) void;
     extern fn zt_stb_num_glyphs(storage: *const anyopaque) callconv(.c) c_int;
     extern fn zt_stb_find_glyph(storage: *const anyopaque, codepoint: c_int) callconv(.c) c_int;
@@ -43,15 +43,21 @@ pub const Metrics = struct {
 
 pub const Font = struct {
     bytes: []const u8,
+    index: u32 = 0,
     info: [info_cap]u8 align(8) = undefined,
     outline: bool = false,
     color: ?Cbdt.ColorFont = null,
 
     pub fn open(bytes: []const u8) Error!Font {
-        if (bytes.len < 12) return error.InvalidFont;
-        var font: Font = .{ .bytes = bytes };
-        font.outline = c.zt_stb_init(&font.info, bytes.ptr, @intCast(bytes.len)) != 0;
-        font.color = Cbdt.ColorFont.parse(bytes);
+        return openIndex(bytes, 0);
+    }
+
+    pub fn openIndex(bytes: []const u8, index: u32) Error!Font {
+        const offset = collectionOffset(bytes, index) orelse return error.InvalidFont;
+        if (bytes.len > std.math.maxInt(c_int)) return error.InvalidFont;
+        var font: Font = .{ .bytes = bytes, .index = index };
+        font.outline = c.zt_stb_init(&font.info, bytes.ptr, @intCast(bytes.len), @intCast(offset)) != 0;
+        font.color = Cbdt.ColorFont.parseAt(bytes, offset);
         if (!font.outline and font.color == null) return error.InvalidFont;
         return font;
     }
@@ -188,6 +194,34 @@ pub const Font = struct {
     }
 };
 
+fn collectionOffset(bytes: []const u8, index: u32) ?usize {
+    if (bytes.len < 12) return null;
+    var offset: usize = 0;
+    if (std.mem.eql(u8, bytes[0..4], "ttcf")) {
+        const version = std.mem.readInt(u32, bytes[4..8], .big);
+        if (version != 0x00010000 and version != 0x00020000) return null;
+        const count = std.mem.readInt(u32, bytes[8..12], .big);
+        if (index >= count or count > (bytes.len - 12) / 4) return null;
+        const at = 12 + @as(usize, index) * 4;
+        offset = std.mem.readInt(u32, bytes[at..][0..4], .big);
+        if (offset > bytes.len - 12) return null;
+    } else if (index != 0) return null;
+    // Retain stb's sfnt signature gate before calling its unbounded table scan.
+    switch (std.mem.readInt(u32, bytes[offset..][0..4], .big)) {
+        0x00010000, 0x31000000, 0x74797031, 0x4f54544f, 0x74727565 => {},
+        else => return null,
+    }
+    const tables = std.mem.readInt(u16, bytes[offset + 4 ..][0..2], .big);
+    if (tables > (bytes.len - offset - 12) / 16) return null;
+    for (0..tables) |table| {
+        const entry = offset + 12 + table * 16;
+        const start = std.mem.readInt(u32, bytes[entry + 8 ..][0..4], .big);
+        const len = std.mem.readInt(u32, bytes[entry + 12 ..][0..4], .big);
+        if (start > bytes.len or len > bytes.len - start) return null;
+    }
+    return offset;
+}
+
 fn clampI16(v: i32) i16 {
     if (v > 32767) return 32767;
     if (v < -32768) return -32768;
@@ -197,6 +231,8 @@ fn clampI16(v: i32) i16 {
 test "open rejects junk" {
     try std.testing.expectError(error.InvalidFont, Font.open(&.{}));
     try std.testing.expectError(error.InvalidFont, Font.open("not a font"));
+    try std.testing.expectError(error.InvalidFont, Font.open("this is not an sfnt font header"));
+    try std.testing.expectError(error.InvalidFont, Font.open(&(@as([12]u8, @splat(0xff)))));
     var empty_dir: [12]u8 = undefined;
     std.mem.writeInt(u32, empty_dir[0..4], 0x00010000, .big);
     std.mem.writeInt(u16, empty_dir[4..6], 0, .big);
@@ -204,6 +240,79 @@ test "open rejects junk" {
     std.mem.writeInt(u16, empty_dir[8..10], 0, .big);
     std.mem.writeInt(u16, empty_dir[10..12], 0, .big);
     try std.testing.expectError(error.InvalidFont, Font.open(&empty_dir));
+    std.mem.writeInt(u16, empty_dir[4..6], 1, .big);
+    try std.testing.expectError(error.InvalidFont, Font.open(&empty_dir));
+}
+
+/// Tiny bitmap-only sfnts, with distinct metrics and absolute table offsets,
+/// let the collection tests run without an installed font or fontconfig.
+pub const testing = if (@import("builtin").is_test) struct {
+    pub const collection = blk: {
+        var data: [528]u8 = @splat(0);
+        @memcpy(data[0..4], "ttcf");
+        std.mem.writeInt(u32, data[4..8], 0x00010000, .big);
+        std.mem.writeInt(u32, data[8..12], 2, .big);
+        const tags = [_]*const [4]u8{ "CBLC", "CBDT", "cmap", "head", "hhea", "hmtx", "maxp" };
+        const lengths = [_]usize{ 56, 4, 4, 20, 36, 4, 6 };
+        var at: usize = 268;
+        for (0..2) |member| {
+            const dir = 20 + member * 124;
+            std.mem.writeInt(u32, data[12 + member * 4 ..][0..4], dir, .big);
+            std.mem.writeInt(u32, data[dir..][0..4], 0x00010000, .big);
+            std.mem.writeInt(u16, data[dir + 4 ..][0..2], 7, .big);
+            for (tags, lengths, 0..) |tag, len, table| {
+                const entry = dir + 12 + table * 16;
+                @memcpy(data[entry..][0..4], tag);
+                std.mem.writeInt(u32, data[entry + 8 ..][0..4], at, .big);
+                std.mem.writeInt(u32, data[entry + 12 ..][0..4], len, .big);
+                switch (table) {
+                    0 => {
+                        std.mem.writeInt(u32, data[at + 4 ..][0..4], 1, .big); // strike count
+                        std.mem.writeInt(u32, data[at + 16 ..][0..4], 1, .big); // subtable count
+                        data[at + 52] = 16; // strike ppem
+                    },
+                    3 => std.mem.writeInt(u16, data[at + 18 ..][0..2], @intCast(1000 * (member + 1)), .big),
+                    4 => {
+                        std.mem.writeInt(i16, data[at + 4 ..][0..2], @intCast(800 * (member + 1)), .big);
+                        std.mem.writeInt(i16, data[at + 6 ..][0..2], -200, .big);
+                        std.mem.writeInt(u16, data[at + 34 ..][0..2], 1, .big);
+                    },
+                    6 => std.mem.writeInt(u16, data[at + 4 ..][0..2], 1, .big),
+                    else => {},
+                }
+                at += len;
+            }
+        }
+        break :blk data;
+    };
+} else struct {};
+
+test "collection selects the requested sfnt and bitmap tables" {
+    const a = try Font.openIndex(&testing.collection, 0);
+    const b = try Font.openIndex(&testing.collection, 1);
+    try std.testing.expectEqual(@as(u32, 0), a.index);
+    try std.testing.expectEqual(@as(u32, 1), b.index);
+    try std.testing.expectEqual(@as(u16, 1000), (try a.metrics(16)).units_per_em);
+    try std.testing.expectEqual(@as(u16, 2000), (try b.metrics(16)).units_per_em);
+    try std.testing.expectError(error.InvalidFont, Font.openIndex(&testing.collection, 2));
+    var truncated = testing.collection;
+    std.mem.writeInt(u32, truncated[8..12], 200, .big);
+    try std.testing.expectError(error.InvalidFont, Font.openIndex(&truncated, 1));
+    var outside = testing.collection;
+    std.mem.writeInt(u32, outside[16..20], outside.len, .big);
+    try std.testing.expectError(error.InvalidFont, Font.openIndex(&outside, 1));
+    var bad_version = testing.collection;
+    std.mem.writeInt(u32, bad_version[4..8], 0x00030000, .big);
+    try std.testing.expectError(error.InvalidFont, Font.openIndex(&bad_version, 1));
+    var bad_signature = testing.collection;
+    @memcpy(bad_signature[144..148], "junk");
+    try std.testing.expectError(error.InvalidFont, Font.openIndex(&bad_signature, 1));
+    var bad_directory = testing.collection;
+    std.mem.writeInt(u16, bad_directory[148..150], 65535, .big);
+    try std.testing.expectError(error.InvalidFont, Font.openIndex(&bad_directory, 1));
+    var bad_table = testing.collection;
+    std.mem.writeInt(u32, bad_table[164..168], bad_table.len, .big);
+    try std.testing.expectError(error.InvalidFont, Font.openIndex(&bad_table, 1));
 }
 
 test "rasterize system font" {

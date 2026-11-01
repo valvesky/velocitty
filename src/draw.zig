@@ -105,6 +105,7 @@ pub const Frame = struct {
     /// only comparable within one generation (`Term.Styles`).
     prev_styles: ?*const Term.Styles = null,
     prev_gen: u32 = 0,
+    prev_reverse: bool = false,
     prev_cols: u16 = 0,
     prev_rows: u16 = 0,
     prev_cursor: Term.Cursor = .{},
@@ -192,11 +193,12 @@ pub const Frame = struct {
 
         const cols = screen.cols;
         const rows = screen.rows;
-        if (self.prev_styles != screen.styles or self.prev_gen != screen.styles.gen) {
-            // Same ids may now mean other colors: compare nothing.
+        if (self.prev_styles != screen.styles or self.prev_gen != screen.styles.gen or self.prev_reverse != screen.flags.reverse) {
+            // Cell ids do not capture recoloring or global reverse video.
             self.prev_rows = 0;
             self.prev_styles = screen.styles;
             self.prev_gen = screen.styles.gen;
+            self.prev_reverse = screen.flags.reverse;
         }
         const have_prev = self.ensurePrev(cols, rows);
         const cur_on = screen.cursorVisible() and screen.scrollOffset() == 0;
@@ -242,7 +244,10 @@ pub const Frame = struct {
             const cursor_row = mustPaintCursorRow(r, self.prev_cursor, self.prev_cursor_on, cur, cur_on) or
                 (style_changed and (r == cur.row or r == self.prev_cursor.row)) or
                 (scroll != 0 and cur_on and r == cur.row);
-            const sel_row = sel.coversRow(r, cols) or self.prev_sel.coversRow(r, cols);
+            const shifted_row = @as(i32, r) + scroll;
+            const shifted_sel = scroll != 0 and shifted_row >= 0 and shifted_row < rows and
+                self.prev_sel.coversRow(@intCast(shifted_row), cols);
+            const sel_row = sel.coversRow(r, cols) or self.prev_sel.coversRow(r, cols) or shifted_sel;
             const img_row = r < max_rows and (img_rows[r] or self.prev_img_rows[r]);
             var need = true;
             if (!paint_all and !cursor_row and !sel_row and !img_row) {
@@ -1570,4 +1575,101 @@ test "a combining mark draws over its base cell" {
     }
     try std.testing.expect(ink[0] > 0);
     try std.testing.expect(ink[1] > ink[0]);
+}
+
+test "reverse mode repaints previously rendered cells" {
+    const a = std.testing.allocator;
+    var storage: [32]u8 = undefined;
+    var vt = try Term.VtState.init(a, 4, 2, 4, &storage);
+    defer vt.deinit();
+    vt.flags.cursor_visible = false;
+    vt.feedText("hello");
+    var frame = try Frame.init(a, 16, 8);
+    defer frame.deinit();
+    var fresh = try Frame.init(a, 16, 8);
+    defer fresh.deinit();
+    frame.render(&vt, 4, 4, null, 8);
+    vt.clearDirty();
+    for ([_]bool{ true, false }) |enabled| {
+        vt.setPrivate(&.{5}, enabled);
+        frame.render(&vt, 4, 4, null, 8);
+        fresh.invalidate();
+        fresh.render(&vt, 4, 4, null, 8);
+        try std.testing.expectEqualSlices(u32, fresh.pixels, frame.pixels);
+        vt.clearDirty();
+    }
+}
+
+test "cursor follows padded wide glyph during reflow" {
+    const a = std.testing.allocator;
+    var storage: [32]u8 = undefined;
+    var vt = try Term.VtState.init(a, 4, 4, 16, &storage);
+    defer vt.deinit();
+    vt.feedText("ab\u{754c}");
+    try vt.resize(3, 4);
+    vt.feedText("Z");
+    try std.testing.expectEqual(@as(u21, 0), vt.grid().cellAt(1, 1).codepoint);
+    try std.testing.expectEqual(@as(u21, 'Z'), vt.grid().cellAt(1, 2).codepoint);
+}
+
+test "scrolling does not leave selection painted at old content position" {
+    const a = std.testing.allocator;
+    var storage: [32]u8 = undefined;
+    var vt = try Term.VtState.init(a, 4, 4, 16, &storage);
+    defer vt.deinit();
+    vt.flags.cursor_visible = false;
+    vt.feedText("AAAABBBBCCCCDDDD");
+    var frame = try Frame.init(a, 16, 16);
+    defer frame.deinit();
+    var fresh = try Frame.init(a, 16, 16);
+    defer fresh.deinit();
+    var sel: Select.State = .{};
+    sel.begin(1, 2);
+    frame.renderSel(&vt, 4, 4, null, 8, sel);
+    vt.clearDirty();
+    vt.regionScrollUp(1);
+    frame.renderSel(&vt, 4, 4, null, 8, sel);
+    fresh.renderSel(&vt, 4, 4, null, 8, sel);
+    try std.testing.expectEqualSlices(u32, fresh.pixels, frame.pixels);
+}
+
+test "reflow retains styled spaces" {
+    const a = std.testing.allocator;
+    var storage: [32]u8 = undefined;
+    var vt = try Term.VtState.init(a, 4, 4, 16, &storage);
+    defer vt.deinit();
+    vt.grid().bg = .{ .r = 200, .g = 0, .b = 0 };
+    vt.feedText(" ");
+    vt.grid().bg = vt.scheme.bg;
+    try vt.resize(5, 4);
+    try std.testing.expectEqual(@as(u8, 200), vt.styleOf(vt.grid().cellAt(0, 0)).bg.r);
+}
+
+test "shrinking height keeps cursor content" {
+    const a = std.testing.allocator;
+    var storage: [32]u8 = undefined;
+    var vt = try Term.VtState.init(a, 4, 4, 16, &storage);
+    defer vt.deinit();
+    vt.feedText("AAAABBBBCCCCDDDD");
+    try vt.resize(4, 2);
+    try std.testing.expectEqual(@as(u21, 'D'), vt.grid().cellAt(vt.cursor().row, 0).codepoint);
+    try std.testing.expect(vt.grid().wrap_pending);
+}
+
+test "height shrink keeps graphics anchored to the retained text" {
+    const a = std.testing.allocator;
+    var vt = try Term.VtState.init(a, 4, 4, 16, &.{});
+    defer vt.deinit();
+    vt.flags.cursor_visible = false;
+    vt.feedText("AAAABBBBCCCCDDDD");
+    const pixels = try a.dupe(u8, &.{ 255, 0, 0, 255 });
+    vt.kitty.placeBitmap(pixels, 1, 1, .{ .row = 3 }, 0, 1, 1);
+    try vt.resize(4, 2);
+    try std.testing.expectEqual(@as(i64, 3), vt.kitty.placements.items[0].row);
+    try std.testing.expectEqual(@as(i64, 2), vt.imageBase());
+    var frame = try Frame.init(a, 16, 8);
+    defer frame.deinit();
+    vt.prepareImages();
+    frame.render(&vt, 4, 4, null, 8);
+    try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[4 * frame.width]);
 }

@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 72 920 772" width="920" height="772" font-family="sans-serif" font-size="14" aria-labelledby="title desc" role="img">
   <title id="title">Ring buffer and pre-parser overview</title>
-  <desc id="desc">PTY input enters a mirrored buffer of 1 MiB by default. EOF, a frame tick, or occupancy above 75 percent triggers a drain. All bytes are pre-parsed into runs. Long sequences use a temporary stream buffer, capped at 320 MiB, referenced by flagged runs. During a pressure drain, isSpanObsolete checks each run; only proven obsolete text work can be skipped. The VT consumes runs in order and sends graphics commands to an independent image store. Graphics payload ownership transfers or copies from stream storage into the image store, which retains image IDs, placements, encoded payloads and decoded pixels across drains, resize and redraw. Other streamed control strings do not become image data.</desc>
+  <desc id="desc">Ordered runs reference a mirrored input ring or temporary stream storage. Pressure enables a visibility proof for obsolete cell writes; graphics payloads move into a separate image store.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0,0 L10,5 L0,10 Z" fill="#a89984"/>
@@ -62,7 +62,7 @@
   <!-- Runs retain input order regardless of backing storage. -->
   <path class="reference" d="M730,382 V486"/>
   <text class="mono" x="744" y="434">off / len</text>
-  <text class="heading" x="588" y="466">Stream buffer <tspan class="muted">(up to 320 MiB)</tspan></text>
+  <text class="heading" x="588" y="466">Stream buffer <tspan class="muted"></tspan></text>
   <rect class="box" x="588" y="486" width="284" height="46"/>
   <rect x="589" y="487" width="222" height="44" fill="#d65d0e" fill-opacity="0.2" stroke="#d65d0e"/>
   <text class="mono" x="600" y="514">ESC ... payload ... ST</text>
@@ -79,7 +79,7 @@
 
   <rect class="box" x="32" y="554" width="248" height="96" rx="4"/>
   <text class="function" x="48" y="581">isSpanObsolete()</text>
-  <text class="text" x="48" y="608">Uses later runs prove the text</text>
+  <text class="text" x="48" y="608">Uses later runs to prove text</text>
   <text class="text" x="48" y="630">will be scrolled off or cleared.</text>
 
   <path class="link" d="M156,650 V762"/>
@@ -90,14 +90,14 @@
   <!-- Only graphics payloads transfer into persistent image ownership. -->
   <path class="link" d="M730,532 V638"/>
   <text class="muted" x="744" y="570">graphics payload</text>
-  <text class="mono" x="744" y="590">take / copy</text>
+  <text class="mono" x="744" y="590">copy or handoff</text>
   <path class="link" d="M548,791 H566 V728 H588"/>
   <rect class="box" x="588" y="638" width="284" height="182" rx="4"/>
   <text class="heading" x="604" y="665">Image store</text>
   <text class="mono" x="604" y="690">IDs + placements</text>
-  <text class="text" x="604" y="713">Owns encoded payloads</text>
-  <text class="text" x="604" y="734">and decoded pixels.</text>
-  <text class="muted" x="604" y="758">Survives drains, resize and redraw.</text>
-  <text class="muted" x="604" y="783">Clears remove placements; named</text>
-  <text class="muted" x="604" y="802">data stays until deletion / eviction.</text>
+  <text class="text" x="604" y="713">Owns both payloads</text>
+  <text class="text" x="604" y="734">and bitmaps.</text>
+  <text class="text" x="604" y="758">Persists after drains, resizes and redraws.</text>
+  <text class="text" x="604" y="783">Clears remove placements. Named</text>
+  <text class="text" x="604" y="802">data stays until deletion or eviction.</text>
 </svg>

@@ -1,13 +1,13 @@
 <!DOCTYPE html>
-<html>
-    <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Velocitty 1.3</title>
-        <link rel="stylesheet" href="style.css">
-        <link rel="icon" href="favicon.ico" sizes="16x16 32x32">
-    </head>
-
-    <body>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Velocitty 1.3 - Input Redesign and Paint Skipping</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="icon" href="favicon.ico" sizes="16x16 32x32">
+</head>
+<body>
     <nav class="site-nav" aria-label="Main navigation">
         <div class="nav-inner">
             <a class="brand" href="index.html"><img src="icon.svg" alt=""><span>Velocitty</span></a>
@@ -16,234 +16,200 @@
     </nav>
     <div class="docs-layout">
         <nav class="docs-sidebar" aria-label="On this page">
-            <a href="#overview">Overview</a>
-            <a href="#obsolete">Obsolete painting</a>
+            <a href="#problem">Problem</a>
+            <a href="#feedback">Technical feedback</a>
+            <a href="#redesign">Redesign</a>
             <a href="#streaming">Large payloads</a>
-            <a href="#images">Image ownership</a>
-            <a href="#fonts">Font loading</a>
-            <a href="#appendix">Early designs</a>
+            <a href="#obsolete">Skipping obsolete painting</a>
             <a href="#benchmarks">Benchmarks</a>
+            <a href="#appendix">Early designs</a>
             <a href="#changelog">Changelog</a>
         </nav>
-    <main>
-        <h1 class="title">
-            Velocitty 1.3 - Ring Buffer and Pre-parser Redesign
-        </h1>
+        <main>
+            <h1 class="title">Velocitty 1.3 - Input Redesign and Paint Skipping</h1>
 
-        <h2 id="overview">Overview</h2>
+            <h2 id="problem">Problem</h2>
 
-        <p>Velocitty 1.3 uses a mirrored 1 MiB input ring. The preparser frames input into categorized
-        runs (text, ESC, C0, CSI, OSC and other control strings), whose offsets and lengths reference
-        their backing storage. If the buffer is more than 75% full (e.g. a large read) the runs are
-        fed through a special path that calls <code>isSpanObsolete</code> on each run, either way ends with
-        sequentially feeding the VT parser.</p>
+            <p>Terminal emulation is trickier than it seems. Even if you parse every sequence and
+            drop old text — which is a patch I tried before coming up with this redesign — you can
+            still have sync issues because of sequences like <code>CSI ? 7 h</code> and
+            <code>CSI ? 7 l</code> that enable and disable automatic line wrapping.</p>
 
+            <p>A terminal is not a bunch of HTML with bits of inline CSS.
+            Simply discarding old output will eventually cause long-lasting synchronization issues.
+            For example, if a 64 KiB image was preceded by <code>CSI ? 1049 h</code> (switching to the alternate screen),
+            discarding that screen switch would cause Velocitty 1.2 to draw the image over the main screen instead.</p>
 
-        <p><strong>Unconsumed ring bytes are never overwritten.</strong></p>
+            <p>In high-output workloads, much of the input is plain ASCII that scrolls off-screen
+            or gets cleared before a frame is displayed.</p>
 
+            <p>That's what I wanted to address in 1.3: skip painting that can be <em>proven</em>
+            obsolete, without skipping the terminal state attached to it.</p>
 
-        <p>Normal consumption occurs at a frame boundary or when input closes. Above 75% occupancy,
-        pressure consumption enables <code>skipText=true</code>. This activates lookahead analysis through
-        <code>isSpanObsolete</code>, it is disabled by default. The frame cadence gives reads time to
-        accumulate without running the visibility proof on small workloads.</p>
+            <h3 id="feedback">Technical feedback</h3>
 
-        <figure>
-            <img src="ring-runs.svg" alt="The 1 MiB ring, categorized runs, temporary stream buffer, ordered VT consumption and independently owned image store">
-            <figcaption>Diagram of the new input feeder and pre-parser.</figcaption>
-        </figure>
+            <p>Special thanks to Mitchell Hashimoto for the technical feedback on Velocitty 1.2.
+            He also posted a benchmark comparing its VT processing throughput with Ghostty.
+            I've kept the original post and chart here for reference.</p>
 
-        <p>To handle large payloads (APC, OSC clipboard, DCS strings, etc.),  if the preparser reaches an
-        unfinished string, its bytes move into a separate, growable stream buffer. Subsequent reads then
-        append directly to that buffer instead of filling the ring further. Once that sequence ends, the
-        preparser emits a run that references the stream buffer instead of the ring.
-        </p>
+            <div class="side">
+                <figure>
+                    <img src="mitchell-post.png" alt="Mitchell Hashimoto's post on Velocitty 1.2.0" loading="lazy">
+                    <figcaption>Mitchell Hashimoto's critique of Velocitty 1.2.0.</figcaption>
+                </figure>
+                <figure>
+                    <img src="mitchell-bench.jpeg" alt="VT processing throughput, Velocitty 1.2.1 vs Ghostty, M4 Max" loading="lazy">
+                    <figcaption>The benchmark attached to the post.</figcaption>
+                </figure>
+            </div>
 
-<pre><code>
-pub fn isSpanObsolete(self: *Preparser, index: usize) bool {
-    const span = self.runs.items[index];
-    if (span.kind != .text and span.role != .lf) return false;
-    if (self.exact) return false;
-    if (span.flags.ghost) return true;
-    if (self.blind) return false;
-    if (!self.visibility_ready) {
-        self.visibility_ready = true;
-        const need: u32 = 2 * @as(u32, self.rows) -| 1;
-        // No clear and too few scrolling LFs means no safe cutoff:
-        // CSI-heavy, non-scrolling input takes this O(1) exit.
-        var remaining = self.barriers;
-        inline for (0..2) |k| {
-            if (self.scroll_lfs[k] >= need) remaining |= @as(u2, 1) << k;
-        }
-        remaining &= self.screens;
-        var lfs = [2]u32{ 0, 0 };
-        var i = self.runs.items.len;
-        while (i > 0 and remaining != 0) {
-            i -= 1;
-            const run = self.runs.items[i];
-            const screen = run.flags.screen;
-            const bit = @as(u2, 1) << screen;
-            var kills: u2 = 0;
-            switch (run.role) {
-                .lf => {
-                    if (!run.flags.scrolls) {
-                        lfs[screen] = 0;
-                    } else {
-                        lfs[screen] += 1;
-                        if (lfs[screen] >= need) kills = bit;
-                    }
-                },
-                .motion => lfs[screen] = 0,
-                .barrier => kills = bit,
-                .barrier_alt => kills = 0b10,
-                .barrier_all => kills = 0b11,
-                else => {},
-            }
-            inline for (0..2) |k| {
-                const mask = @as(u2, 1) << k;
-                if (kills & remaining & mask != 0) self.cut[k] = @intCast(i);
-            }
-            remaining &= ~kills;
-            if (run.flags.moves) lfs[screen] = 0;
-            if (run.flags.resets) lfs = .{ 0, 0 };
-        }
-    }
-    return index < self.cut[span.flags.screen];
-}
-</code></pre>
+            <h2 id="redesign">Redesign</h2>
 
-        <h2 id="obsolete">Omitting obsolete painting, not terminal state</h2>
+            <p>A terminal can receive a lot of output in a very short time. Sometimes that output is
+            immediately cleared or scrolled off-screen before it can even be displayed. Painting all
+            of it is wasted work!</p>
 
-        <p><code>isSpanObsolete</code> uses later runs to prove that earlier ASCII/UTF-8 cell painting
-        cannot affect the visible result. Text still advances cursor, wrapping and grapheme state.
-        SGR, mode changes, queries, replies and graphics remain ordered; this is not a license to discard
-        arbitrary input before a byte cutoff.</p>
+            <p>Velocitty now reads into a <strong>mirrored 1 MiB ring buffer</strong>. Before the VT
+            parser sees the input, a pre-parser splits it into runs: text, ESC, C0, CSI, OSC and
+            other control strings. Each run stores an offset and length pointing to its backing
+            storage. It doesn't need to copy the whole input just to describe it.</p>
 
-        <p>The visibility proof is evaluated lazily and cached for each prepared workset. It uses
-        qualifying screen clears or enough full-region scrolling line feeds, conservatively stopping
-        at cursor motion, screen switches and restores it cannot reason about. Parser arrays have hard
-        limits totaling 160 KiB of dynamic metadata, independent of ring size, and are reused rather
-        than growing to describe an entire flood.</p>
+            <p>Normally, the runs are consumed at the next frame boundary, or when input closes.
+            This gives reads time to accumulate. Once the ring passes <strong>75% occupancy</strong>,
+            pressure consumption kicks in with <code>skipText=true</code>. That's when the
+            <code>isSpanObsolete</code> lookahead is used. On smaller workloads it's off, so I'm not
+            paying for the visibility proof when there isn't much to gain.</p>
 
-        <p>Pressure consumption retains the live suffix in the ring as lookahead for later input,
-        instead of repeatedly painting that suffix on every full-buffer drain. When the oldest content
-        cannot be proven obsolete, a quarter-ring progress floor prevents repeated scans on each small
-        PTY read near the 75% trigger. The next normal frame drain consumes the retained suffix.</p>
+            <p>In both cases, the runs reach the VT parser in order and without unconsumed ring
+            bytes being overwritten.</p>
 
-        <h2 id="streaming">Large payloads and temporary stream storage</h2>
-
-        <p>A control string can exceed the ring capacity or span many reads. If preparation reaches
-        an unfinished OSC, DCS, APC, PM or SOS string, the bytes seen so far move into a separate,
-        growable stream buffer. While the ring is empty, subsequent reads can append directly there.
-        Once the terminator arrives, a run with <code>flags.stream</code> references stream storage;
-        bytes following the terminator return to the ring. This preserves processing order across
-        both backing stores.</p>
-
-        <p>This covers transport framing for Kitty APC graphics, sixel DCS bodies, OSC 52 clipboard
-        data and other string payloads; individual handlers still determine which commands are supported.
-        The stream cap is 320 MiB, not an upfront allocation. Over-cap strings are discarded through
-        their terminator so ordinary parsing can recover.</p>
-
-        <p>The stream cannot be cleared merely because the ring is empty: its sequence might still be
-        incomplete. After consumption or an ownership transfer, temporary storage can be reused. The
-        current implementation frees idle stream allocations larger than 1 MiB and retains smaller ones;
-        it does not unconditionally shrink them by half.</p>
-
-        <p>Bulk payload traffic is not yet completely separate from pressure accounting: complete
-        strings initially occupy the ring, and large strings can cross 75% before streaming starts.
-        CSI/SGR are not streamed by this mechanism; incomplete CSI/ESC input has a separate 4 KiB hold
-        limit. These are current limitations, not evidence that payload pressure alone explains a
-        benchmark performance difference.</p>
-
-        <h2 id="images">Image storage survives input drains</h2>
-
-        <p>The image store is independent of temporary stream storage. It owns encoded payloads or
-        decoded RGBA pixels, image IDs and placements. A sufficiently large completed Kitty APC can
-        transfer its stream allocation to the store rather than copying the payload again; other paths
-        copy or transfer their own payload storage. Raw, PNG and sixel payloads defer decoding until
-        a placement becomes visible. Formats without a cheap size header, such as JPEG/GIF, decode
-        immediately to determine their dimensions.</p>
-
-        <p>Resize/reflow remaps image anchors alongside text, including blank cells, wide-glyph wrap
-        padding and the scrolled viewport. Redraw and font/cell-size changes do not discard image data.
-        Natural and single-axis-scaled dimensions are shared by rendering, cursor advancement and
-        placement lifetime; <code>C=1</code> suppresses Kitty cursor movement.</p>
-
-        <p>Screen clears remove visible placements. Named Kitty data stays available for a later
-        <code>a=p</code>, including after lowercase placement deletion; uppercase deletion frees data
-        once no placement references it. Anonymous/sixel images expire with their final placement.
-        The cache is bounded to 64 images and a separate 320 MiB logical quota, preferring unplaced
-        entries for eviction. Each image reserves the larger of encoded payload size and decoded RGBA
-        size, keeping quota decisions stable across lazy decoding. Decode scratch and allocator slack
-        are additional memory; this quota is not the stream-buffer cap or an RSS limit.</p>
-
-        <h2 id="fonts">Load fonts when needed</h2>
-
-        <p>The primary family comes from configuration, or the system <code>monospace</code> selection
-        when unset. There is no hardcoded Iosevka preference or emergency font path. Linux discovery
-        uses fontconfig; other platforms use native font resolution.</p>
-
-        <p>Only the primary font file loads initially. Styled faces load on first styled use, and
-        missing glyphs trigger the configured fallback chain before built-in coverage families.
-        Failed lookups are cached until font reload. Rendering benchmarks follow application font
-        selection unless explicitly overridden; parser-only benchmarks load neither font files nor
-        glyph atlases.</p>
-
-        <h2 id="appendix">Early Designs</h2>
-
-        I had other ideas that were similar but wouldn't work in practice. I tried having a "dead zone"
-        where I just ignored all ascii / utf-8 before a certain point but the gains were small, but it did
-        lead me to the current design.
-
-        <figure>
-            <img src="velocitty-1.3-notebook.webp" alt="Original notebook sketch." loading="lazy">
-            <figcaption>First sketch for the 1.3 redesign.</figcaption>
-        </figure>
-
-        <figure>
-            <img src="velocitty-1.3-notebook-2.webp" alt="Original notebook sketch." loading="lazy">
-            <figcaption>Second sketch for the 1.3 redesign.</figcaption>
-        </figure>
-
-
-
-        <h3 id="benchmarks">VT Parsing Speed Compared to Ghostty</h3>
-
-        <figure>
-            <img src="velocitty-vs-ghostty.png" alt="Headless VT throughput: Velocitty exact and text skipping versus Ghostty 1.4.0 exact">
-            <figcaption>Velocitty worktree (<code>74fb03457bae-dirty</code>) in exact and <code>--drop</code> text-skipping modes versus ghostty-bench 1.4.0 exact, on an Intel i7-10610U. Median of five CPU-time runs on 2026-11-01, generated via <code>scripts/bench_vs_ghostty.py</code>; no rendering or window presentation.</figcaption>
-        </figure>
-
-
-        <p>The chart is a historical measurement snapshot, not a benchmark of every subsequent
-        runtime change. Its current grouped bars use independent, zero-based linear scales per workload:
-        compare bar lengths within a workload, not between different workloads. Redrawing the chart
-        does not rerun the measurements.</p>
-
-        <p>The compatible <code>+terminal-stream</code> mode in <code>velocitty-bench</code> compares
-        identical generated input, identical grid dimensions and CPU time (user + system), rather than
-        requiring equal execution time. Exact consumption and text-skipping results are labeled
-        separately. This controls the input differences that can arise when applications choose output
-        based on <code>TERM=xterm-256color</code> versus <code>xterm-ghostty</code>.</p>
-
-        <h2 id="feedback">Technical feedback</h2>
-
-        <p> Special thanks to Mitchell Hashimoto for the accurate and technical feedback. </p>
-        <div class="side">
             <figure>
-                <img src="mitchell-post.png" alt="Mitchell Hashimoto's post on Velocitty 1.2.0">
-                <figcaption>Mitchell Hashimoto's critique of Velocitty 1.2.0.</figcaption>
+                <img src="ring-runs.svg" alt="The 1 MiB input ring, categorized runs, temporary stream buffer, ordered VT consumption and separate image store">
+                <figcaption>The new input feeder and pre-parser.</figcaption>
             </figure>
+
+            <h2 id="streaming">Large payloads</h2>
+
+            <p>The ring buffer is now 1 MiB. A control string can be much larger than that,
+            or arrive across many reads. For unfinished OSC, DCS, APC, PM and SOS strings,
+            the pre-parser moves the bytes it already has into a separate, growable stream buffer.
+            Subsequent reads can append straight to that buffer even if the ring is empty.</p>
+
+            <p>When the terminator sequence arrives, the pre-parser emits a run with
+            <code>flags.stream</code>. This signals that the offset and length point to the
+            stream storage instead of the ring buffer. Anything after the terminator
+            goes back into the ring. The VT parser still receives everything in order,
+            even though the bytes come from two different places.</p>
+
             <figure>
-                <img src="mitchell-bench.jpeg" alt="VT processing throughput, Velocitty 1.2.1 vs Ghostty, M4 Max">
-                <figcaption>The benchmark attached to the post.</figcaption>
+                <img src="payloads.svg" alt="An unfinished control string grows in stream storage and becomes an ordered run after its terminator">
+                <figcaption>Example of a payload being streamed to the buffer.</figcaption>
             </figure>
-        </div>
 
-        <h2 id="changelog">Changelog</h2>
+            <p>This handles framing for things like Kitty APC graphics, sixel DCS bodies and OSC 52
+            clipboard data.</p>
 
-        Besides the main redesign, a few other notable optimizations were made.
+            <p>There are still limits here. Complete control strings initially take space in the
+            ring, and a large string can cross the 75% threshold before streaming starts. So bulk
+            payload traffic isn't fully separate from pressure accounting yet. CSI/SGR don't use
+            this stream path, and incomplete CSI/ESC input has its own 4 KiB hold limit. None of
+            that, by itself, proves that payload pressure explains a benchmark difference.</p>
 
-        <h4>Performance and output handling</h4>
+            <h3 id="images">Image ownership</h3>
+
+            <p>Note that the temporary buffer is not the image store. The image store owns its encoded
+            payloads or decoded RGBA pixels, along with image IDs and placements. A sufficiently
+            large completed Kitty APC upload can hand its allocation directly to the image store,
+            avoiding another payload copy. Other paths copy or transfer their own storage.</p>
+
+            <p>The image cache is limited to <strong>64 images</strong> and a separate
+            <strong>320 MiB logical quota</strong>, with unplaced entries evicted first. Each image
+            reserves whichever is larger: its encoded payload size or decoded RGBA size. That way,
+            lazy decoding doesn't suddenly change its quota cost. Decode scratch space and allocator
+            overhead are extra. This quota is separate from the stream-buffer cap, and neither is a
+            limit on the process's total RSS.</p>
+
+
+            <h2 id="obsolete">Skipping obsolete painting</h2>
+
+            <p>This is an important distinction: I'm skipping <em>painting</em>, not terminal
+            state. <code>isSpanObsolete</code> looks at later runs to prove that earlier ASCII/UTF-8
+            cell painting won't affect the final visible result. That text still advances the cursor,
+            wraps lines and updates grapheme state. SGR, mode changes, queries, replies and graphics
+            are still processed in order!</p>
+
+            <p>The proof uses qualifying screen clears, or enough line feeds scrolling the full
+            region, to show that earlier painted cells are gone. It stops conservatively at things
+            it can't reason about safely (for now) like cursor movement, rectangle copies that read existing
+            cells, screen switches and restores. If this function can't prove a span is obsolete, the painting
+            is not skipped.</p>
+
+            <p>The lookahead is lazy. Instead of scanning the runs every time, the pre-parser only does it when
+            the VT first needs to know whether some text is obsolete. It scans backwards once, remembers the cutoff,
+            and reuses that result for the rest of the batch.</p>
+
+
+            <figure>
+                <img src="obsolete2.svg" alt="Full-region line feeds prove earlier text obsolete while cursor, color and wrapping state remain ordered">
+                <figcaption>Scrollback example.</figcaption>
+            </figure>
+
+            <figure>
+                <img src="obsolete.svg" alt="A later screen clear makes earlier cell writes obsolete while preserving cursor and SGR state">
+                <figcaption>Clear screen (<code>CSI 2 J</code>) example.</figcaption>
+            </figure>
+
+            <p>There's a lot of room for clever heuristics and optimizations here, but I kept
+            things simple because it's more of a proof-of-concept.</p>
+
+            <h2 id="benchmarks">Benchmarks</h2>
+
+            <p>I also wanted a comparison that measures VT processing directly, without mixing in
+            rendering and window presentation. This is a headless comparison with Ghostty 1.4.0,
+            using the same generated terminal stream and grid dimensions. Velocitty's exact mode
+            and its <code>--drop</code> text-skipping mode are shown separately, so the cost of the
+            optimization isn't hidden inside the baseline.</p>
+
+            <figure>
+                <img src="velocitty-vs-ghostty.png" alt="Headless VT throughput: Velocitty exact and text skipping versus Ghostty 1.4.0 exact">
+                <figcaption>Velocitty worktree (<code>74fb03457bae-dirty</code>) in exact and <code>--drop</code> text-skipping modes versus ghostty-bench 1.4.0 exact, on an Intel i7-10610U. Median of five CPU-time runs on 2026-11-01, generated via <code>scripts/bench_vs_ghostty.py</code>; no rendering or window presentation.</figcaption>
+            </figure>
+
+            <p>The compatible <code>+terminal-stream</code> mode in <code>velocitty-bench</code>
+            uses identical generated input, identical grid dimensions and CPU time (user + system).
+            It doesn't require the two programs to take exactly the same wall-clock time. Using
+            the same stream also avoids differences caused by applications choosing different
+            output for <code>TERM=xterm-256color</code> and <code>xterm-ghostty</code>.</p>
+
+            <p>This chart is a snapshot of that worktree, not a measurement of every change made
+            since. Each workload has its own zero-based linear scale, so compare bars
+            <em>within</em> a workload, not between workloads. Redrawing the chart doesn't rerun
+            the benchmark.</p>
+
+            <h2 id="appendix">Early designs</h2>
+
+            <p>I tried a few simpler ideas first. One was a "dead zone" where I ignored ASCII/UTF-8
+            before a certain point. It didn't help much in practice, but it led me toward this
+            design: instead of using a cutoff, I need to prove the painting won't matter.</p>
+
+            <p>These are my original notebook sketches.</p>
+
+            <figure>
+                <img src="velocitty-1.3-notebook.webp" alt="First notebook sketch of the Velocitty 1.3 input redesign" loading="lazy">
+                <figcaption>First sketch for the 1.3 redesign.</figcaption>
+            </figure>
+
+            <figure>
+                <img src="velocitty-1.3-notebook-2.webp" alt="Second notebook sketch of the Velocitty 1.3 input redesign" loading="lazy">
+                <figcaption>Second sketch for the 1.3 redesign.</figcaption>
+            </figure>
+
+            <h2 id="changelog">Changelog</h2>
+
+            <p>Besides the ring and pre-parser redesign, there were a lot of smaller fixes and
+            improvements. Here's the full list.</p>
+
+        <h3>Performance and output handling</h3>
         <ul>
             <li>Bounded, reusable parser metadata and shared CSI parsing.</li>
             <li>Direct stream-buffer reads and image-buffer handoff to reduce copying for large transfers.</li>
@@ -252,9 +218,9 @@ pub fn isSpanObsolete(self: *Preparser, index: usize) bool {
             <li>Style-table compaction and renderer invalidation when style IDs change.</li>
         </ul>
 
-        I got the style table idea from ghostty.
+        <p>I got the style table idea from Ghostty.</p>
 
-        <h4>Unicode and text</h4>
+        <h3>Unicode and text</h3>
         <ul>
             <li>Unicode 18 grapheme-break tables.</li>
             <li>Extended grapheme-cluster handling with mode 2027 support.</li>
@@ -262,13 +228,14 @@ pub fn isSpanObsolete(self: *Preparser, index: usize) bool {
             <li>Added combining-mark rendering and Hangul-jamo composition.</li>
             <li>Updated selection and copying to preserve complete grapheme clusters.</li>
             <li>Preserved clusters through insertion, deletion, erasure, and reflow.</li>
+            <li>Preserved styled trailing spaces and active/saved cursor positions through wide-glyph reflow.</li>
         </ul>
 
-        <h4>Graphics</h4>
+        <h3>Graphics</h3>
         <ul>
             <li>Anchored kitty and sixel images to scrollback lines.</li>
             <li>Updated image placement handling for scrolling regions and history expiration.</li>
-            <li>Deferred image decoding until rendering.</li>
+            <li>Deferred eligible image decoding until a placement becomes visible.</li>
             <li>Improved image-transfer ownership, cleanup, and retransmission handling.</li>
             <li>Added support for image strings larger than the input ring.</li>
             <li>Preserved anchors, blank-cell placements and the scrolled viewport through resize/reflow.</li>
@@ -276,27 +243,33 @@ pub fn isSpanObsolete(self: *Preparser, index: usize) bool {
             <li>Retained named image data for re-placement after clears and lowercase deletion.</li>
             <li>Added bounded, decode-independent cache accounting and unplaced-first eviction.</li>
             <li>Refined visible/point/placement-ID deletion and cancellation of unfinished uploads.</li>
+            <li>Kept anonymous/sixel image IDs distinct from existing named Kitty images, including ID wraparound.</li>
+            <li>Bounded sixel RGB scaling and header counters, and corrected allocation-failure cleanup.</li>
         </ul>
 
-        <h4>Font loading</h4>
+        <h3>Font loading</h3>
         <ul>
             <li>Resolve the configured primary or system monospace font without hardcoded preferred paths.</li>
             <li>Load styled and fallback faces on demand, preserve fallback order, deduplicate data and cache failed lookups.</li>
             <li>Keep valid blank glyphs from triggering unnecessary fallback loads during ASCII warmup.</li>
             <li>Make rendering benchmarks follow application font selection and parser-only benchmarks font-free.</li>
+            <li>Preserve selected font-collection members in primary loading, lazy fallback identity and rasterization.</li>
         </ul>
 
-        <h4>Correctness and input</h4>
+        <h3>Correctness and input</h3>
         <ul>
             <li>Hardened paste handling against escape/control injection; allocation failures no longer fall back to raw input.</li>
-            <li>Fixed composed Unicode input under kitty’s all-keys reporting mode.</li>
+            <li>Fixed composed Unicode input under Kitty's all-keys reporting mode.</li>
             <li>Fixed no-button mouse-motion reporting and urxvt mouse-button encoding.</li>
             <li>Propagated resize allocation errors instead of silently publishing inconsistent dimensions.</li>
             <li>Reaped Linux notification child processes and protected notification arguments with <code>--</code>.</li>
             <li>Corrected raw C1-byte handling, reset behavior, and soft-wrap clearing during erasure.</li>
+            <li>Preserved existing cells during tabulation and the live cursor content during height-only window shrinking.</li>
+            <li>Retained rectangle-copy source cells during pressure parsing and honored updated extended palette entries.</li>
+            <li>Corrected reverse-video repainting and selection highlights after framebuffer scroll reuse.</li>
         </ul>
 
-        <h4>Benchmarks and tests</h4>
+        <h3>Benchmarks and tests</h3>
         <ul>
             <li>Added Ghostty-compatible headless <code>+terminal-stream</code> benchmarking.</li>
             <li>Added automated Ghostty throughput comparisons with raw samples and generated charts.</li>
@@ -308,7 +281,7 @@ pub fn isSpanObsolete(self: *Preparser, index: usize) bool {
             <li>Removed the obsolete standalone rendering/golden-test harness and older benchmark implementations.</li>
         </ul>
 
-        <h4>Packaging and documentation</h4>
+        <h3>Packaging and documentation</h3>
         <ul>
             <li>Consolidated icons, desktop metadata, and Windows resources under <code>assets/</code>.</li>
             <li>Updated icon generation to use the canonical SVG.</li>
@@ -317,15 +290,7 @@ pub fn isSpanObsolete(self: *Preparser, index: usize) bool {
             <li>Added design pages, benchmark imagery, storage diagrams and subsystem references.</li>
             <li>Updated README branding, feature descriptions, Linux installation instructions, and the man page.</li>
         </ul>
-
-        <h3>Regression coverage</h3>
-        <p>Automated checks cover bounded metadata reuse, oversized OSC/DCS/APC transport, split
-        terminators, stream-to-image ownership, exact-vs-pressure parsing, graphics redraw/reflow,
-        cached image reuse and lazy font loading. The stream cap is tested with reduced limits;
-        this is not a claim of a full 320 MiB stress run. PM/SOS framing lacks dedicated tests, and
-        live interactive resize behavior remains a separate manual check.</p>
-
-    </main>
+        </main>
     </div>
-    </body>
+</body>
 </html>

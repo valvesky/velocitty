@@ -22,8 +22,7 @@ pub const Atlas = @import("type/atlas.zig").Atlas;
 const AtlasRgba = @import("type/atlas.zig").AtlasRgba;
 pub const Cache = @import("type/cache.zig");
 const EastAsian = @import("type/eastasian.zig");
-
-
+const FontSource = @import("fontsource.zig");
 
 pub const Error = error{
     InvalidFont,
@@ -55,6 +54,8 @@ pub const Style = packed struct {
 };
 
 pub const FaceOptions = struct {
+    /// Member of a TrueType/OpenType collection (zero for a standalone sfnt).
+    index: u32 = 0,
     weight: ?Weight = null,
     style: Style = .{},
     /// A deferred color-emoji candidate is irrelevant to other glyph misses.
@@ -119,8 +120,8 @@ pub const GlyphStats = struct {
     atlas_ns: u64 = 0,
 };
 
-/// A successful loader returns allocator-owned bytes, transferred to Context.
-pub const FontLoader = *const fn (std.mem.Allocator, std.Io, []const u8, bool, bool, bool) anyerror![]u8;
+/// A successful loader transfers allocator-owned bytes and their selected face.
+pub const FontLoader = *const fn (std.mem.Allocator, std.Io, []const u8, bool, bool, bool) anyerror!FontSource.Loaded;
 const LazyFont = struct {
     name: []u8,
     io: std.Io,
@@ -202,7 +203,7 @@ pub const Context = struct {
 
     /// `bytes` must outlive this context. The first added face becomes primary.
     pub fn addFont(self: *Context, bytes: []const u8, options: FaceOptions) Error!FontId {
-        const font = try TrueType.Font.open(bytes);
+        const font = try TrueType.Font.openIndex(bytes, options.index);
         const id: FontId = @enumFromInt(@as(u32, @intCast(self.faces.items.len)));
         var opened = font;
         if (!self.options.color_emoji) opened.color = null;
@@ -248,15 +249,16 @@ pub const Context = struct {
     fn loadLazyFont(self: *Context, index: usize) Error!?FontId {
         const candidate = &self.lazy_fonts.items[index];
         if (candidate.attempted) return candidate.id;
-        const bytes = candidate.loader(self.allocator, candidate.io, candidate.name, candidate.options.style.bold, candidate.options.style.italic, candidate.exact) catch |err| {
+        const loaded = candidate.loader(self.allocator, candidate.io, candidate.name, candidate.options.style.bold, candidate.options.style.italic, candidate.exact) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             candidate.attempted = true;
             return null;
         };
+        const bytes = loaded.bytes;
         var keep = false;
         defer if (!keep) self.allocator.free(bytes);
         for (self.faces.items) |face| {
-            if (std.mem.eql(u8, face.font.bytes, bytes)) {
+            if (face.font.index == loaded.index and std.mem.eql(u8, face.font.bytes, bytes)) {
                 candidate.attempted = true;
                 candidate.id = face.id;
                 self.selectStyleFace(face.id, candidate.options.style);
@@ -264,7 +266,9 @@ pub const Context = struct {
             }
         }
         try self.owned_fonts.ensureUnusedCapacity(self.allocator, 1);
-        const id = self.addFont(bytes, candidate.options) catch |err| {
+        var options = candidate.options;
+        options.index = loaded.index;
+        const id = self.addFont(bytes, options) catch |err| {
             if (err == error.OutOfMemory) return err;
             candidate.attempted = true;
             return null;
@@ -744,25 +748,28 @@ test "lazy font misses and styles load once and reset on reload" {
     var threaded = std.Io.Threaded.init(gpa, .{ .environ = std.testing.environ });
     defer threaded.deinit();
     const io = threaded.io();
-    const bytes = @import("fontsource.zig").loadFamily(gpa, io, "monospace", false, false, false) catch return error.SkipZigTest;
+    const loaded = FontSource.loadFamily(gpa, io, "monospace", false, false, false) catch return error.SkipZigTest;
+    const bytes = loaded.bytes;
     defer gpa.free(bytes);
     const Loader = struct {
         var calls = [2]usize{ 0, 0 };
         var source: []const u8 = &.{};
-        fn load(a: std.mem.Allocator, _: std.Io, name: []const u8, _: bool, _: bool, _: bool) anyerror![]u8 {
+        var index: u32 = 0;
+        fn load(a: std.mem.Allocator, _: std.Io, name: []const u8, _: bool, _: bool, _: bool) anyerror!FontSource.Loaded {
             if (std.mem.eql(u8, name, "missing")) {
                 calls[0] += 1;
                 return error.InvalidFont;
             }
             calls[1] += 1;
-            return a.dupe(u8, source);
+            return .{ .bytes = try a.dupe(u8, source), .index = index };
         }
     };
     Loader.calls = .{ 0, 0 };
     Loader.source = bytes;
+    Loader.index = loaded.index;
     var ctx = try Context.init(gpa, .{ .atlas_width = 256, .atlas_height = 256, .cache_capacity = 16 });
     defer ctx.deinit();
-    _ = try ctx.addFont(bytes, .{});
+    _ = try ctx.addFont(bytes, .{ .index = loaded.index });
     try ctx.addLazyFont(io, "missing", .{}, true, Loader.load);
     try ctx.addLazyFont(io, "missing", .{}, true, Loader.load);
     try ctx.addLazyFont(io, "style", .{ .style = .{ .bold = true } }, false, Loader.load);
@@ -778,8 +785,45 @@ test "lazy font misses and styles load once and reset on reload" {
     try std.testing.expectEqual(@as(usize, 1), ctx.faces.items.len); // Duplicate font bytes freed.
     ctx.clearFonts();
     try std.testing.expectEqual(@as(usize, 0), ctx.lazy_fonts.items.len);
-    _ = try ctx.addFont(bytes, .{});
+    _ = try ctx.addFont(bytes, .{ .index = loaded.index });
     try ctx.addLazyFont(io, "missing", .{}, true, Loader.load);
     _ = try ctx.glyph(0x10FFFF, 16);
     try std.testing.expectEqual(@as(usize, 2), Loader.calls[0]);
+}
+
+test "lazy font identity includes the collection member" {
+    const Loader = struct {
+        fn load(a: std.mem.Allocator, _: std.Io, _: []const u8, _: bool, _: bool, _: bool) anyerror!FontSource.Loaded {
+            return .{ .bytes = try a.dupe(u8, &TrueType.testing.collection), .index = 1 };
+        }
+    };
+    const a = std.testing.allocator;
+    var ctx = try Context.init(a, .{ .atlas_width = 16, .atlas_height = 16, .cache_capacity = 4 });
+    defer ctx.deinit();
+    const primary = try ctx.addFont(&TrueType.testing.collection, .{});
+    try ctx.addLazyFont(std.testing.io, "second member", .{}, true, Loader.load);
+    try ctx.addLazyFont(std.testing.io, "same second member", .{}, true, Loader.load);
+    const second = (try ctx.loadLazyFont(0)).?;
+    try std.testing.expect(second != primary);
+    try std.testing.expectEqual(@as(usize, 2), ctx.faces.items.len);
+    try std.testing.expectEqual(@as(u16, 1000), (try ctx.faces.items[@intFromEnum(primary)].font.metrics(16)).units_per_em);
+    try std.testing.expectEqual(@as(u16, 2000), (try ctx.faces.items[@intFromEnum(second)].font.metrics(16)).units_per_em);
+    try std.testing.expectEqual(second, (try ctx.loadLazyFont(1)).?);
+    try std.testing.expectEqual(@as(usize, 2), ctx.faces.items.len);
+    try std.testing.expectEqual(@as(usize, 1), ctx.owned_fonts.items.len);
+}
+
+test "fontconfig collection loads the selected outline face" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(a, .{ .environ = std.testing.environ });
+    defer threaded.deinit();
+    const loaded = FontSource.loadFamily(a, threaded.io(), "Noto Sans CJK SC", false, false, true) catch return error.SkipZigTest;
+    defer a.free(loaded.bytes);
+    if (loaded.index == 0) return error.SkipZigTest;
+    const first = try TrueType.Font.open(loaded.bytes);
+    const selected = try TrueType.Font.openIndex(loaded.bytes, loaded.index);
+    try std.testing.expect(selected.outline);
+    // This character has locale-specific glyph forms in Noto's CJK collection.
+    try std.testing.expect((try first.glyphIndex(0x9AA8)) != (try selected.glyphIndex(0x9AA8)));
 }

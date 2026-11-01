@@ -581,7 +581,7 @@ pub const Grid = struct {
             try self.resizeReflow(allocator, old_cols, old_rows, new_cols, new_rows, min_cap, anchors);
             return;
         }
-        try self.resizeClip(allocator, old_cols, old_rows, new_cols, new_rows, min_cap);
+        try self.resizeClip(allocator, old_cols, old_rows, new_cols, new_rows, min_cap, reflow);
     }
 
     fn resizeClip(
@@ -592,10 +592,18 @@ pub const Grid = struct {
         new_cols: u16,
         new_rows: u16,
         min_cap: u32,
+        preserve_history: bool,
     ) std.mem.Allocator.Error!void {
         const hist = self.used -| @as(u32, old_rows);
-        const keep_screen = @min(@as(u32, old_rows), @as(u32, new_rows));
-        const new_cap = @max(min_cap, hist + new_rows);
+        // A primary-screen height reduction moves the rows above the cursor
+        // into history rather than deleting the live prompt at the bottom.
+        const shift: u32 = if (preserve_history)
+            @min(old_rows -| new_rows, self.cursor.row -| (new_rows - 1))
+        else
+            0;
+        const new_hist = hist + shift;
+        const keep = @min(hist + old_rows, new_hist + new_rows);
+        const new_cap = @max(min_cap, new_hist + new_rows);
 
         const new_cells = try allocator.alloc(Cell, @as(usize, new_cols) * new_cap);
         errdefer allocator.free(new_cells);
@@ -613,7 +621,7 @@ pub const Grid = struct {
         const copy_cols = @min(old_cols, new_cols);
         const oldest = (self.head + self.cap - hist) % self.cap;
         var n: u32 = 0;
-        while (n < hist + keep_screen) : (n += 1) {
+        while (n < keep) : (n += 1) {
             const src_idx = (oldest + n) % self.cap;
             const src_off = self.starts[src_idx];
             const dst_off = new_starts[n];
@@ -634,10 +642,20 @@ pub const Grid = struct {
         self.wraps = new_wraps;
         self.cap = new_cap;
         self.width = new_cols;
-        self.head = hist;
-        self.used = hist + new_rows;
-        self.scroll = @min(self.scroll, hist);
+        self.head = new_hist;
+        self.used = new_hist + new_rows;
+        self.base += shift;
+        if (self.scroll != 0) self.scroll += shift;
+        self.scroll = @min(self.scroll, new_hist);
+        const pending = self.wrap_pending;
+        const saved_pending = self.saved_wrap_pending and self.saved_cursor.row >= shift;
+        self.cursor.row -|= @intCast(shift);
+        self.saved_cursor.row -|= @intCast(shift);
         self.clampCursors(new_cols, new_rows, old_rows);
+        if (preserve_history and old_cols == new_cols) {
+            self.wrap_pending = pending;
+            self.saved_wrap_pending = saved_pending;
+        }
     }
 
     fn resizeReflow(
@@ -661,8 +679,10 @@ pub const Grid = struct {
         }
         const oldest = (self.head + self.cap - hist) % self.cap;
         const blank = self.blankCell();
-        const cur_abs = hist + @as(u32, self.cursor.row);
-        const cur_col = self.cursor.col;
+        var positions = [_]ReflowPosition{
+            .{ .source = self.cursor, .wrap_pending = self.wrap_pending },
+            .{ .source = self.saved_cursor, .wrap_pending = self.saved_wrap_pending },
+        };
 
         var out_cells: std.ArrayList(Cell) = .empty;
         defer out_cells.deinit(allocator);
@@ -670,11 +690,6 @@ pub const Grid = struct {
         defer out_wraps.deinit(allocator);
         var logical: std.ArrayList(Cell) = .empty;
         defer logical.deinit(allocator);
-
-        var new_cur_row: u32 = 0;
-        var new_cur_col: u16 = @min(cur_col, new_cols - 1);
-        var mapped_cursor = false;
-        var new_wrap_pending = false;
 
         var i: u32 = 0;
         while (i < old_total) {
@@ -684,7 +699,7 @@ pub const Grid = struct {
                 const src_idx = (oldest + i) % self.cap;
                 const src = self.cells[self.starts[src_idx] .. self.starts[src_idx] + old_cols];
                 const wrapped = self.wraps[src_idx] != 0 and i + 1 < old_total;
-                const take = if (wrapped) old_cols else rowContentLen(src);
+                const take = if (wrapped) old_cols else rowContentLen(src, blank);
                 try logical.appendSlice(allocator, src[0..take]);
                 if (!wrapped) break;
                 i += 1;
@@ -701,14 +716,18 @@ pub const Grid = struct {
                 anchor.offset = offset;
                 while (logical.items.len <= offset) try logical.append(allocator, blank);
             }
-            // Graphics may advance the cursor through blank cells. Preserve
-            // that insertion point rather than clamping it to text content.
-            var graphics_cursor: ?u32 = null;
-            if (anchors.len != 0 and cur_abs >= log_start and cur_abs <= log_end) {
-                graphics_cursor = (cur_abs - log_start) * @as(u32, old_cols) + cur_col;
-                while (logical.items.len <= graphics_cursor.?) try logical.append(allocator, blank);
+            for (&positions, 0..) |*position, pos_index| {
+                position.offset = null;
+                const abs = hist + @as(u32, position.source.row);
+                if (abs < log_start or abs > log_end) continue;
+                // Graphics and saved cursor positions can lie beyond text.
+                const offset = if (pos_index == 1 or anchors.len != 0) offset: {
+                    const raw = (abs - log_start) * @as(u32, old_cols) + position.source.col;
+                    while (logical.items.len <= raw) try logical.append(allocator, blank);
+                    break :offset raw;
+                } else cursorOffsetInLogical(self, oldest, old_cols, log_start, abs, position.source.col, blank);
+                position.offset = offset + @intFromBool(position.wrap_pending);
             }
-            const before_rows: u32 = @intCast(out_wraps.items.len);
             try wrapLogical(
                 allocator,
                 &out_cells,
@@ -717,37 +736,21 @@ pub const Grid = struct {
                 new_cols,
                 blank,
                 anchors,
+                &positions,
             );
-            if (!mapped_cursor and cur_abs >= log_start and cur_abs <= log_end) {
-                const offset = graphics_cursor orelse cursorOffsetInLogical(
-                    self,
-                    oldest,
-                    old_cols,
-                    log_start,
-                    cur_abs,
-                    cur_col,
-                );
-                const insertion_offset = offset + @intFromBool(self.wrap_pending);
-                if (self.wrap_pending and insertion_offset % new_cols == 0) {
-                    mapCursor(insertion_offset - 1, new_cols, before_rows, &new_cur_row, &new_cur_col);
-                    new_wrap_pending = true;
-                } else {
-                    mapCursor(insertion_offset, new_cols, before_rows, &new_cur_row, &new_cur_col);
-                }
-                mapped_cursor = true;
-            }
             i += 1;
         }
 
         var out_rows: u32 = @intCast(out_wraps.items.len);
-        var cur_line: u32 = if (mapped_cursor) new_cur_row else out_rows -| 1;
+        const active = positions[0];
+        var cur_line: u32 = if (active.mapped) active.row else out_rows -| 1;
         for (anchors) |anchor| {
             if (anchor.mapped and anchor.outside_rows <= 0) cur_line = @max(cur_line, anchor.mapped_row);
         }
         while (out_rows > new_rows and out_rows > cur_line + 1) {
             const last = out_rows - 1;
             const off = last * @as(u32, new_cols);
-            if (rowContentLen(out_cells.items[off .. off + new_cols]) != 0) break;
+            if (rowContentLen(out_cells.items[off .. off + new_cols], blank) != 0) break;
             out_rows = last;
         }
         if (out_rows < new_rows) {
@@ -761,9 +764,9 @@ pub const Grid = struct {
         }
 
         var view_top = out_rows -| @as(u32, new_rows);
-        if (mapped_cursor and new_cur_row < view_top) view_top = new_cur_row;
-        if (mapped_cursor and new_cur_row >= view_top + new_rows) {
-            view_top = new_cur_row + 1 - new_rows;
+        if (active.mapped and active.row < view_top) view_top = active.row;
+        if (active.mapped and active.row >= view_top + new_rows) {
+            view_top = active.row + 1 - new_rows;
         }
 
         const new_cap = @max(min_cap, out_rows);
@@ -805,22 +808,18 @@ pub const Grid = struct {
         self.head = view;
         self.used = view + new_rows;
         self.scroll = 0;
-        if (mapped_cursor) {
-            const abs = new_cur_row -| drop;
-            if (abs >= view) {
-                self.cursor.row = @intCast(@min(abs - view, @as(u32, new_rows - 1)));
+        for (positions, 0..) |position, pos_index| {
+            const cursor = if (pos_index == 0) &self.cursor else &self.saved_cursor;
+            if (position.mapped) {
+                cursor.row = @intCast(@min(position.row -| drop -| view, new_rows - 1));
+                cursor.col = @min(position.col, new_cols - 1);
             } else {
-                self.cursor.row = 0;
+                cursor.row = @min(cursor.row, new_rows - 1);
+                cursor.col = @min(cursor.col, new_cols - 1);
             }
-            self.cursor.col = @min(new_cur_col, new_cols - 1);
-        } else {
-            self.cursor.row = @min(self.cursor.row, new_rows - 1);
-            self.cursor.col = @min(self.cursor.col, new_cols - 1);
+            const pending = position.mapped and position.wrap_pending;
+            if (pos_index == 0) self.wrap_pending = pending else self.saved_wrap_pending = pending;
         }
-        self.wrap_pending = new_wrap_pending;
-        self.saved_cursor.row = @min(self.saved_cursor.row, new_rows - 1);
-        self.saved_cursor.col = @min(self.saved_cursor.col, new_cols - 1);
-        self.saved_wrap_pending = false;
         self.clampScrollRegion(old_rows, new_rows);
         for (anchors) |*anchor| {
             if (!anchor.mapped) continue;
@@ -1096,10 +1095,13 @@ pub const Grid = struct {
     }
 };
 
-fn rowContentLen(row: []const Cell) u16 {
+fn rowContentLen(row: []const Cell, blank: Cell) u16 {
     var n: u16 = @intCast(row.len);
     while (n > 0) {
-        const cp = row[n - 1].codepoint;
+        const cell = row[n - 1];
+        const cp = cell.codepoint;
+        // Reflow can discard only blanks it can reproduce with the new fill.
+        if (cell.style != blank.style) break;
         if (cp == 0 and n >= 2 and row[n - 2].codepoint != 0 and row[n - 2].codepoint != ' ') break;
         if (cp != 0 and cp != ' ') break;
         n -= 1;
@@ -1115,12 +1117,14 @@ fn wrapLogical(
     new_cols: u16,
     blank: Cell,
     anchors: []Grid.Anchor,
+    positions: []ReflowPosition,
 ) std.mem.Allocator.Error!void {
     var col: u16 = 0;
     var i: usize = 0;
     if (logical.len == 0) {
         var c: u16 = 0;
         while (c < new_cols) : (c += 1) try out_cells.append(allocator, blank);
+        mapPositions(positions, 0, 1, @intCast(out_wraps.items.len), 0, 1);
         try out_wraps.append(allocator, 0);
         return;
     }
@@ -1140,6 +1144,7 @@ fn wrapLogical(
             col = 0;
         }
         mapAnchors(anchors, i, if (wide) 2 else 1, @intCast(out_wraps.items.len), col, width);
+        mapPositions(positions, i, if (wide) 2 else 1, @intCast(out_wraps.items.len), col, width);
         try out_cells.append(allocator, cell);
         col += 1;
         if (width == 2) {
@@ -1149,8 +1154,43 @@ fn wrapLogical(
         }
         i += 1;
     }
+    // A cursor may be the insertion point after the final glyph. Its output
+    // position includes padding inserted before wide glyphs, just like cells.
+    for (positions) |*position| {
+        const offset = position.offset orelse continue;
+        if (offset != logical.len) continue;
+        position.row = @intCast(out_wraps.items.len);
+        position.col = col;
+        if (col == new_cols) {
+            position.col -= 1;
+            position.wrap_pending = true;
+        } else position.wrap_pending = false;
+        position.mapped = true;
+        position.offset = null;
+    }
     while (col < new_cols) : (col += 1) try out_cells.append(allocator, blank);
     try out_wraps.append(allocator, 0);
+}
+
+const ReflowPosition = struct {
+    source: Cursor,
+    wrap_pending: bool,
+    offset: ?usize = null,
+    row: u32 = 0,
+    col: u16 = 0,
+    mapped: bool = false,
+};
+
+fn mapPositions(positions: []ReflowPosition, index: usize, old_width: usize, row: u32, col: u16, width: u16) void {
+    for (positions) |*position| {
+        const offset = position.offset orelse continue;
+        if (offset < index or offset >= index + old_width) continue;
+        position.row = row;
+        position.col = col + @as(u16, @intCast(@min(offset - index, width - 1)));
+        position.wrap_pending = false;
+        position.mapped = true;
+        position.offset = null;
+    }
 }
 
 fn mapAnchors(anchors: []Grid.Anchor, index: usize, old_width: usize, row: u32, col: u16, width: u16) void {
@@ -1171,6 +1211,7 @@ fn cursorOffsetInLogical(
     log_start: u32,
     cur_abs: u32,
     cur_col: u16,
+    blank: Cell,
 ) u32 {
     var off: u32 = 0;
     var r = log_start;
@@ -1178,17 +1219,12 @@ fn cursorOffsetInLogical(
         const src_idx = (oldest + r) % grid.cap;
         const src = grid.cells[grid.starts[src_idx] .. grid.starts[src_idx] + old_cols];
         const wrapped = grid.wraps[src_idx] != 0;
-        off += if (wrapped) old_cols else rowContentLen(src);
+        off += if (wrapped) old_cols else rowContentLen(src, blank);
     }
     const src_idx = (oldest + cur_abs) % grid.cap;
     const src = grid.cells[grid.starts[src_idx] .. grid.starts[src_idx] + old_cols];
-    const take = if (grid.wraps[src_idx] != 0) old_cols else rowContentLen(src);
+    const take = if (grid.wraps[src_idx] != 0) old_cols else rowContentLen(src, blank);
     return off + @min(@as(u32, cur_col), @as(u32, take));
-}
-
-fn mapCursor(offset: u32, new_cols: u16, before_rows: u32, row: *u32, col: *u16) void {
-    row.* = before_rows + offset / new_cols;
-    col.* = @intCast(@min(offset % new_cols, @as(u32, new_cols - 1)));
 }
 
 test "reflow keeps glyphs" {
@@ -1202,6 +1238,73 @@ test "reflow keeps glyphs" {
     try g.resize(std.testing.allocator, 4, 2, 6, 3, 8, true);
     try std.testing.expectEqual(@as(u21, 'A'), g.cellAt(0, 0).codepoint);
     try std.testing.expectEqual(@as(u21, 'B'), g.cellAt(0, 1).codepoint);
+}
+
+test "height shrink preserves history, saved cursor and absolute viewport" {
+    const a = std.testing.allocator;
+    const styles = try Styles.create(a);
+    defer styles.destroy();
+    var g = try Grid.init(a, 4, 4, 8, styles, 0);
+    defer g.deinit(a);
+    for (0..4) |r| g.writeCell(@intCast(r), 0, @intCast('A' + r));
+    g.cursor = .{ .row = 3, .col = 2 };
+    g.saveCursor();
+    // Seed one existing history row, as after a full-screen scroll.
+    g.historyScrollUp(1, 4, 4);
+    g.cursor.row = 3;
+    g.saved_cursor.row = 2;
+    g.scroll = 1;
+    const old_view = @as(i64, @intCast(g.base)) - g.scroll;
+    try g.resize(a, 4, 4, 4, 2, 8, true);
+    try std.testing.expectEqual(@as(u32, 3), g.used - 2);
+    try std.testing.expectEqual(@as(u16, 1), g.cursor.row);
+    try std.testing.expectEqual(@as(u16, 0), g.saved_cursor.row);
+    try std.testing.expectEqual(old_view, @as(i64, @intCast(g.base)) - g.scroll);
+    const oldest = (g.head + g.cap - (g.used - 2)) % g.cap;
+    try std.testing.expectEqual(@as(u21, 'A'), g.cells[g.starts[oldest]].codepoint);
+}
+
+test "wide reflow maps saved insertion point through padding" {
+    const a = std.testing.allocator;
+    const styles = try Styles.create(a);
+    defer styles.destroy();
+    var g = try Grid.init(a, 4, 4, 8, styles, 0);
+    defer g.deinit(a);
+    for ([_]u21{ 'a', 'b', '界', 0 }, 0..) |cp, col| g.writeCell(0, @intCast(col), cp);
+    g.cursor = .{ .col = 3 };
+    g.wrap_pending = true;
+    g.saveCursor();
+    try g.resize(a, 4, 4, 3, 4, 8, true);
+    try std.testing.expectEqual(Cursor{ .row = 1, .col = 2 }, g.cursor);
+    try std.testing.expectEqual(g.cursor, g.saved_cursor);
+    try std.testing.expect(!g.wrap_pending and !g.saved_wrap_pending);
+}
+
+test "reflow ending at the new margin retains an insertion point" {
+    const a = std.testing.allocator;
+    const styles = try Styles.create(a);
+    defer styles.destroy();
+    var g = try Grid.init(a, 4, 1, 4, styles, 0);
+    defer g.deinit(a);
+    for ("abc", 0..) |cp, col| g.writeCell(0, @intCast(col), cp);
+    g.cursor.col = 3;
+    try g.resize(a, 4, 1, 3, 1, 4, true);
+    try std.testing.expectEqual(Cursor{ .col = 2 }, g.cursor);
+    try std.testing.expect(g.wrap_pending);
+}
+
+test "saved cursor beyond text survives reflow" {
+    const a = std.testing.allocator;
+    const styles = try Styles.create(a);
+    defer styles.destroy();
+    var g = try Grid.init(a, 4, 2, 4, styles, 0);
+    defer g.deinit(a);
+    g.saved_cursor = .{ .col = 2 };
+    g.cursor.row = 1;
+    g.writeCell(1, 0, 'Y');
+    try g.resize(a, 4, 2, 5, 2, 4, true);
+    try std.testing.expectEqual(Cursor{ .col = 2 }, g.saved_cursor);
+    try std.testing.expectEqual(@as(u21, 'Y'), g.cellAt(1, 0).codepoint);
 }
 
 test "fillCells matches memset" {

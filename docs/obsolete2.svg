@@ -1,0 +1,403 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1220" height="580" viewBox="0 0 1220 580" role="img" aria-labelledby="title desc">
+  <title id="title">Skipping obsolete terminal painting after scrolling</title>
+  <desc id="desc">The pre-parser sees 15 full-screen scrolling line feeds for an 8-row terminal. Reverse lookahead finds enough line feeds to prove earlier text painting invisible. The old text is ghosted while SGR and cursor changes remain ordered. In the terminal grid, prior visible output scrolls off, READY is painted red, and autowrap is disabled.</desc>
+  <defs><clipPath id="grid-clip"><rect x="88" y="370" width="704" height="192"/></clipPath></defs>
+  <style>
+  :root {color-scheme:dark}
+  text {font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}
+  .section{fill:#d79921;font-size:15px;font-weight:700;letter-spacing:.5px}
+  .copy{fill:#ebdbb2}.muted{fill:#a89984}
+  .card-label{fill:#ebdbb2;font-size:15px;font-weight:700}
+  .card-body{fill:#ebdbb2;font-size:17px;font-weight:600}
+  .look-highlight{fill:none;stroke:#83a598;stroke-width:3;filter:drop-shadow(0 0 3px #458588);opacity:0}
+  .parse-highlight{fill:none;stroke:#d79921;stroke-width:2.5;filter:drop-shadow(0 0 3px #d79921);opacity:0}
+  .ghost-badge{opacity:0}
+  .caption{opacity:0}
+  .caption-label{font-size:15px;font-weight:700;letter-spacing:.3px}
+  .caption-copy{fill:#ebdbb2;font-size:17px;font-weight:500}
+  .scan-section{opacity:0;animation:scan-section 20s linear infinite}
+  @keyframes scan-section{0%,11%{opacity:0}12%,38%{opacity:1}40%,100%{opacity:0}}
+  .terminal-stage{opacity:.48;animation:terminal-enter 20s linear infinite}
+  @keyframes terminal-enter{0%,39%{opacity:.48}40%,98%{opacity:1}100%{opacity:.48}}
+  .vt-grid-line{stroke:#665c54;stroke-opacity:.43;stroke-width:.75;shape-rendering:crispEdges}
+  .vt-caret{fill:#ebdbb2;fill-opacity:.70;stroke:#ebdbb2;stroke-width:.7;animation:vt-caret 20s steps(1,end) infinite}
+  .vt-glyph{fill:#fb4934;font-size:17px;font-weight:600}
+  .scroll-contents{animation:scroll-contents 20s steps(1,end) infinite}
+  .prior-text{fill:#bdae93;font-size:14px;opacity:.77}
+  .state-text{fill:#ebdbb2;font-size:14px}
+  .state-red{fill:#fb4934;font-size:14px}
+  .state-green{fill:#0f0;font-size:14px}
+  .look-0{opacity:0;animation:look-0 20s linear infinite}
+  @keyframes look-0{0%,32.97%{opacity:0} 33%,35.97%{opacity:1} 36%,100%{opacity:0}}
+  .look-1{opacity:0;animation:look-1 20s linear infinite}
+  @keyframes look-1{0%,29.97%{opacity:0} 30%,32.97%{opacity:1} 33%,100%{opacity:0}}
+  .look-2{opacity:0;animation:look-2 20s linear infinite}
+  @keyframes look-2{0%,26.97%{opacity:0} 27%,29.97%{opacity:1} 30%,100%{opacity:0}}
+  .look-3{opacity:0;animation:look-3 20s linear infinite}
+  @keyframes look-3{0%,18.97%{opacity:0} 19%,26.97%{opacity:1} 27%,100%{opacity:0}}
+  .look-4{opacity:0;animation:look-4 20s linear infinite}
+  @keyframes look-4{0%,15.47%{opacity:0} 15.5%,18.97%{opacity:1} 19%,100%{opacity:0}}
+  .look-5{opacity:0;animation:look-5 20s linear infinite}
+  @keyframes look-5{0%,11.97%{opacity:0} 12%,15.47%{opacity:1} 15.5%,100%{opacity:0}}
+  .parse-0{opacity:0;animation:parse-0 20s linear infinite}
+  @keyframes parse-0{0%,39.97%{opacity:0} 40%,44.97%{opacity:1} 45%,100%{opacity:0}}
+  .parse-1{opacity:0;animation:parse-1 20s linear infinite}
+  @keyframes parse-1{0%,44.97%{opacity:0} 45%,48.97%{opacity:1} 49%,100%{opacity:0}}
+  .parse-2{opacity:0;animation:parse-2 20s linear infinite}
+  @keyframes parse-2{0%,48.97%{opacity:0} 49%,53.97%{opacity:1} 54%,100%{opacity:0}}
+  .parse-3{opacity:0;animation:parse-3 20s linear infinite}
+  @keyframes parse-3{0%,53.97%{opacity:0} 54%,75.97%{opacity:1} 76%,100%{opacity:0}}
+  .parse-4{opacity:0;animation:parse-4 20s linear infinite}
+  @keyframes parse-4{0%,75.97%{opacity:0} 76%,82.97%{opacity:1} 83%,100%{opacity:0}}
+  .parse-5{opacity:0;animation:parse-5 20s linear infinite}
+  @keyframes parse-5{0%,82.97%{opacity:0} 83%,88.97%{opacity:1} 89%,100%{opacity:0}}
+  .caption-0{animation:caption-0 20s ease-in-out infinite}
+  @keyframes caption-0{0%,0%{opacity:0;transform:translateY(3px)} 0.6%,10.4%{opacity:1;transform:translateY(0)} 11%,100%{opacity:0;transform:translateY(-3px)}}
+  .caption-1{animation:caption-1 20s ease-in-out infinite}
+  @keyframes caption-1{0%,11.65%{opacity:0;transform:translateY(3px)} 12.6%,26.4%{opacity:1;transform:translateY(0)} 27%,100%{opacity:0;transform:translateY(-3px)}}
+  .caption-2{animation:caption-2 20s ease-in-out infinite}
+  @keyframes caption-2{0%,26.65%{opacity:0;transform:translateY(3px)} 27.6%,39.4%{opacity:1;transform:translateY(0)} 40%,100%{opacity:0;transform:translateY(-3px)}}
+  .caption-3{animation:caption-3 20s ease-in-out infinite}
+  @keyframes caption-3{0%,39.65%{opacity:0;transform:translateY(3px)} 40.6%,44.4%{opacity:1;transform:translateY(0)} 45%,100%{opacity:0;transform:translateY(-3px)}}
+  .caption-4{animation:caption-4 20s ease-in-out infinite}
+  @keyframes caption-4{0%,44.65%{opacity:0;transform:translateY(3px)} 45.6%,48.4%{opacity:1;transform:translateY(0)} 49%,100%{opacity:0;transform:translateY(-3px)}}
+  .caption-5{animation:caption-5 20s ease-in-out infinite}
+  @keyframes caption-5{0%,48.65%{opacity:0;transform:translateY(3px)} 49.6%,53.4%{opacity:1;transform:translateY(0)} 54%,100%{opacity:0;transform:translateY(-3px)}}
+  .caption-6{animation:caption-6 20s ease-in-out infinite}
+  @keyframes caption-6{0%,53.65%{opacity:0;transform:translateY(3px)} 54.6%,75.4%{opacity:1;transform:translateY(0)} 76%,100%{opacity:0;transform:translateY(-3px)}}
+  .caption-7{animation:caption-7 20s ease-in-out infinite}
+  @keyframes caption-7{0%,75.65%{opacity:0;transform:translateY(3px)} 76.6%,82.4%{opacity:1;transform:translateY(0)} 83%,100%{opacity:0;transform:translateY(-3px)}}
+  .caption-8{animation:caption-8 20s ease-in-out infinite}
+  @keyframes caption-8{0%,82.65%{opacity:0;transform:translateY(3px)} 83.6%,88.4%{opacity:1;transform:translateY(0)} 89%,100%{opacity:0;transform:translateY(-3px)}}
+  .caption-9{animation:caption-9 20s ease-in-out infinite}
+  @keyframes caption-9{0%,88.65%{opacity:0;transform:translateY(3px)} 89.6%,98.4%{opacity:1;transform:translateY(0)} 99%,100%{opacity:0;transform:translateY(-3px)}}
+  .ghost-2{animation:ghost-2 20s linear infinite}
+  @keyframes ghost-2{0%,29.08%{opacity:0} 29.1%,98%{opacity:1} 100%{opacity:0}}
+  .ghost-0{animation:ghost-0 20s linear infinite}
+  @keyframes ghost-0{0%,33.98%{opacity:0} 34%,98%{opacity:1} 100%{opacity:0}}
+  @keyframes vt-caret{
+    0%{transform:translateX(0px)}
+    40%{transform:translateX(0px)}
+    40.5556%{transform:translateX(22px)}
+    41.1111%{transform:translateX(44px)}
+    41.6667%{transform:translateX(66px)}
+    42.2222%{transform:translateX(88px)}
+    42.7778%{transform:translateX(110px)}
+    43.3333%{transform:translateX(132px)}
+    43.8889%{transform:translateX(154px)}
+    44.4444%{transform:translateX(176px)}
+    45%{transform:translateX(198px)}
+    49%{transform:translateX(198px)}
+    49.625%{transform:translateX(220px)}
+    50.25%{transform:translateX(242px)}
+    50.875%{transform:translateX(264px)}
+    51.5%{transform:translateX(286px)}
+    52.125%{transform:translateX(308px)}
+    52.75%{transform:translateX(330px)}
+    53.375%{transform:translateX(352px)}
+    54%{transform:translateX(374px)}
+    76%{transform:translateX(374px)}
+    77.4%{transform:translateX(396px)}
+    78.8%{transform:translateX(418px)}
+    80.2%{transform:translateX(440px)}
+    81.6%{transform:translateX(462px)}
+    83%{transform:translateX(484px)}
+    89%{transform:translateX(484px)}
+    100%{transform:translateX(484px)}
+  }
+  .col-0{opacity:0;animation:col-0 20s linear infinite}
+  @keyframes col-0{0%,0%{opacity:0} 0%,40.5256%{opacity:1} 40.5556%,100%{opacity:0}}
+  .col-1{opacity:0;animation:col-1 20s linear infinite}
+  @keyframes col-1{0%,40.5256%{opacity:0} 40.5556%,41.0811%{opacity:1} 41.1111%,100%{opacity:0}}
+  .col-2{opacity:0;animation:col-2 20s linear infinite}
+  @keyframes col-2{0%,41.0811%{opacity:0} 41.1111%,41.6367%{opacity:1} 41.6667%,100%{opacity:0}}
+  .col-3{opacity:0;animation:col-3 20s linear infinite}
+  @keyframes col-3{0%,41.6367%{opacity:0} 41.6667%,42.1922%{opacity:1} 42.2222%,100%{opacity:0}}
+  .col-4{opacity:0;animation:col-4 20s linear infinite}
+  @keyframes col-4{0%,42.1922%{opacity:0} 42.2222%,42.7478%{opacity:1} 42.7778%,100%{opacity:0}}
+  .col-5{opacity:0;animation:col-5 20s linear infinite}
+  @keyframes col-5{0%,42.7478%{opacity:0} 42.7778%,43.3033%{opacity:1} 43.3333%,100%{opacity:0}}
+  .col-6{opacity:0;animation:col-6 20s linear infinite}
+  @keyframes col-6{0%,43.3033%{opacity:0} 43.3333%,43.8589%{opacity:1} 43.8889%,100%{opacity:0}}
+  .col-7{opacity:0;animation:col-7 20s linear infinite}
+  @keyframes col-7{0%,43.8589%{opacity:0} 43.8889%,44.4144%{opacity:1} 44.4444%,100%{opacity:0}}
+  .col-8{opacity:0;animation:col-8 20s linear infinite}
+  @keyframes col-8{0%,44.4144%{opacity:0} 44.4444%,44.97%{opacity:1} 45%,100%{opacity:0}}
+  .col-9{opacity:0;animation:col-9 20s linear infinite}
+  @keyframes col-9{0%,44.97%{opacity:0} 45%,49.595%{opacity:1} 49.625%,100%{opacity:0}}
+  .col-10{opacity:0;animation:col-10 20s linear infinite}
+  @keyframes col-10{0%,49.595%{opacity:0} 49.625%,50.22%{opacity:1} 50.25%,100%{opacity:0}}
+  .col-11{opacity:0;animation:col-11 20s linear infinite}
+  @keyframes col-11{0%,50.22%{opacity:0} 50.25%,50.845%{opacity:1} 50.875%,100%{opacity:0}}
+  .col-12{opacity:0;animation:col-12 20s linear infinite}
+  @keyframes col-12{0%,50.845%{opacity:0} 50.875%,51.47%{opacity:1} 51.5%,100%{opacity:0}}
+  .col-13{opacity:0;animation:col-13 20s linear infinite}
+  @keyframes col-13{0%,51.47%{opacity:0} 51.5%,52.095%{opacity:1} 52.125%,100%{opacity:0}}
+  .col-14{opacity:0;animation:col-14 20s linear infinite}
+  @keyframes col-14{0%,52.095%{opacity:0} 52.125%,52.72%{opacity:1} 52.75%,100%{opacity:0}}
+  .col-15{opacity:0;animation:col-15 20s linear infinite}
+  @keyframes col-15{0%,52.72%{opacity:0} 52.75%,53.345%{opacity:1} 53.375%,100%{opacity:0}}
+  .col-16{opacity:0;animation:col-16 20s linear infinite}
+  @keyframes col-16{0%,53.345%{opacity:0} 53.375%,53.97%{opacity:1} 54%,100%{opacity:0}}
+  .col-17{opacity:0;animation:col-17 20s linear infinite}
+  @keyframes col-17{0%,53.97%{opacity:0} 54%,77.37%{opacity:1} 77.4%,100%{opacity:0}}
+  .col-18{opacity:0;animation:col-18 20s linear infinite}
+  @keyframes col-18{0%,77.37%{opacity:0} 77.4%,78.77%{opacity:1} 78.8%,100%{opacity:0}}
+  .col-19{opacity:0;animation:col-19 20s linear infinite}
+  @keyframes col-19{0%,78.77%{opacity:0} 78.8%,80.17%{opacity:1} 80.2%,100%{opacity:0}}
+  .col-20{opacity:0;animation:col-20 20s linear infinite}
+  @keyframes col-20{0%,80.17%{opacity:0} 80.2%,81.57%{opacity:1} 81.6%,100%{opacity:0}}
+  .col-21{opacity:0;animation:col-21 20s linear infinite}
+  @keyframes col-21{0%,81.57%{opacity:0} 81.6%,82.97%{opacity:1} 83%,100%{opacity:0}}
+  .col-22{opacity:0;animation:col-22 20s linear infinite}
+  @keyframes col-22{0%,82.97%{opacity:0} 83%,99.97%{opacity:1} 100%,100%{opacity:0}}
+  .state-fg-default{opacity:0;animation:state-fg-default 20s linear infinite}
+  @keyframes state-fg-default{0%,0%{opacity:0} 0%,44.97%{opacity:1} 45%,100%{opacity:0}}
+  .state-fg-red{opacity:0;animation:state-fg-red 20s linear infinite}
+  @keyframes state-fg-red{0%,44.97%{opacity:0} 45%,99.95%{opacity:1} 99.98%,100%{opacity:0}}
+  .state-wrap-on{opacity:0;animation:state-wrap-on 20s linear infinite}
+  @keyframes state-wrap-on{0%,0%{opacity:0} 0%,82.97%{opacity:1} 83%,100%{opacity:0}}
+  .state-wrap-off{opacity:0;animation:state-wrap-off 20s linear infinite}
+  @keyframes state-wrap-off{0%,82.97%{opacity:0} 83%,99.95%{opacity:1} 99.98%,100%{opacity:0}}
+  .lf-count-0{opacity:0;animation:lf-count-0 20s linear infinite}
+  @keyframes lf-count-0{0%,0%{opacity:0} 0%,55.4367%{opacity:1} 55.4667%,100%{opacity:0}}
+  .lf-count-1{opacity:0;animation:lf-count-1 20s linear infinite}
+  @keyframes lf-count-1{0%,55.4367%{opacity:0} 55.4667%,56.9033%{opacity:1} 56.9333%,100%{opacity:0}}
+  .lf-count-2{opacity:0;animation:lf-count-2 20s linear infinite}
+  @keyframes lf-count-2{0%,56.9033%{opacity:0} 56.9333%,58.37%{opacity:1} 58.4%,100%{opacity:0}}
+  .lf-count-3{opacity:0;animation:lf-count-3 20s linear infinite}
+  @keyframes lf-count-3{0%,58.37%{opacity:0} 58.4%,59.8367%{opacity:1} 59.8667%,100%{opacity:0}}
+  .lf-count-4{opacity:0;animation:lf-count-4 20s linear infinite}
+  @keyframes lf-count-4{0%,59.8367%{opacity:0} 59.8667%,61.3033%{opacity:1} 61.3333%,100%{opacity:0}}
+  .lf-count-5{opacity:0;animation:lf-count-5 20s linear infinite}
+  @keyframes lf-count-5{0%,61.3033%{opacity:0} 61.3333%,62.77%{opacity:1} 62.8%,100%{opacity:0}}
+  .lf-count-6{opacity:0;animation:lf-count-6 20s linear infinite}
+  @keyframes lf-count-6{0%,62.77%{opacity:0} 62.8%,64.2367%{opacity:1} 64.2667%,100%{opacity:0}}
+  .lf-count-7{opacity:0;animation:lf-count-7 20s linear infinite}
+  @keyframes lf-count-7{0%,64.2367%{opacity:0} 64.2667%,65.7033%{opacity:1} 65.7333%,100%{opacity:0}}
+  .lf-count-8{opacity:0;animation:lf-count-8 20s linear infinite}
+  @keyframes lf-count-8{0%,65.7033%{opacity:0} 65.7333%,67.17%{opacity:1} 67.2%,100%{opacity:0}}
+  .lf-count-9{opacity:0;animation:lf-count-9 20s linear infinite}
+  @keyframes lf-count-9{0%,67.17%{opacity:0} 67.2%,68.6367%{opacity:1} 68.6667%,100%{opacity:0}}
+  .lf-count-10{opacity:0;animation:lf-count-10 20s linear infinite}
+  @keyframes lf-count-10{0%,68.6367%{opacity:0} 68.6667%,70.1033%{opacity:1} 70.1333%,100%{opacity:0}}
+  .lf-count-11{opacity:0;animation:lf-count-11 20s linear infinite}
+  @keyframes lf-count-11{0%,70.1033%{opacity:0} 70.1333%,71.57%{opacity:1} 71.6%,100%{opacity:0}}
+  .lf-count-12{opacity:0;animation:lf-count-12 20s linear infinite}
+  @keyframes lf-count-12{0%,71.57%{opacity:0} 71.6%,73.0367%{opacity:1} 73.0667%,100%{opacity:0}}
+  .lf-count-13{opacity:0;animation:lf-count-13 20s linear infinite}
+  @keyframes lf-count-13{0%,73.0367%{opacity:0} 73.0667%,74.5033%{opacity:1} 74.5333%,100%{opacity:0}}
+  .lf-count-14{opacity:0;animation:lf-count-14 20s linear infinite}
+  @keyframes lf-count-14{0%,74.5033%{opacity:0} 74.5333%,75.97%{opacity:1} 76%,100%{opacity:0}}
+  .lf-count-15{opacity:0;animation:lf-count-15 20s linear infinite}
+  @keyframes lf-count-15{0%,75.97%{opacity:0} 76%,99.97%{opacity:1} 100%,100%{opacity:0}}
+  @keyframes scroll-contents{
+    0%{transform:translateY(0px)}
+    54%{transform:translateY(0px)}
+    55.4667%{transform:translateY(-24px)}
+    56.9333%{transform:translateY(-48px)}
+    58.4%{transform:translateY(-72px)}
+    59.8667%{transform:translateY(-96px)}
+    61.3333%{transform:translateY(-120px)}
+    62.8%{transform:translateY(-144px)}
+    64.2667%{transform:translateY(-168px)}
+    65.7333%{transform:translateY(-192px)}
+    67.2%{transform:translateY(-192px)}
+    68.6667%{transform:translateY(-192px)}
+    70.1333%{transform:translateY(-192px)}
+    71.6%{transform:translateY(-192px)}
+    73.0667%{transform:translateY(-192px)}
+    74.5333%{transform:translateY(-192px)}
+    76%{transform:translateY(-192px)}
+    100%{transform:translateY(-192px)}
+  }
+  .vt-paint-0{opacity:0;animation:vt-paint-0 20s linear infinite}
+  @keyframes vt-paint-0{0%,77.37%{opacity:0} 77.4%,99.95%{opacity:1} 99.98%,100%{opacity:0}}
+  .vt-paint-1{opacity:0;animation:vt-paint-1 20s linear infinite}
+  @keyframes vt-paint-1{0%,78.77%{opacity:0} 78.8%,99.95%{opacity:1} 99.98%,100%{opacity:0}}
+  .vt-paint-2{opacity:0;animation:vt-paint-2 20s linear infinite}
+  @keyframes vt-paint-2{0%,80.17%{opacity:0} 80.2%,99.95%{opacity:1} 99.98%,100%{opacity:0}}
+  .vt-paint-3{opacity:0;animation:vt-paint-3 20s linear infinite}
+  @keyframes vt-paint-3{0%,81.57%{opacity:0} 81.6%,99.95%{opacity:1} 99.98%,100%{opacity:0}}
+  .vt-paint-4{opacity:0;animation:vt-paint-4 20s linear infinite}
+  @keyframes vt-paint-4{0%,82.97%{opacity:0} 83%,99.95%{opacity:1} 99.98%,100%{opacity:0}}
+  @media(prefers-reduced-motion:reduce){
+    *{animation:none!important}
+    .caption,.look-highlight,.parse-highlight,.scan-section,.prior-text,.scroll-contents,.ghost-badge{opacity:0!important}
+    .terminal-stage,.state-fg-red,.state-wrap-off,.col-22,.lf-count-15,.vt-glyph{opacity:1!important}
+    .state-fg-default,.state-wrap-on{opacity:0!important}
+    .vt-caret{transform:translateX(484px)!important}
+  }
+  </style>
+  <g id="run-1" role="group" aria-label="TEXT: old frame">
+    <rect x="56" y="91" width="170" height="103" rx="3" fill="#458588" fill-opacity=".2" stroke="#458588" stroke-width="1.5"/>
+    <text x="70" y="128" class="card-label">TEXT</text>
+    <text x="70" y="163" class="card-body">old frame</text>
+    <rect x="58" y="93" width="166" height="99" rx="2" class="parse-highlight parse-0"/>
+    <rect x="57" y="92" width="168" height="101" rx="3" class="look-highlight look-0"/>
+  </g>
+  <g class="ghost-badge ghost-0">
+    <rect x="146" y="106" width="67" height="23" rx="2" fill="#282828" stroke="#bdae93" stroke-dasharray="4 3"/>
+    <text x="179.5" y="121.5" text-anchor="middle" font-size="11" font-weight="700" fill="#ebdbb2">GHOST</text>
+    <rect x="59" y="94" width="164" height="97" rx="2" stroke="#bdae93" stroke-width="1.6" stroke-dasharray="6 7" fill="none" opacity=".7"/>
+  </g>
+  <g id="run-2" role="group" aria-label="SGR: CSI 31 m">
+    <rect x="246" y="91" width="170" height="103" rx="3" fill="#d79921" fill-opacity=".2" stroke="#d79921" stroke-width="1.5"/>
+    <text x="260" y="128" class="card-label">SGR</text>
+    <text x="260" y="163" class="card-body">CSI 31 m</text>
+    <rect x="248" y="93" width="166" height="99" rx="2" class="parse-highlight parse-1"/>
+    <rect x="247" y="92" width="168" height="101" rx="3" class="look-highlight look-1"/>
+  </g>
+  <g id="run-3" role="group" aria-label="TEXT: old data">
+    <rect x="436" y="91" width="170" height="103" rx="3" fill="#458588" fill-opacity=".2" stroke="#458588" stroke-width="1.5"/>
+    <text x="450" y="128" class="card-label">TEXT</text>
+    <text x="450" y="163" class="card-body">old data</text>
+    <rect x="438" y="93" width="166" height="99" rx="2" class="parse-highlight parse-2"/>
+    <rect x="437" y="92" width="168" height="101" rx="3" class="look-highlight look-2"/>
+  </g>
+  <g class="ghost-badge ghost-2">
+    <rect x="526" y="106" width="67" height="23" rx="2" fill="#282828" stroke="#bdae93" stroke-dasharray="4 3"/>
+    <text x="559.5" y="121.5" text-anchor="middle" font-size="11" font-weight="700" fill="#ebdbb2">GHOST</text>
+    <rect x="439" y="94" width="164" height="97" rx="2" stroke="#bdae93" stroke-width="1.6" stroke-dasharray="6 7" fill="none" opacity=".7"/>
+  </g>
+  <g id="run-4" role="group" aria-label="C0 / LF: 15 x LF">
+    <rect x="626" y="91" width="170" height="103" rx="3" fill="#a89984" fill-opacity=".2" stroke="#a89984" stroke-width="1.5"/>
+    <text x="640" y="128" class="card-label">C0 / LF</text>
+    <text x="640" y="163" class="card-body">15 x LF</text>
+    <rect x="628" y="93" width="166" height="99" rx="2" class="parse-highlight parse-3"/>
+    <rect x="627" y="92" width="168" height="101" rx="3" class="look-highlight look-3"/>
+  </g>
+  <g id="run-5" role="group" aria-label="TEXT: READY">
+    <rect x="816" y="91" width="170" height="103" rx="3" fill="#458588" fill-opacity=".2" stroke="#458588" stroke-width="1.5"/>
+    <text x="830" y="128" class="card-label">TEXT</text>
+    <text x="830" y="163" class="card-body">READY</text>
+    <rect x="818" y="93" width="166" height="99" rx="2" class="parse-highlight parse-4"/>
+    <rect x="817" y="92" width="168" height="101" rx="3" class="look-highlight look-4"/>
+  </g>
+  <g id="run-6" role="group" aria-label="MODE: CSI ? 7 l">
+    <rect x="1006" y="91" width="170" height="103" rx="3" fill="#d79921" fill-opacity=".2" stroke="#d79921" stroke-width="1.5"/>
+    <text x="1020" y="128" class="card-label">MODE</text>
+    <text x="1020" y="163" class="card-body">CSI ? 7 l</text>
+    <rect x="1008" y="93" width="166" height="99" rx="2" class="parse-highlight parse-5"/>
+    <rect x="1007" y="92" width="168" height="101" rx="3" class="look-highlight look-5"/>
+  </g>
+  <g class="scan-section"><text x="56" y="229" class="section">REVERSE LOOKAHEAD</text><text x="765" y="229" class="section">2 x 8 - 1 = 15 qualifying LFs</text></g>
+  <g class="caption caption-0"><text x="56" y="307" class="caption-label" fill="#d79921">QUEUED</text><text x="232" y="307" class="caption-copy">15 individual LF runs are grouped into one block.</text></g>
+  <g class="caption caption-1"><text x="56" y="307" class="caption-label" fill="#458588">LOOKAHEAD</text><text x="232" y="307" class="caption-copy">Scan backward and count full-region line feeds.</text></g>
+  <g class="caption caption-2"><text x="56" y="307" class="caption-label" fill="#458588">GHOST RUNS</text><text x="232" y="307" class="caption-copy">15 LFs for 8 rows prove earlier painting obsolete.</text></g>
+  <g class="caption caption-3"><text x="56" y="307" class="caption-label" fill="#458588">TEXT</text><text x="232" y="307" class="caption-copy">old frame moves the cursor. No cells are written.</text></g>
+  <g class="caption caption-4"><text x="56" y="307" class="caption-label" fill="#d79921">SGR</text><text x="232" y="307" class="caption-copy">CSI 31 m changes the foreground to red.</text></g>
+  <g class="caption caption-5"><text x="56" y="307" class="caption-label" fill="#458588">TEXT</text><text x="232" y="307" class="caption-copy">old data advances the cursor. Still no cell writes.</text></g>
+  <g class="caption caption-6"><text x="56" y="307" class="caption-label" fill="#a89984">LINE FEEDS</text><text x="232" y="307" class="caption-copy">15 line feeds scroll the full region, row by row.</text></g>
+  <g class="caption caption-7"><text x="56" y="307" class="caption-label" fill="#458588">TEXT</text><text x="232" y="307" class="caption-copy">READY is painted in red at the current cursor.</text></g>
+  <g class="caption caption-8"><text x="56" y="307" class="caption-label" fill="#d79921">MODE</text><text x="232" y="307" class="caption-copy">CSI ? 7 l disables automatic wrapping.</text></g>
+  <g class="caption caption-9"><text x="56" y="307" class="caption-label" fill="#d79921">RESULT</text><text x="232" y="307" class="caption-copy">Visible history is gone. Terminal state is preserved.</text></g>
+  <path d="M56 330 H1176" stroke="#665c54" stroke-width="1.5"/>
+  <g class="terminal-stage">
+    <rect x="88" y="370" width="704" height="192" fill="#171717" stroke="#665c54" stroke-width="1"/>
+    <path class="vt-grid-line" d="M110 370 V562"/>
+    <path class="vt-grid-line" d="M132 370 V562"/>
+    <path class="vt-grid-line" d="M154 370 V562"/>
+    <path class="vt-grid-line" d="M176 370 V562"/>
+    <path class="vt-grid-line" d="M198 370 V562"/>
+    <path class="vt-grid-line" d="M220 370 V562"/>
+    <path class="vt-grid-line" d="M242 370 V562"/>
+    <path class="vt-grid-line" d="M264 370 V562"/>
+    <path class="vt-grid-line" d="M286 370 V562"/>
+    <path class="vt-grid-line" d="M308 370 V562"/>
+    <path class="vt-grid-line" d="M330 370 V562"/>
+    <path class="vt-grid-line" d="M352 370 V562"/>
+    <path class="vt-grid-line" d="M374 370 V562"/>
+    <path class="vt-grid-line" d="M396 370 V562"/>
+    <path class="vt-grid-line" d="M418 370 V562"/>
+    <path class="vt-grid-line" d="M440 370 V562"/>
+    <path class="vt-grid-line" d="M462 370 V562"/>
+    <path class="vt-grid-line" d="M484 370 V562"/>
+    <path class="vt-grid-line" d="M506 370 V562"/>
+    <path class="vt-grid-line" d="M528 370 V562"/>
+    <path class="vt-grid-line" d="M550 370 V562"/>
+    <path class="vt-grid-line" d="M572 370 V562"/>
+    <path class="vt-grid-line" d="M594 370 V562"/>
+    <path class="vt-grid-line" d="M616 370 V562"/>
+    <path class="vt-grid-line" d="M638 370 V562"/>
+    <path class="vt-grid-line" d="M660 370 V562"/>
+    <path class="vt-grid-line" d="M682 370 V562"/>
+    <path class="vt-grid-line" d="M704 370 V562"/>
+    <path class="vt-grid-line" d="M726 370 V562"/>
+    <path class="vt-grid-line" d="M748 370 V562"/>
+    <path class="vt-grid-line" d="M770 370 V562"/>
+    <path class="vt-grid-line" d="M88 394 H792"/>
+    <path class="vt-grid-line" d="M88 418 H792"/>
+    <path class="vt-grid-line" d="M88 442 H792"/>
+    <path class="vt-grid-line" d="M88 466 H792"/>
+    <path class="vt-grid-line" d="M88 490 H792"/>
+    <path class="vt-grid-line" d="M88 514 H792"/>
+    <path class="vt-grid-line" d="M88 538 H792"/>
+    <g clip-path="url(#grid-clip)"><g class="scroll-contents">
+      <text x="95" y="388" class="prior-text">$ build --watch</text>
+      <text x="95" y="412" class="prior-text">compiling src/...</text>
+      <text x="95" y="436" class="prior-text">linking binaries</text>
+      <text x="95" y="460" class="prior-text">running tests ...</text>
+      <text x="95" y="484" class="prior-text">done: 42 passed</text>
+      <text x="95" y="508" class="prior-text">previous output</text>
+      <text x="95" y="532" class="prior-text">frame 000113</text>
+      <text x="95" y="556" class="prior-text">frame 000114</text>
+    </g></g>
+    <text x="467" y="556" class="vt-glyph vt-paint-0" style="opacity:0;animation:vt-paint-0 20s linear infinite">R</text>
+    <text x="489" y="556" class="vt-glyph vt-paint-1" style="opacity:0;animation:vt-paint-1 20s linear infinite">E</text>
+    <text x="511" y="556" class="vt-glyph vt-paint-2" style="opacity:0;animation:vt-paint-2 20s linear infinite">A</text>
+    <text x="533" y="556" class="vt-glyph vt-paint-3" style="opacity:0;animation:vt-paint-3 20s linear infinite">D</text>
+    <text x="555" y="556" class="vt-glyph vt-paint-4" style="opacity:0;animation:vt-paint-4 20s linear infinite">Y</text>
+    <rect class="vt-caret" x="88.5" y="538.5" width="21" height="23" rx="1"/>
+    <rect x="860" y="370" width="316" height="192" rx="3" stroke="#665c54" stroke-width="1.5" fill="none"/>
+    <text x="882" y="400" class="section">VT PARSER STATE</text>
+    <path d="M878 413 H1158" stroke="#665c54" stroke-width="1"/>
+    <text x="882" y="443" class="muted" font-size="14">cursor</text>
+    <text x="1153" y="443" text-anchor="end" class="state-text col-0">row 8, col 1</text>
+    <text x="1153" y="443" text-anchor="end" class="state-text col-1">row 8, col 2</text>
+    <text x="1153" y="443" text-anchor="end" class="state-text col-2">row 8, col 3</text>
+    <text x="1153" y="443" text-anchor="end" class="state-text col-3">row 8, col 4</text>
+    <text x="1153" y="443" text-anchor="end" class="state-text col-4">row 8, col 5</text>
+    <text x="1153" y="443" text-anchor="end" class="state-text col-5">row 8, col 6</text>
+    <text x="1153" y="443" text-anchor="end" class="state-text col-6">row 8, col 7</text>
+    <text x="1153" y="443" text-anchor="end" class="state-text col-7">row 8, col 8</text>
+    <text x="1153" y="443" text-anchor="end" class="state-text col-8">row 8, col 9</text>
+    <text x="1153" y="443" text-anchor="end" class="state-text col-9">row 8, col 10</text>
+    <text x="1153" y="443" text-anchor="end" class="state-text col-10">row 8, col 11</text>
+    <text x="1153" y="443" text-anchor="end" class="state-text col-11">row 8, col 12</text>
+    <text x="1153" y="443" text-anchor="end" class="state-text col-12">row 8, col 13</text>
+    <text x="1153" y="443" text-anchor="end" class="state-text col-13">row 8, col 14</text>
+    <text x="1153" y="443" text-anchor="end" class="state-text col-14">row 8, col 15</text>
+    <text x="1153" y="443" text-anchor="end" class="state-text col-15">row 8, col 16</text>
+    <text x="1153" y="443" text-anchor="end" class="state-text col-16">row 8, col 17</text>
+    <text x="1153" y="443" text-anchor="end" class="state-text col-17">row 8, col 18</text>
+    <text x="1153" y="443" text-anchor="end" class="state-text col-18">row 8, col 19</text>
+    <text x="1153" y="443" text-anchor="end" class="state-text col-19">row 8, col 20</text>
+    <text x="1153" y="443" text-anchor="end" class="state-text col-20">row 8, col 21</text>
+    <text x="1153" y="443" text-anchor="end" class="state-text col-21">row 8, col 22</text>
+    <text x="1153" y="443" text-anchor="end" class="state-text col-22">row 8, col 23</text>
+    <text x="882" y="475" class="muted" font-size="14">foreground</text>
+    <text x="1153" y="475" text-anchor="end" class="state-text state-fg-default">default</text>
+    <text x="1153" y="475" text-anchor="end" class="state-red state-fg-red">red</text>
+    <text x="882" y="507" class="muted" font-size="14">autowrap</text>
+    <text x="1153" y="507" text-anchor="end" class="state-text state-wrap-on">on</text>
+    <text x="1153" y="507" text-anchor="end" class="state-green state-wrap-off">off</text>
+    <text x="882" y="539" class="muted" font-size="14">scrolling LFs</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text lf-count-0">00 / 15</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text lf-count-1">01 / 15</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text lf-count-2">02 / 15</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text lf-count-3">03 / 15</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text lf-count-4">04 / 15</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text lf-count-5">05 / 15</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text lf-count-6">06 / 15</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text lf-count-7">07 / 15</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text lf-count-8">08 / 15</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text lf-count-9">09 / 15</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text lf-count-10">10 / 15</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text lf-count-11">11 / 15</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text lf-count-12">12 / 15</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text lf-count-13">13 / 15</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text lf-count-14">14 / 15</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text lf-count-15">15 / 15</text>
+  </g>
+</svg>

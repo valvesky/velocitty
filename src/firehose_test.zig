@@ -994,6 +994,10 @@ test "XTRESTORE and leaving the alt screen restart the LF count" {
     try one("alt-restore", 8, 2, "A\n\x1b[?47h\x1b[?1049l\n\x1b[?47h\x1b[?1049l\n");
 }
 
+test "rectangle copies can preserve source text across scrolling" {
+    try one("rectangle-copy-source", 10, 2, "A\n\x1b[1;1;1;1;1;2;1;1$v\n\x1b[1;1;1;1;1;2;1;1$v\n");
+}
+
 test "a cleared named image can be placed again without retransmission" {
     try runCase("clear-then-place", 8, 3, &.{ "\x1b_Ga=T,f=32,s=1,v=1,i=5,c=1,r=1,C=1;" ++ red_px ++ "\x1b\\\x1b[2J", "\x1b_Ga=p,i=5,c=1,r=1,C=1;\x1b\\" });
 }
@@ -1002,7 +1006,7 @@ test "a chunked transfer places on the screen it completes on" {
     try one("chunk-screen", 8, 3, "\x1b_Ga=T,f=32,s=1,v=1,i=5,c=1,r=1,C=1,m=1;/wAA\x1b\\\x1b[?47h\x1b_Gm=0;/w==\x1b\\\x1b[?47l\x1b[2J");
 }
 
-test "a dead sixel replaces the image with its assigned id" {
+test "a dead sixel keeps named images distinct" {
     try one("sixel-id", 8, 3, "\x1b_Ga=T,f=32,s=1,v=1,i=1,c=1,r=1,C=1;" ++ red_px ++ "\x1b\\\x1b[?47h\x1bPq~\x1b\\\x1b[2J\x1b[?47l");
 }
 

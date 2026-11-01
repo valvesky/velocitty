@@ -21,6 +21,7 @@ const velocitty_font_free = FontSource.velocitty_font_free;
 
 const FontBlob = struct {
     bytes: []u8,
+    index: u32 = 0,
     style: @import("type.zig").Style = .{},
     deferred: bool = false,
     emoji_only: bool = false,
@@ -40,9 +41,9 @@ fn deferFont(io: std.Io, gpa: std.mem.Allocator, out: *std.ArrayList(FontBlob), 
 
 fn loadFonts(io: std.Io, gpa: std.mem.Allocator, out: *std.ArrayList(FontBlob), config: *const Scheme.Config) !void {
     const family = config.family() orelse "monospace";
-    const bytes = try FontSource.loadFamily(gpa, io, family, false, false, false);
-    out.append(gpa, .{ .bytes = bytes }) catch |err| {
-        gpa.free(bytes);
+    const loaded = try FontSource.loadFamily(gpa, io, family, false, false, false);
+    out.append(gpa, .{ .bytes = loaded.bytes, .index = loaded.index }) catch |err| {
+        gpa.free(loaded.bytes);
         return err;
     };
     try deferFont(io, gpa, out, family, .{ .bold = true }, false, false);
@@ -63,7 +64,7 @@ fn bindFonts(gpa: std.mem.Allocator, type_ctx: *TypeCtx, blobs: []const FontBlob
         if (blob.deferred) {
             try type_ctx.addLazyFont(blob.io.?, blob.bytes, .{ .style = blob.style, .emoji_only = blob.emoji_only }, blob.exact, FontSource.loadFamily);
         } else {
-            _ = try type_ctx.addFont(blob.bytes, .{ .style = blob.style });
+            _ = try type_ctx.addFont(blob.bytes, .{ .style = blob.style, .index = blob.index });
         }
     }
     if (type_ctx.primary == null) return error.InvalidFont;
@@ -1196,6 +1197,15 @@ test "fontconfig fallbacks require an installed family, not a substitute" {
     try std.testing.expect(fontMatchPath("", null) == null);
     try std.testing.expect(fontMatchPath("relative.ttf\nExample Sans\n", "Example Sans") == null);
     try std.testing.expect(fontMatchPath("/fonts/Example.ttf\n", "Example Sans") == null);
+}
+
+test "primary font binding preserves the selected collection member" {
+    var bytes = @import("type.zig").TrueType.testing.collection;
+    const blobs = [_]FontBlob{.{ .bytes = &bytes, .index = 1 }};
+    var ctx = try TypeCtx.init(std.testing.allocator, .{});
+    defer ctx.deinit();
+    try bindFonts(std.testing.allocator, &ctx, &blobs);
+    try std.testing.expectEqual(@as(u16, 2000), (try ctx.metrics(16)).units_per_em);
 }
 
 test "native fonts load real primary faces and reject unrelated substitutions" {

@@ -1283,15 +1283,6 @@ pub const VtState = struct {
                     break;
                 }
             }
-            if (start < dest) {
-                const id = self.penId();
-                const row = g.cellPtr(g.cursor.row, 0);
-                g.noteWrite(g.cursor.row, dest);
-                row[start] = .{ .codepoint = '\t', .style = id };
-                var x = start + 1;
-                while (x < dest) : (x += 1) row[x] = .{ .codepoint = ' ', .style = id };
-                self.markDirty(g.cursor.row);
-            }
             g.cursor.col = dest;
         }
     }
@@ -1562,7 +1553,7 @@ pub const VtState = struct {
         if (rest.len == 0) return 0;
         if (rest[0] == 5) {
             if (rest.len < 2) return rest.len;
-            const c = indexedColor(self.scheme, rest[1]);
+            const c = self.colorIndex(rest[1]);
             if (fg) {
                 self.grid().fg = c;
                 self.grid().attrs.fg_explicit = true;
@@ -1826,7 +1817,7 @@ pub const VtState = struct {
     }
 
     pub fn colorIndex(self: *const VtState, i: u32) Color {
-        return indexedColor(self.scheme, @intCast(@min(i, 255)));
+        return self.table[@min(i, 255)];
     }
 
     pub fn setUnderlineColor(self: *VtState, c: Color) void {
@@ -1919,7 +1910,9 @@ pub const VtState = struct {
             }
             if (c == ';' or c == 'q') {
                 if (nparam == 1) p2 = if (have) val else 0;
-                nparam += 1;
+                // Only the first three parameters have meaning. Keep the
+                // counter past them without wrapping back onto P2.
+                nparam +|= 1;
                 val = 0;
                 have = false;
                 i += 1;
@@ -2442,21 +2435,6 @@ fn clip(v: u16) u8 {
     return @truncate(@min(v, 255));
 }
 
-fn indexedColor(scheme: Scheme, i: u16) Color {
-    const n: u8 = clip(i);
-    if (n < 16) return scheme.palette[n];
-    if (n < 232) {
-        const x = n - 16;
-        const r6 = x / 36;
-        const g6 = (x % 36) / 6;
-        const b6 = x % 6;
-        const levels = [_]u8{ 0, 95, 135, 175, 215, 255 };
-        return .{ .r = levels[r6], .g = levels[g6], .b = levels[b6] };
-    }
-    const v: u8 = 8 + 10 * (n - 232);
-    return .{ .r = v, .g = v, .b = v };
-}
-
 fn cellIsBlank(scheme: Scheme, c: Cell, st: Style) bool {
     if (c.codepoint != ' ' and c.codepoint != 0) return false;
     if (st.fg.r != scheme.fg.r or st.fg.g != scheme.fg.g or st.fg.b != scheme.fg.b) return false;
@@ -2808,15 +2786,23 @@ test "ed 3 drops scrollback" {
     try std.testing.expectEqual(@as(u32, 0), vt.grid().scroll);
 }
 
-test "tab writes tab and spaces" {
+test "HT and CHT preserve cells and styles while moving to tab stops" {
     var dummy: [1]u8 = .{0};
-    var vt = try VtState.init(std.testing.allocator, 16, 1, 2, &dummy);
+    var vt = try VtState.init(std.testing.allocator, 24, 1, 2, &dummy);
     defer vt.deinit();
-    vt.printCodepoint('A');
+    applyCsi(&vt, "\x1b[41m");
+    vt.feedText("ABCDEFGHIJKLMNOPQRSTUVWX");
+    var before: [24]Cell = undefined;
+    @memcpy(&before, vt.rowCells(0));
+    vt.carriageReturn();
+    applyCsi(&vt, "\x1b[44m");
     C0.dispatch(&vt, 0x09);
-    try std.testing.expectEqual(@as(u21, '\t'), vt.grid().cellAt(0, 1).codepoint);
-    try std.testing.expectEqual(@as(u21, ' '), vt.grid().cellAt(0, 2).codepoint);
     try std.testing.expectEqual(@as(u16, 8), vt.grid().cursor.col);
+    applyCsi(&vt, "\x1b[2I");
+    try std.testing.expectEqual(@as(u16, 23), vt.grid().cursor.col);
+    for (before, vt.rowCells(0)) |expected, actual| try std.testing.expectEqual(expected, actual);
+    vt.printCodepoint('Z');
+    try std.testing.expectEqual(@as(u21, 'Z'), vt.grid().cellAt(0, 23).codepoint);
 }
 
 test "sgr underline color on cell" {
@@ -2966,6 +2952,28 @@ test "reflow retains trailing wide continuation" {
     try std.testing.expectEqual(@as(u21, 'X'), vt.grid().cellAt(0, 4).codepoint);
 }
 
+test "OSC palette updates and resets are used by every indexed SGR target" {
+    var vt = try VtState.init(std.testing.allocator, 8, 2, 2, &.{});
+    defer vt.deinit();
+    const original = vt.colorIndex(200);
+    const changed = Color{ .r = 0x12, .g = 0x34, .b = 0x56 };
+    @import("osc.zig").dispatch(&vt, "\x1b]4;200;#123456\x07");
+    applyCsi(&vt, "\x1b[38;5;200;48:5:200;58;5;200m");
+    vt.printCodepoint('X');
+    const st = vt.styleOf(vt.cell(0, 0));
+    try std.testing.expectEqual(changed, st.fg);
+    try std.testing.expectEqual(changed, st.bg);
+    try std.testing.expectEqual(changed.r, st.ul.r);
+    try std.testing.expectEqual(changed.g, st.ul.g);
+    try std.testing.expectEqual(changed.b, st.ul.b);
+    try std.testing.expectEqual(@as(usize, 2), vt.takeColor(&.{ 5, 200 }, true));
+    try std.testing.expectEqual(changed, vt.grid().fg);
+    @import("osc.zig").dispatch(&vt, "\x1b]104;200\x07");
+    applyCsi(&vt, "\x1b[38:5:200m");
+    vt.printCodepoint('Y');
+    try std.testing.expectEqual(original, vt.styleOf(vt.cell(0, 1)).fg);
+}
+
 test "osc default and palette resets preserve explicit colors" {
     var dummy: [1]u8 = .{0};
     var vt = try VtState.init(std.testing.allocator, 8, 2, 2, &dummy);
@@ -3058,6 +3066,26 @@ test "printPlain matches per-codepoint printing" {
             try std.testing.expectEqual(b.last_cp, a.last_cp);
         }
     }
+}
+
+test "sixel extra header parameters never wrap back onto P2" {
+    var vt = try VtState.init(std.testing.allocator, 8, 8, 8, &.{});
+    defer vt.deinit();
+    vt.flags.sixel_private_palette = false;
+    const prefix = "\x1bP0;1;";
+    var extra: [512]u8 = @splat(';');
+    for (0..256) |i| extra[i * 2] = '0';
+    const suffix = "q?\x1b\\";
+    var bytes: [prefix.len + extra.len + suffix.len]u8 = undefined;
+    @memcpy(bytes[0..prefix.len], prefix);
+    @memcpy(bytes[prefix.len..][0..extra.len], &extra);
+    @memcpy(bytes[prefix.len + extra.len ..], suffix);
+    vt.feedSixel(&bytes);
+    try std.testing.expectEqual(@as(usize, 1), vt.kitty.images.items.len);
+    const rgba = vt.kitty.images.items[0].rgba;
+    try std.testing.expect(rgba.len != 0);
+    var i: usize = 3;
+    while (i < rgba.len) : (i += 4) try std.testing.expectEqual(@as(u8, 0), rgba[i]);
 }
 
 test "sixel follows its scrollback line until history drops it" {

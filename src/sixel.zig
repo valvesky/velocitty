@@ -155,10 +155,7 @@ fn walk(comptime paint: bool, allocator: std.mem.Allocator, body: []const u8, pa
     const out_h = @max(1, @min(h, if (max_y == 0) h else max_y));
     if (!paint) return .{ .width = out_w, .height = out_h, .rgba = &.{} };
     params.palette.* = pal;
-    const rgba = allocator.alloc(u8, @as(usize, out_w) * out_h * 4) catch {
-        allocator.free(pix);
-        return error.InvalidSixel;
-    };
+    const rgba = allocator.alloc(u8, @as(usize, out_w) * out_h * 4) catch return error.InvalidSixel;
     var row: u32 = 0;
     while (row < out_h) : (row += 1) {
         var col: u32 = 0;
@@ -212,7 +209,7 @@ fn rgb100(r: u32, g: u32, b: u32) Color {
 }
 
 fn scale100(v: u32) u8 {
-    return @intCast(@min(255, v * 255 / 100));
+    return @intCast(@as(u32, @min(v, 100)) * 255 / 100);
 }
 
 fn hls(h: u32, l: u32, s: u32) Color {
@@ -322,4 +319,20 @@ test "measure matches decode size" {
         try std.testing.expectEqual(bmp.width, m.width);
         try std.testing.expectEqual(bmp.height, m.height);
     }
+}
+
+test "sixel final allocation failure releases the canvas once" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var pal = defaultPalette();
+    try std.testing.expectError(error.InvalidSixel, decode(failing.allocator(), "?", .{ .palette = &pal }));
+}
+
+test "sixel RGB percentages clamp before scaling" {
+    var pal = defaultPalette();
+    const bmp = try decode(std.testing.allocator, "#0;2;16843010;4294967295;100~", .{ .palette = &pal });
+    defer std.testing.allocator.free(bmp.rgba);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255, 255 }, bmp.rgba[0..4]);
+    try std.testing.expectEqual(@as(u8, 0), scale100(0));
+    try std.testing.expectEqual(@as(u8, 127), scale100(50));
+    try std.testing.expectEqual(@as(u8, 255), scale100(100));
 }

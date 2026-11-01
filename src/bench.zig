@@ -215,8 +215,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         ctx_store = try Type.Context.init(gpa, .{ .cache_capacity = cache_capacity });
         const ctx = &ctx_store.?;
         for (blobs.items) |b| {
-            _ = try ctx.addFont(b.bytes, .{});
-            try log.print("font primary {s} bytes={d}\n", .{ b.path, b.bytes.len });
+            _ = try ctx.addFont(b.bytes, .{ .index = b.index });
+            try log.print("font primary {s} bytes={d} index={d}\n", .{ b.path, b.bytes.len, b.index });
         }
         const family = config.family() orelse "monospace";
         if (opt.font == null) {
@@ -1690,15 +1690,18 @@ fn hashTerm(term: *const VtState) u64 {
     return h ^ (@as(u64, c.row) << 32) ^ c.col;
 }
 
-const Font = struct { path: []u8, bytes: []u8 };
+const Font = struct { path: []u8, bytes: []u8, index: u32 = 0 };
 
 fn loadFonts(io: std.Io, gpa: std.mem.Allocator, override: ?[]const u8, config: *const Scheme.Config, out: *std.ArrayList(Font)) !void {
     const name = override orelse config.family() orelse "monospace";
-    const bytes = if (override != null) try FontSource.loadFile(io, gpa, name) else try FontSource.loadFamily(gpa, io, name, false, false, false);
-    errdefer gpa.free(bytes);
+    const loaded: FontSource.Loaded = if (override != null)
+        .{ .bytes = try FontSource.loadFile(io, gpa, name) }
+    else
+        try FontSource.loadFamily(gpa, io, name, false, false, false);
+    errdefer gpa.free(loaded.bytes);
     const owned = try gpa.dupe(u8, name);
     errdefer gpa.free(owned);
-    try out.append(gpa, .{ .path = owned, .bytes = bytes });
+    try out.append(gpa, .{ .path = owned, .bytes = loaded.bytes, .index = loaded.index });
 }
 
 test "parser-only benchmark selections do not load fonts or atlases" {

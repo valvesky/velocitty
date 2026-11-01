@@ -837,10 +837,14 @@ pub const Store = struct {
     }
 
     fn takeId(self: *Store) u32 {
-        const id = self.next_id;
-        self.next_id +|= 1;
-        if (self.next_id == 0) self.next_id = 1;
-        return id;
+        // Named and anonymous images share the protocol's nonzero id space.
+        // At most max_images ids are occupied, so a free one is always nearby.
+        while (true) {
+            const id = self.next_id;
+            self.next_id +%= 1;
+            if (self.next_id == 0) self.next_id = 1;
+            if (id != 0 and self.find(id) == null) return id;
+        }
     }
 
     /// Store `img` (owned) under a fresh id and place it at `cursor`.
@@ -1728,4 +1732,36 @@ test "retransmitting an id drops the old placements" {
     _ = store.feed("\x1b_Ga=t,f=32,s=1,v=1,i=1,q=2;/wAA/w==\x1b\\", .{}, 8, 4, 0);
     try std.testing.expectEqual(@as(usize, 0), store.placements.items.len);
     try std.testing.expectEqual(@as(usize, 1), store.images.items.len);
+}
+
+test "anonymous graphics preserve named images and placements" {
+    const gpa = std.testing.allocator;
+    var store = Store.init(gpa);
+    defer store.deinit();
+    _ = store.feed("\x1b_Ga=T,f=32,s=1,v=1,i=1,C=1,q=2;/wAA/w==\x1b\\", .{}, 8, 4, 0);
+    store.placeBitmap(try gpa.dupe(u8, &.{ 0, 255, 0, 255 }), 1, 1, .{ .row = 1 }, 0, 1, 1);
+    _ = store.feed("\x1b_Ga=T,f=32,s=1,v=1,C=1,q=2;AAD//w==\x1b\\", .{ .row = 2 }, 8, 4, 0);
+    try std.testing.expectEqual(@as(usize, 3), store.images.items.len);
+    try std.testing.expectEqual(@as(usize, 3), store.placements.items.len);
+    try std.testing.expect(!store.find(1).?.assigned);
+    try std.testing.expect(store.find(2).?.assigned);
+    try std.testing.expect(store.find(3).?.assigned);
+    store.decodeVisible(0, 0, 4, 1);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, store.find(1).?.rgba);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255 }, store.find(2).?.rgba);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, store.find(3).?.rgba);
+}
+
+test "anonymous image ids wrap and skip occupied ids" {
+    const gpa = std.testing.allocator;
+    var store = Store.init(gpa);
+    defer store.deinit();
+    _ = store.feed("\x1b_Ga=t,f=32,s=1,v=1,i=4294967295,q=2;/wAA/w==\x1b\\", .{}, 8, 4, 0);
+    _ = store.feed("\x1b_Ga=t,f=32,s=1,v=1,i=1,q=2;/wAA/w==\x1b\\", .{}, 8, 4, 0);
+    store.next_id = std.math.maxInt(u32);
+    store.placeBitmap(try gpa.dupe(u8, &.{ 0, 255, 0, 255 }), 1, 1, .{}, 0, 1, 1);
+    try std.testing.expectEqual(@as(usize, 3), store.images.items.len);
+    try std.testing.expect(store.find(2).?.assigned);
+    try std.testing.expect(!store.find(std.math.maxInt(u32)).?.assigned);
+    try std.testing.expect(!store.find(1).?.assigned);
 }

@@ -513,7 +513,10 @@ const Scan = struct {
             },
             '$' => ev.role = switch (q.final) {
                 'p' => .query,
-                'x', 'z', 'r', 't', 'v', '{' => .content,
+                // DECCRA can copy old cells below the scrolling frontier.
+                // Restart the LF proof just as for vertical cursor motion.
+                'v' => .motion,
+                'x', 'z', 'r', 't', '{' => .content,
                 else => .ordered,
             },
             '!' => {
@@ -807,6 +810,17 @@ test "size and SGR pressure never prove visible text obsolete" {
     defer parser.deinit();
     _ = parser.prepare("A\x1b[31mB\x1b[32mC", 0, .{ .rows = 4, .alt = false }, false, null);
     for (parser.runs.items, 0..) |_, i| try std.testing.expect(!parser.isSpanObsolete(i));
+}
+
+test "rectangle copies restart the scrolling visibility proof" {
+    var parser = try Preparser.init(std.testing.allocator);
+    defer parser.deinit();
+    const bytes = "A\n\x1b[1;1;1;1;1;2;1;1$v\n\x1b[1;1;1;1;1;2;1;1$v\n";
+    _ = parser.prepare(bytes, 0, .{ .rows = 2, .alt = false }, false, null);
+    for (parser.runs.items, 0..) |_, i| try std.testing.expect(!parser.isSpanObsolete(i));
+    // A later complete clear still proves all earlier cells dead.
+    _ = parser.prepare(bytes ++ "\x1b[2J", 0, .{ .rows = 2, .alt = false }, false, null);
+    try std.testing.expect(parser.isSpanObsolete(0));
 }
 
 test "obsolete spans distinguish screens and keep XTRESTORE conservative" {
