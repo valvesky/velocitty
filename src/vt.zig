@@ -3198,10 +3198,7 @@ test "large kitty images arrive through the ring, chunked or as one string" {
         while (off < stream.items.len) {
             const free: usize = @intCast(ring.capacity - (ring.head - ring.tail));
             const n = @min(free, stream.items.len - off);
-            const at: usize = @intCast(ring.head & (ring.capacity - 1));
-            @memcpy(ring.storage[at..][0..n], stream.items[off..][0..n]);
-            if (!ring.mapped) @memcpy(ring.storage[at + ring.capacity ..][0..n], ring.storage[at..][0..n]);
-            ring.head += n;
+            Ring.append(&ring, stream.items[off..][0..n]);
             off += n;
             if (ring.capacity - (ring.head - ring.tail) < ring.capacity / 4) ring.drain(vt.sink(), true);
         }
@@ -3407,10 +3404,7 @@ test "a tiny style table compacts often and every cell keeps its style" {
                 pieces[rand.uintLessThan(usize, pieces.len)];
             const gen = a.styles.gen;
             for ([_]*Ring.CircBuffer{ &ring_a, &ring_b }, [_]*VtState{ &a, &b }) |ring, vt| {
-                const at: usize = @intCast(ring.head & (ring.capacity - 1));
-                @memcpy(ring.storage[at..][0..piece.len], piece);
-                if (!ring.mapped) @memcpy(ring.storage[at + ring.capacity ..][0..piece.len], piece);
-                ring.head += piece.len;
+                Ring.append(ring, piece);
                 ring.drain(vt.sink(), true);
             }
             if (a.styles.gen != gen) gens += 1;
@@ -3459,10 +3453,7 @@ test "row extents never change what the grid holds" {
         for (0..400) |step| {
             const piece = pieces[rand.uintLessThan(usize, pieces.len)];
             for ([_]*Ring.CircBuffer{ &ring_a, &ring_b }, [_]*VtState{ &a, &b }) |ring, vt| {
-                const at: usize = @intCast(ring.head & (ring.capacity - 1));
-                @memcpy(ring.storage[at..][0..piece.len], piece);
-                if (!ring.mapped) @memcpy(ring.storage[at + ring.capacity ..][0..piece.len], piece);
-                ring.head += piece.len;
+                Ring.append(ring, piece);
                 ring.drain(vt.sink(), true);
             }
             if (step % 97 == 96) {
@@ -3504,10 +3495,7 @@ test "pressure text pruning preserves the pen and screen of an exact parse" {
                 const lr = local.random();
                 for (0..30) |_| {
                     const piece = pieces[lr.uintLessThan(usize, pieces.len)];
-                    const at: usize = @intCast(ring.head & (ring.capacity - 1));
-                    @memcpy(ring.storage[at..][0..piece.len], piece);
-                    if (!ring.mapped) @memcpy(ring.storage[at + ring.capacity ..][0..piece.len], piece);
-                    ring.head += piece.len;
+                    Ring.append(ring, piece);
                 }
                 ring.drain(vt.sink(), true);
             }
@@ -3585,10 +3573,7 @@ const TestTerm = struct {
         var rest = bytes;
         while (rest.len != 0) {
             const n = @min(rest.len, 1024);
-            const at: usize = @intCast(t.ring.head & (t.ring.capacity - 1));
-            @memcpy(t.ring.storage[at..][0..n], rest[0..n]);
-            if (!t.ring.mapped) @memcpy(t.ring.storage[at + t.ring.capacity ..][0..n], rest[0..n]);
-            t.ring.head += n;
+            Ring.append(&t.ring, rest[0..n]);
             t.ring.drain(t.vt.sink(), true);
             rest = rest[n..];
         }

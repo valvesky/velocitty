@@ -555,13 +555,43 @@ const TestSink = struct {
     }
 };
 
-fn append(buf: *CircBuffer, src: []const u8) void {
+/// Test input helper: use the same mirror synchronization as PTY reads.
+pub fn append(buf: *CircBuffer, src: []const u8) void {
     const cap = buf.capacity;
     const off: usize = @intCast(buf.head & (cap - 1));
     assert(src.len <= cap - (buf.head - buf.tail));
     @memcpy(buf.storage[off..][0..src.len], src);
     buf.syncMirror(off, src.len);
     buf.head += src.len;
+}
+
+test "test input wraps in an allocator-backed ring" {
+    const gpa = std.testing.allocator;
+    const cap = 16;
+    var buf: CircBuffer = .{
+        .allocator = gpa,
+        .storage = try gpa.alloc(u8, cap * 2),
+        .capacity = cap,
+        .mapped = false,
+        .preparser = try Preparse.Preparser.init(gpa),
+    };
+    defer buf.destroy();
+    const bytes = "0123456789abcdef";
+    for (0..cap) |off| {
+        for (1..cap + 1) |len| {
+            @memset(buf.storage, 0);
+            buf.head = off;
+            buf.tail = off;
+            append(&buf, bytes[0..len]);
+            try std.testing.expectEqual(off + len, buf.head);
+            try std.testing.expectEqualStrings(bytes[0..len], buf.storage[off..][0..len]);
+            for (bytes[0..len], 0..) |byte, i| {
+                const at = (off + i) & (cap - 1);
+                try std.testing.expectEqual(byte, buf.storage[at]);
+                try std.testing.expectEqual(byte, buf.storage[at + cap]);
+            }
+        }
+    }
 }
 
 test "framing defers obsolescence to span consumption" {
