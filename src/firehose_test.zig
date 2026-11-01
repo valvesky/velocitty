@@ -994,7 +994,7 @@ test "XTRESTORE and leaving the alt screen restart the LF count" {
     try one("alt-restore", 8, 2, "A\n\x1b[?47h\x1b[?1049l\n\x1b[?47h\x1b[?1049l\n");
 }
 
-test "a cleared image is gone for a later a=p" {
+test "a cleared named image can be placed again without retransmission" {
     try runCase("clear-then-place", 8, 3, &.{ "\x1b_Ga=T,f=32,s=1,v=1,i=5,c=1,r=1,C=1;" ++ red_px ++ "\x1b\\\x1b[2J", "\x1b_Ga=p,i=5,c=1,r=1,C=1;\x1b\\" });
 }
 

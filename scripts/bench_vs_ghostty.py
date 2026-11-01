@@ -19,7 +19,6 @@ import argparse
 import base64
 import datetime
 import json
-import math
 import os
 import platform
 import re
@@ -188,65 +187,45 @@ def marker(key, cx, cy, size, role):
 
 
 def chart(res):
-    """Three-icon throughput chart; older exact-only results remain readable."""
+    """Grouped bars with independent linear scales; supports exact-only results."""
     metric = res["metric"]
     rows = res["rows"]
     series = [k for k in SERIES if any(k in r for r in rows)]
     if any(k not in r for k in series for r in rows):
         raise ValueError("every workload must contain the same benchmark modes")
-    vals = [r[k][f"{metric}_mbps"] for r in rows for k in series]
-    ticks = [(10.0 ** e, f"{10 ** e} MB/s") for e in range(0, 3)] + [(1024.0 * 10 ** e, f"{10 ** e} GB/s") for e in range(0, 4)]
-    lo = max(t for t, _ in ticks if t <= min(vals))
-    hi = min(t for t, _ in ticks if t >= max(vals))
-    if lo == hi:
-        lo = next((t for t, _ in reversed(ticks) if t < lo), lo / 10)
-        hi = next((t for t, _ in ticks if t > hi), hi * 10)
-    ticks = [t for t in ticks if lo <= t[0] <= hi]
-    pitch = 150
+    pitch = 240 if "velocitty_skip" in series else 190
     W, H = 2000, 300 + pitch * len(rows) + 250
-    x0, x1 = 500, 1570
+    x0, x1 = 600, 1320
     top = 300
     skipping = "velocitty_skip" in series
-
-    def x(v):
-        return x0 + (math.log10(v) - math.log10(lo)) / (math.log10(hi) - math.log10(lo)) * (x1 - x0)
-
     font = 'font-family="system-ui, -apple-system, Segoe UI, sans-serif"'
-    subtitle = "Headless processing: exact and pressure-triggered obsolete-span skipping" if skipping else "Headless processing across six kitten benchmarks"
     out = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" {font}>',
         marker_definitions(),
         f'<rect width="{W}" height="{H}" fill="{SURFACE}"/>',
         f'<text x="90" y="125" font-size="64" font-weight="500" fill="{INK}">VT processing throughput</text>',
-        f'<text x="90" y="172" font-size="30" fill="{INK_2}">{subtitle}</text>',
-        f'<text x="1910" y="235" font-size="24" fill="{INK_2}" text-anchor="end">Higher is better</text>',
+        f'<text x="90" y="180" font-size="28" fill="{INK_2}">Higher is better · independent scale per workload · compare bar lengths within each workload only</text>',
+        f'<text x="{x0}" y="260" font-size="22" fill="{MUTED}">Throughput · linear scale from zero</text>',
+        f'<text x="1540" y="260" font-size="22" fill="{MUTED}" text-anchor="end">Throughput</text>',
+        f'<text x="1910" y="260" font-size="22" fill="{MUTED}" text-anchor="end">vs Ghostty exact</text>',
     ]
     labels = {"velocitty": "Velocitty exact", "velocitty_skip": "Velocitty text skipping", "ghostty": "Ghostty exact"}
-    positions = [350, 850, 1400] if skipping else [540, 1000]
-    for k, lx in zip(series, positions):
-        out.append(marker(k, lx, 226, 34, "legend"))
-        out.append(f'<text x="{lx + 26}" y="236" font-size="30" fill="{INK}">{labels[k]}</text>')
-    out.append(f'<text x="1910" y="285" font-size="24" fill="{INK_2}" text-anchor="end">Velocitty vs Ghostty exact</text>')
     bottom = top + pitch * len(rows)
-    for t, label in ticks:
-        gx = x(t)
-        out.append(f'<line x1="{gx:.1f}" y1="{top}" x2="{gx:.1f}" y2="{bottom}" stroke="{GRID}" stroke-width="2"/>')
-        out.append(f'<text x="{gx:.1f}" y="{bottom + 45}" font-size="26" fill="{INK_2}" text-anchor="middle">{label}</text>')
-    out.append(f'<text x="{(x0 + x1) / 2:.0f}" y="{bottom + 80}" font-size="22" fill="{MUTED}" text-anchor="middle">Throughput · log scale</text>')
-    label_offsets = {"ghostty": -39, "velocitty": 40, "velocitty_skip": 75}
     for i, row in enumerate(rows):
-        cy = top + pitch // 2 + pitch * i
+        row_top = top + pitch * i
         rates = {k: row[k][f"{metric}_mbps"] for k in series}
-        out.append(f'<text x="475" y="{cy + 10}" font-size="30" fill="{INK}" text-anchor="end">{esc(row["label"])}</text>')
-        out.append(f'<line x1="{x(min(rates.values())):.1f}" y1="{cy}" x2="{x(max(rates.values())):.1f}" y2="{cy}" stroke="{BASELINE}" stroke-width="4" stroke-linecap="round"/>')
-        for k, val in rates.items():
-            # All icon centers share a baseline; close measurements may overlap.
-            out.append(marker(k, x(val), cy, 32, "point"))
-            out.append(f'<text x="{x(val):.1f}" y="{cy + label_offsets[k]}" font-size="24" fill="{LABEL_COLORS[k]}" text-anchor="middle">{fmt_rate(val)}</text>')
-        ghostty = rates["ghostty"]
-        out.append(f'<text x="1910" y="{cy - 6}" font-size="25" fill="{LABEL_COLORS["velocitty"]}" text-anchor="end">Exact: {ratio_text(rates["velocitty"], ghostty)}</text>')
-        if skipping:
-            out.append(f'<text x="1910" y="{cy + 29}" font-size="25" fill="{LABEL_COLORS["velocitty_skip"]}" text-anchor="end">Skip text: {ratio_text(rates["velocitty_skip"], ghostty)}</text>')
+        hi = max(rates.values())
+        out.append(f'<line x1="90" y1="{row_top}" x2="1910" y2="{row_top}" stroke="{GRID}"/>')
+        out.append(f'<text x="90" y="{row_top + 35}" font-size="30" font-weight="600" fill="{INK}">{esc(row["label"])}</text>')
+        for j, k in enumerate(series):
+            cy = row_top + 75 + 50 * j
+            width = rates[k] / hi * (x1 - x0)
+            out.append(marker(k, 300, cy, 28, "series"))
+            out.append(f'<text x="326" y="{cy + 8}" font-size="23" fill="{INK_2}">{labels[k]}</text>')
+            out.append(f'<rect data-role="bar" data-row="{i}" data-series="{k}" x="{x0}" y="{cy - 12}" width="{width:.1f}" height="24" rx="4" fill="{SERIES[k]}"/>')
+            out.append(f'<text x="1540" y="{cy + 8}" font-size="25" font-weight="500" fill="{INK}" text-anchor="end">{fmt_rate(rates[k])}</text>')
+            comparison = "reference" if k == "ghostty" else ratio_text(rates[k], rates["ghostty"])
+            out.append(f'<text x="1910" y="{cy + 8}" font-size="24" fill="{INK_2}" text-anchor="end">{comparison}</text>')
     fy = bottom + 125
     metric_txt = "CPU time (user + sys)" if metric == "cpu" else "wall time"
     load = f" · load avg {res['load_avg_1m']:.1f}" if res.get("load_avg_1m") is not None else ""

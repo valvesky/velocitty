@@ -12,7 +12,7 @@ const c = struct {
 const max_dim: u32 = 10000;
 const max_bytes: usize = 320 * 1024 * 1024;
 const max_images: usize = 64;
-const max_placements: usize = 64;
+pub const max_placements: usize = 64;
 const max_header: usize = 256;
 
 /// A buffer holding the APC string being fed that the owner can give away
@@ -62,12 +62,15 @@ pub const Image = struct {
     /// The payload as transmitted, freed once decoded. Images that are
     /// deleted or scroll away before a frame shows them are never decoded.
     pending: ?Pending = null,
-    /// Has been placed at least once: freed as soon as no placement is left
-    /// (scrolled off, cleared, deleted). Transmitted-only images wait for
-    /// their a=p (bounded by `max_images`).
+    /// Has been placed. Anonymous images expire with their last placement;
+    /// named Kitty images stay cached for a=p until data deletion or quota
+    /// pressure (bounded by both image count and cache bytes).
     placed: bool = false,
     /// The id was assigned here (sixel, or a transfer without `i=`).
     assigned: bool = false,
+    /// Stable quota charge: max(encoded payload, decoded RGBA), unchanged by
+    /// lazy decode so parse/paint scheduling cannot change cache eviction.
+    cache_cost: usize = 0,
 };
 
 pub const Pending = struct {
@@ -106,10 +109,28 @@ pub const Placement = struct {
     src_w: u32 = 0,
     src_h: u32 = 0,
     screen: u1,
+    /// Actual cell coverage, including natural-size/aspect-scaled images.
+    span_rows: u32 = 1,
+    span_cols: u32 = 1,
+
+    pub fn pixelSize(self: Placement, img: Image, cell_w: u32, cell_h: u32) struct { width: u64, height: u64 } {
+        const x = @min(self.src_x, img.width);
+        const y = @min(self.src_y, img.height);
+        const w = if (self.src_w == 0) img.width - x else @min(self.src_w, img.width - x);
+        const h = if (self.src_h == 0) img.height - y else @min(self.src_h, img.height - y);
+        if (w == 0 or h == 0) return .{ .width = 0, .height = 0 };
+        var width: u64 = if (self.columns != 0) @as(u64, self.columns) * cell_w else w;
+        var height: u64 = if (self.rows != 0) @as(u64, self.rows) * cell_h else h;
+        if (self.columns != 0 and self.rows == 0 and w != 0)
+            height = @intCast(@max(1, @min(std.math.maxInt(u64), @as(u128, width) * h / w)));
+        if (self.rows != 0 and self.columns == 0 and h != 0)
+            width = @intCast(@max(1, @min(std.math.maxInt(u64), @as(u128, height) * w / h)));
+        return .{ .width = width, .height = height };
+    }
 
     /// One past the last absolute line the placement covers.
     fn end(self: Placement) i64 {
-        return self.row + @max(self.rows, 1);
+        return self.row + @max(self.rows, self.span_rows);
     }
 };
 
@@ -118,6 +139,8 @@ pub const Cursor = struct {
     col: u16 = 0,
     /// Absolute line of screen row 0 (`Grid.base`).
     base: i64 = 0,
+    cell_w: u16 = 1,
+    cell_h: u16 = 1,
 };
 
 pub fn isPrefix(s: []const u8) bool {
@@ -188,12 +211,17 @@ pub const Store = struct {
     stream: Stream = .idle,
     /// Largest transfer (base64 or path) accepted.
     max_transfer: usize = max_bytes,
+    /// Logical image-cache budget, excluding decode scratch/allocation slack.
+    /// Each image reserves its larger encoded or decoded representation.
+    max_cache_bytes: usize = max_bytes,
     reply: [128]u8 = undefined,
     reply_len: usize = 0,
     dirty: bool = false,
     /// Lower bound of `Placement.end()` per screen: history scrolls only
     /// scan placements once the oldest kept line reaches it.
     min_end: [2]i64 = @splat(std.math.maxInt(i64)),
+    cell_w: u32 = 1,
+    cell_h: u32 = 1,
 
     pub fn init(allocator: std.mem.Allocator) Store {
         return .{ .allocator = allocator };
@@ -237,22 +265,22 @@ pub const Store = struct {
         self.gcUnplaced();
     }
 
-    /// Free placed images that no placement shows any more.
+    /// Anonymous images have no reusable client id; free their orphan data.
     fn gcUnplaced(self: *Store) void {
         var i: usize = self.images.items.len;
         while (i > 0) {
             i -= 1;
             const img = self.images.items[i];
-            if (!img.placed or self.hasPlacement(img.id)) continue;
+            if (!img.assigned or !img.placed or self.hasPlacement(img.id)) continue;
             self.release(img);
             _ = self.images.orderedRemove(i);
         }
     }
 
-    /// Free image `id` if it was placed and its last placement is gone.
+    /// Free anonymous image data when its last placement expires.
     fn freeIfOrphan(self: *Store, id: u32) void {
         const img = self.find(id) orelse return;
-        if (img.placed and !self.hasPlacement(id)) self.removeImage(id);
+        if (img.assigned and img.placed and !self.hasPlacement(id)) self.removeImage(id);
     }
 
     fn hasPlacement(self: *const Store, id: u32) bool {
@@ -305,6 +333,27 @@ pub const Store = struct {
         }
     }
 
+    /// Reflow changes anchor line numbers; font/DPI changes can change the
+    /// cell coverage of natural-size placements. Neither discards pixels.
+    pub fn placementsChanged(self: *Store, cell_w: u32, cell_h: u32) void {
+        self.cell_w = @max(cell_w, 1);
+        self.cell_h = @max(cell_h, 1);
+        self.min_end = @splat(std.math.maxInt(i64));
+        for (self.placements.items) |*p| {
+            const img = self.find(p.image_id) orelse continue;
+            const size = p.pixelSize(img.*, self.cell_w, self.cell_h);
+            p.span_rows = @intCast(@min(std.math.maxInt(u32), @max(1, (size.height -| 1) / self.cell_h + 1)));
+            p.span_cols = @intCast(@min(std.math.maxInt(u32), @max(1, (size.width -| 1) / self.cell_w + 1)));
+            self.min_end[p.screen] = @min(self.min_end[p.screen], p.end());
+        }
+        self.dirty = true;
+    }
+
+    pub fn setCellSize(self: *Store, cell_w: u32, cell_h: u32) void {
+        if (self.cell_w == @max(cell_w, 1) and self.cell_h == @max(cell_h, 1)) return;
+        self.placementsChanged(cell_w, cell_h);
+    }
+
     pub fn find(self: *const Store, id: u32) ?*const Image {
         for (self.images.items) |*img| {
             if (img.id == id) return img;
@@ -337,12 +386,17 @@ pub const Store = struct {
             return null;
         }
         if (cmd.action == 'd') {
-            self.delete(cmd, cursor, which);
+            self.delete(cmd, cursor, which, cols, rows);
             self.dirty = true;
             return null;
         }
         if (cmd.action == 'p') {
+            if (self.find(cmd.id) == null) {
+                self.fail(cmd, "ENOENT:image not found");
+                return null;
+            }
             self.place(cmd, cursor, which);
+            self.ok(cmd);
             self.dirty = true;
             return self.movedCursor(cmd, cursor, cols, rows);
         }
@@ -499,13 +553,14 @@ pub const Store = struct {
     /// Decode the images of placements visible on `which`'s view: rows
     /// `0..rows` counted from absolute line `base`.
     pub fn decodeVisible(self: *Store, which: u1, base: i64, rows: u16, cell_h: u32) void {
+        self.setCellSize(self.cell_w, cell_h);
         var ids: [max_placements]u32 = undefined;
         var n: usize = 0;
         for (self.placements.items) |p| {
             if (p.screen != which) continue;
             const img = self.find(p.image_id) orelse continue;
             if (img.pending == null) continue;
-            const span: i64 = if (p.rows != 0) p.rows else (img.height + @max(cell_h, 1) - 1) / @max(cell_h, 1);
+            const span: i64 = @max(p.rows, p.span_rows);
             const row = p.row - base;
             if (row >= rows or row + @max(span, 1) <= 0) continue;
             if (std.mem.indexOfScalar(u32, ids[0..n], p.image_id) != null) continue;
@@ -543,15 +598,23 @@ pub const Store = struct {
                     continue;
                 };
             };
+            const cost = @max(img.cache_cost, bmp.rgba.len);
+            if (!self.makeRoom(cost, id, false)) {
+                self.allocator.free(bmp.rgba);
+                self.removeImage(id);
+                continue;
+            }
             const now = self.findMut(id) orelse {
                 self.allocator.free(bmp.rgba);
                 continue;
             };
             now.rgba = bmp.rgba;
+            now.cache_cost = cost;
             now.width = bmp.width;
             now.height = bmp.height;
             self.dirty = true;
         }
+        if (n != 0) self.placementsChanged(self.cell_w, cell_h);
     }
 
     fn findMut(self: *Store, id: u32) ?*Image {
@@ -561,28 +624,61 @@ pub const Store = struct {
         return null;
     }
 
+    fn imageBytes(img: Image) usize {
+        const rgba: usize = @intCast(@min(std.math.maxInt(usize), @as(u128, img.width) * img.height * 4));
+        const encoded = if (img.pending) |p| p.data.len else img.rgba.len;
+        return @max(img.cache_cost, @max(rgba, encoded));
+    }
+
+    pub fn cacheBytes(self: *const Store) usize {
+        var total: usize = 0;
+        for (self.images.items) |img| total +|= imageBytes(img);
+        return total;
+    }
+
+    /// Prefer cached/unplaced images over anything still referenced by a
+    /// visible or history placement. The protected id is being replaced.
+    fn makeRoom(self: *Store, bytes: usize, protected: u32, inserting: bool) bool {
+        if (bytes > self.max_cache_bytes) return false;
+        while (true) {
+            const old = if (self.find(protected)) |img| imageBytes(img.*) else 0;
+            if (self.cacheBytes() - old <= self.max_cache_bytes - bytes and
+                (!inserting or self.images.items.len < max_images)) return true;
+            var victim: ?u32 = null;
+            for (self.images.items) |img| {
+                if (img.id == protected) continue;
+                if (victim == null) victim = img.id;
+                if (!self.hasPlacement(img.id)) {
+                    victim = img.id;
+                    break;
+                }
+            }
+            self.removeImage(victim orelse return false);
+        }
+    }
+
     fn upsertImage(self: *Store, img: Image) std.mem.Allocator.Error!void {
+        var cached = img;
+        cached.cache_cost = imageBytes(img);
+        const inserting = self.find(img.id) == null;
+        if (inserting and self.images.items.len < max_images) try self.images.ensureUnusedCapacity(self.allocator, 1);
+        if (!self.makeRoom(imageBytes(img), img.id, inserting)) return error.OutOfMemory;
         for (self.images.items) |*old| {
             if (old.id == img.id) {
                 const id = old.id;
                 self.release(old.*);
-                old.* = img;
+                old.* = cached;
                 self.dropImagePlacements(id);
                 return;
             }
         }
-        if (self.images.items.len >= max_images) {
-            const old = self.images.orderedRemove(0);
-            self.release(old);
-            self.dropImagePlacements(old.id);
-        }
-        try self.images.append(self.allocator, img);
+        self.images.appendAssumeCapacity(cached);
     }
 
     fn place(self: *Store, cmd: Command, cursor: Cursor, which: u1) void {
         const img = self.findMut(cmd.id) orelse return;
-        img.placed = true;
-        const p = Placement{
+        self.setCellSize(cursor.cell_w, cursor.cell_h);
+        var p = Placement{
             .image_id = cmd.id,
             .place_id = cmd.place_id,
             .col = cursor.col,
@@ -595,10 +691,14 @@ pub const Store = struct {
             .src_h = cmd.src_h,
             .screen = which,
         };
+        const size = p.pixelSize(img.*, @max(cursor.cell_w, 1), @max(cursor.cell_h, 1));
+        p.span_rows = @intCast(@min(std.math.maxInt(u32), @max(1, (size.height -| 1) / @max(cursor.cell_h, 1) + 1)));
+        p.span_cols = @intCast(@min(std.math.maxInt(u32), @max(1, (size.width -| 1) / @max(cursor.cell_w, 1) + 1)));
         if (cmd.place_id != 0) {
             for (self.placements.items) |*old| {
                 if (old.image_id == cmd.id and old.place_id == cmd.place_id) {
                     old.* = p;
+                    img.placed = true;
                     self.min_end[which] = @min(self.min_end[which], p.end());
                     return;
                 }
@@ -609,36 +709,63 @@ pub const Store = struct {
             self.gcUnplaced();
         }
         self.placements.append(self.allocator, p) catch return;
+        // Eviction can compact the image array, so reacquire instead of
+        // retaining img across gcUnplaced. New anonymous data is protected
+        // as never-placed until its first placement actually exists.
+        if (self.findMut(cmd.id)) |placed| placed.placed = true;
         self.min_end[which] = @min(self.min_end[which], p.end());
     }
 
-    fn delete(self: *Store, cmd: Command, cursor: Cursor, which: u1) void {
+    fn delete(self: *Store, cmd: Command, cursor: Cursor, which: u1, cols: u16, rows: u16) void {
+        self.setCellSize(cursor.cell_w, cursor.cell_h);
+        // Any graphics deletion cancels a pending multipart upload.
+        self.assembling = false;
+        self.discarding = false;
+        self.pending = .{};
+        self.stream = .idle;
+        self.chunks.clearAndFree(self.allocator);
+        self.header.clearRetainingCapacity();
+        var affected: [max_placements]u32 = undefined;
+        var n: usize = 0;
+        for (self.placements.items) |p| {
+            if (std.mem.indexOfScalar(u32, affected[0..n], p.image_id) != null) continue;
+            affected[n] = p.image_id;
+            n += 1;
+        }
         const free_data = cmd.delete >= 'A' and cmd.delete <= 'Z';
         const kind: u8 = if (free_data) cmd.delete + ('a' - 'A') else cmd.delete;
         switch (kind) {
-            'a' => if (free_data) self.clear() else self.placements.clearRetainingCapacity(),
-            'i' => if (free_data) self.removeImage(cmd.id) else self.dropImagePlacements(cmd.id),
+            'a' => self.dropVisible(which, cursor.base, rows, cursor.cell_h),
+            'i' => self.removePlacement(cmd.id, cmd.place_id),
             'p' => {
-                self.removePlacement(cmd.id, cmd.place_id);
-                if (free_data) self.removeImage(cmd.id);
+                if (cmd.src_x == 0 or cmd.src_y == 0 or cmd.src_x > cols or cmd.src_y > rows) return;
+                var point = cursor;
+                point.col = @intCast(cmd.src_x - 1);
+                point.row = @intCast(cmd.src_y - 1);
+                self.removeAtCursor(point, which);
             },
             'c' => self.removeAtCursor(cursor, which),
-            else => if (free_data) self.clear() else self.placements.clearRetainingCapacity(),
+            else => return,
+        }
+        if (free_data) {
+            for (affected[0..n]) |id| if (!self.hasPlacement(id)) self.removeImage(id);
+            if (kind == 'i' and !self.hasPlacement(cmd.id)) self.removeImage(cmd.id);
         }
         self.gcUnplaced();
+        self.placementsChanged(cursor.cell_w, cursor.cell_h);
     }
 
     /// The screen was cleared: drop placements that cover any of its rows
     /// (absolute lines `base..base + rows`).
     pub fn dropVisible(self: *Store, which: u1, base: i64, rows: u16, cell_h: u32) void {
+        self.setCellSize(self.cell_w, cell_h);
         var i: usize = self.placements.items.len;
         var any = false;
         while (i > 0) {
             i -= 1;
             const p = self.placements.items[i];
             if (p.screen != which) continue;
-            const img = self.find(p.image_id);
-            const span: i64 = if (p.rows != 0) p.rows else if (img) |m| (m.height + @max(cell_h, 1) - 1) / @max(cell_h, 1) else 1;
+            const span: i64 = @max(p.rows, p.span_rows);
             if (p.row >= base + rows or p.row + @max(span, 1) <= base) continue;
             _ = self.placements.orderedRemove(i);
             any = true;
@@ -687,7 +814,10 @@ pub const Store = struct {
         while (i > 0) {
             i -= 1;
             const p = self.placements.items[i];
-            if (p.screen == which and p.col == cursor.col and p.row == cursor.base + cursor.row) {
+            const row = cursor.base + cursor.row;
+            if (p.screen == which and p.row <= row and row < p.end() and
+                p.col <= cursor.col and @as(i64, cursor.col) < @as(i64, p.col) + @max(p.columns, p.span_cols))
+            {
                 _ = self.placements.orderedRemove(i);
             }
         }
@@ -732,28 +862,21 @@ pub const Store = struct {
         self.dirty = true;
     }
 
-    /// Drops placements starting above screen row 0 (`base`).
+    /// History clear must not remove the visible tail of a tall placement.
     pub fn dropHistory(self: *Store, which: u1, base: i64) void {
-        var i: usize = self.placements.items.len;
-        while (i > 0) {
-            i -= 1;
-            const p = self.placements.items[i];
-            if (p.screen == which and p.row < base) {
-                const id = p.image_id;
-                _ = self.placements.orderedRemove(i);
-                self.freeIfOrphan(id);
-            }
-        }
+        self.expire(which, base);
     }
 
     fn movedCursor(self: *const Store, cmd: Command, cursor: Cursor, cols: u16, rows: u16) ?Cursor {
-        _ = self;
-        if (!cmd.cursor_move) return null;
-        const dc: u16 = std.math.cast(u16, cmd.columns) orelse 0;
-        const dr: u16 = std.math.cast(u16, cmd.rows) orelse 0;
-        if (dc == 0 and dr == 0) return null;
+        if (!cmd.cursor_move or cols == 0 or rows == 0) return null;
+        const img = self.find(cmd.id) orelse return null;
+        const p = Placement{ .image_id = cmd.id, .place_id = cmd.place_id, .col = cursor.col, .row = cursor.base + cursor.row, .columns = cmd.columns, .rows = cmd.rows, .src_x = cmd.src_x, .src_y = cmd.src_y, .src_w = cmd.src_w, .src_h = cmd.src_h, .screen = 0 };
+        const size = p.pixelSize(img.*, @max(cursor.cell_w, 1), @max(cursor.cell_h, 1));
+        if (size.width == 0 or size.height == 0) return null;
+        const dc: u16 = @intCast(@min(std.math.maxInt(u16), (size.width - 1) / @max(cursor.cell_w, 1) + 1));
+        const dr: u16 = @intCast(@min(std.math.maxInt(u16), (size.height - 1) / @max(cursor.cell_h, 1) + 1));
         var next = cursor;
-        next.row = @min(rows - 1, cursor.row +| @max(dr, 1) -| 1);
+        next.row = @min(rows - 1, cursor.row +| dr);
         next.col = @min(cols - 1, cursor.col +| dc);
         return next;
     }
@@ -1071,6 +1194,201 @@ test "decode png without f=100" {
     try std.testing.expectEqual(@as(u8, 255), bmp.rgba[0]);
 }
 
+test "natural-size graphics move the cursor from image and cell dimensions" {
+    const gpa = std.testing.allocator;
+    var store = Store.init(gpa);
+    defer store.deinit();
+    const rgba: [32]u8 = @splat(255);
+    var b64: [std.base64.standard.Encoder.calcSize(rgba.len)]u8 = undefined;
+    _ = std.base64.standard.Encoder.encode(&b64, &rgba);
+    var buf: [256]u8 = undefined;
+    const seq = try std.fmt.bufPrint(&buf, "\x1b_Ga=T,f=32,s=4,v=2,i=7,q=2;{s}\x1b\\", .{b64});
+    const cursor = Cursor{ .row = 1, .col = 2, .cell_w = 2, .cell_h = 1 };
+    const next = store.feed(seq, cursor, 20, 20, 0).?;
+    try std.testing.expectEqual(@as(u16, 3), next.row);
+    try std.testing.expectEqual(@as(u16, 4), next.col);
+    try std.testing.expect(store.find(7).?.pending != null); // No decode required to move.
+    try std.testing.expect(store.feed("\x1b_Ga=p,i=7,C=1,c=3,r=2;\x1b\\", cursor, 20, 20, 0) == null);
+    const scaled = store.feed("\x1b_Ga=p,i=7,c=3;\x1b\\", cursor, 20, 20, 0).?;
+    try std.testing.expectEqual(@as(u16, 4), scaled.row); // 6 x 3 pixels, three rows.
+    try std.testing.expectEqual(@as(u16, 5), scaled.col);
+    const transmit = try std.fmt.bufPrint(&buf, "\x1b_Ga=t,f=32,s=4,v=2,i=8,q=2;{s}\x1b\\", .{b64});
+    try std.testing.expect(store.feed(transmit, cursor, 20, 20, 0) == null);
+}
+
+test "natural-size image lifetime uses its entire height" {
+    const gpa = std.testing.allocator;
+    var store = Store.init(gpa);
+    defer store.deinit();
+    const pixels = try gpa.alloc(u8, 24);
+    @memset(pixels, 255);
+    store.placeBitmap(pixels, 1, 6, .{ .cell_w = 1, .cell_h = 2 }, 0, 0, 0);
+    try std.testing.expectEqual(@as(u32, 3), store.placements.items[0].span_rows);
+    store.expire(0, 1);
+    store.expire(0, 2);
+    try std.testing.expectEqual(@as(usize, 1), store.images.items.len);
+    store.expire(0, 3);
+    try std.testing.expectEqual(@as(usize, 0), store.images.items.len);
+    try std.testing.expectEqual(@as(usize, 0), store.placements.items.len);
+}
+
+test "history clear keeps image pixels that still extend onto the screen" {
+    const gpa = std.testing.allocator;
+    var store = Store.init(gpa);
+    defer store.deinit();
+    const pixels = try gpa.alloc(u8, 4);
+    @memset(pixels, 255);
+    store.placeBitmap(pixels, 1, 1, .{ .base = 99 }, 0, 1, 3);
+    store.dropHistory(0, 100);
+    try std.testing.expectEqual(@as(usize, 1), store.placements.items.len);
+    store.dropHistory(0, 102);
+    try std.testing.expectEqual(@as(usize, 0), store.placements.items.len);
+    try std.testing.expectEqual(@as(usize, 0), store.images.items.len);
+}
+
+test "font metric changes update natural placement expiry bounds" {
+    const gpa = std.testing.allocator;
+    var store = Store.init(gpa);
+    defer store.deinit();
+    const pixels = try gpa.alloc(u8, 24);
+    @memset(pixels, 255);
+    store.placeBitmap(pixels, 1, 6, .{ .cell_w = 1, .cell_h = 2 }, 0, 0, 0);
+    store.setCellSize(1, 1);
+    try std.testing.expectEqual(@as(u32, 6), store.placements.items[0].span_rows);
+    store.expire(0, 3);
+    try std.testing.expectEqual(@as(usize, 1), store.images.items.len);
+    store.setCellSize(1, 3);
+    store.expire(0, 2);
+    try std.testing.expectEqual(@as(usize, 0), store.images.items.len);
+}
+
+test "single-axis placement sizing preserves source aspect ratio" {
+    const img = Image{ .id = 1, .width = 4, .height = 2, .rgba = &.{} };
+    var p = Placement{ .image_id = 1, .place_id = 0, .col = 0, .row = 0, .columns = 3, .rows = 0, .screen = 0 };
+    const by_width = p.pixelSize(img, 2, 2);
+    try std.testing.expectEqual(@as(u64, 6), by_width.width);
+    try std.testing.expectEqual(@as(u64, 3), by_width.height);
+    p.columns = 0;
+    p.rows = 3;
+    const by_height = p.pixelSize(img, 2, 2);
+    try std.testing.expectEqual(@as(u64, 12), by_height.width);
+    try std.testing.expectEqual(@as(u64, 6), by_height.height);
+}
+
+test "image cache has a byte quota and evicts unplaced data first" {
+    const gpa = std.testing.allocator;
+    var store = Store.init(gpa);
+    defer store.deinit();
+    store.max_cache_bytes = 24;
+    _ = store.feed("\x1b_Ga=T,f=32,s=1,v=1,i=1,C=1,q=2;/wAA/w==\x1b\\", .{}, 8, 4, 0);
+    var buf: [128]u8 = undefined;
+    for (2..5) |id| {
+        const seq = try std.fmt.bufPrint(&buf, "\x1b_Ga=t,f=32,s=1,v=1,i={d},q=2;/wAA/w==\x1b\\", .{id});
+        _ = store.feed(seq, .{}, 8, 4, 0);
+        try std.testing.expect(store.cacheBytes() <= store.max_cache_bytes);
+    }
+    try std.testing.expect(store.find(1) != null); // Still has a placement.
+    try std.testing.expect(store.find(2) == null); // Oldest unplaced cache entry.
+    try std.testing.expect(store.find(3) != null and store.find(4) != null);
+    store.decodeVisible(0, 0, 4, 1);
+    try std.testing.expect(store.cacheBytes() <= store.max_cache_bytes);
+    try std.testing.expectEqual(@as(u8, 255), store.find(1).?.rgba[0]);
+    _ = store.feed("\x1b_Ga=p,i=2;\x1b\\", .{}, 8, 4, 0);
+    try std.testing.expect(std.mem.indexOf(u8, store.reply[0..store.reply_len], "ENOENT") != null);
+}
+
+test "a full placement table does not free a newly placed anonymous transmission" {
+    const gpa = std.testing.allocator;
+    var store = Store.init(gpa);
+    defer store.deinit();
+    _ = store.feed("\x1b_Ga=t,f=32,s=1,v=1,q=2;/wAA/w==\x1b\\", .{}, 8, 4, 0);
+    const anonymous = store.images.items[0].id;
+    _ = store.feed("\x1b_Ga=T,f=32,s=1,v=1,i=7,C=1,q=2;/wAA/w==\x1b\\", .{}, 8, 4, 0);
+    for (1..max_placements) |_| _ = store.feed("\x1b_Ga=p,i=7,C=1,q=2;\x1b\\", .{}, 8, 4, 0);
+    var buf: [128]u8 = undefined;
+    const seq = try std.fmt.bufPrint(&buf, "\x1b_Ga=p,i={d},C=1,q=2;\x1b\\", .{anonymous});
+    _ = store.feed(seq, .{}, 8, 4, 0);
+    try std.testing.expect(store.find(anonymous) != null);
+    try std.testing.expectEqual(max_placements, store.placements.items.len);
+    try std.testing.expectEqual(anonymous, store.placements.items[max_placements - 1].image_id);
+}
+
+test "cache quota is independent of whether earlier frames decoded the data" {
+    const gpa = std.testing.allocator;
+    var stores = [_]Store{ Store.init(gpa), Store.init(gpa) };
+    defer for (&stores) |*store| store.deinit();
+    for (&stores) |*store| store.max_cache_bytes = 24;
+    var buf: [128]u8 = undefined;
+    for (1..6) |id| {
+        for (&stores, 0..) |*store, version| {
+            const image = try std.fmt.bufPrint(&buf, "\x1b_Ga=T,f=32,s=1,v=1,i={d},C=1,q=2;/wAA/w==\x1b\\", .{id});
+            _ = store.feed(image, .{}, 8, 4, 0);
+            if (version == 0) store.decodeVisible(0, 0, 4, 1);
+            const del = try std.fmt.bufPrint(&buf, "\x1b_Ga=d,d=i,i={d},q=2;\x1b\\", .{id});
+            _ = store.feed(del, .{}, 8, 4, 0);
+            try std.testing.expect(store.cacheBytes() <= store.max_cache_bytes);
+        }
+    }
+    for (1..6) |id| try std.testing.expectEqual(stores[0].find(@intCast(id)) != null, stores[1].find(@intCast(id)) != null);
+    try std.testing.expect(stores[0].find(1) == null);
+    try std.testing.expect(stores[0].find(3) != null);
+}
+
+test "delete all visible preserves history alternate-screen placements and named data" {
+    const gpa = std.testing.allocator;
+    var store = Store.init(gpa);
+    defer store.deinit();
+    _ = store.feed("\x1b_Ga=T,f=32,s=1,v=1,i=1,C=1,q=2;/wAA/w==\x1b\\", .{ .row = 1, .base = 100 }, 8, 4, 0);
+    _ = store.feed("\x1b_Ga=T,f=32,s=1,v=1,i=2,C=1,q=2;/wAA/w==\x1b\\", .{ .base = 90 }, 8, 4, 0);
+    _ = store.feed("\x1b_Ga=T,f=32,s=1,v=1,i=3,C=1,q=2;/wAA/w==\x1b\\", .{ .base = 100 }, 8, 4, 1);
+    _ = store.feed("\x1b_Ga=d,d=a,q=2;\x1b\\", .{ .base = 100 }, 8, 4, 0);
+    try std.testing.expectEqual(@as(usize, 2), store.placements.items.len);
+    try std.testing.expectEqual(@as(usize, 3), store.images.items.len);
+    _ = store.feed("\x1b_Ga=p,i=1,C=1,q=2;\x1b\\", .{ .base = 100 }, 8, 4, 0);
+    try std.testing.expectEqual(@as(usize, 3), store.placements.items.len);
+}
+
+test "uppercase placement deletion keeps data while another placement references it" {
+    const gpa = std.testing.allocator;
+    var store = Store.init(gpa);
+    defer store.deinit();
+    _ = store.feed("\x1b_Ga=T,f=32,s=1,v=1,i=7,p=11,C=1,q=2;/wAA/w==\x1b\\", .{}, 8, 4, 0);
+    _ = store.feed("\x1b_Ga=p,i=7,p=22,C=1,q=2;\x1b\\", .{}, 8, 4, 1);
+    _ = store.feed("\x1b_Ga=d,d=I,i=7,p=11,q=2;\x1b\\", .{}, 8, 4, 0);
+    try std.testing.expect(store.find(7) != null);
+    try std.testing.expectEqual(@as(usize, 1), store.placements.items.len);
+    _ = store.feed("\x1b_Ga=d,d=i,i=7,p=22,q=2;\x1b\\", .{}, 8, 4, 1);
+    try std.testing.expect(store.find(7) != null);
+    _ = store.feed("\x1b_Ga=d,d=I,i=7,q=2;\x1b\\", .{}, 8, 4, 0);
+    try std.testing.expect(store.find(7) == null);
+}
+
+test "point deletion intersects the image and unknown selectors are non-destructive" {
+    const gpa = std.testing.allocator;
+    var store = Store.init(gpa);
+    defer store.deinit();
+    _ = store.feed("\x1b_Ga=T,f=32,s=1,v=1,i=7,c=3,r=2,C=1,q=2;/wAA/w==\x1b\\", .{}, 8, 4, 0);
+    _ = store.feed("\x1b_Ga=d,d=?,q=2;\x1b\\", .{}, 8, 4, 0);
+    try std.testing.expectEqual(@as(usize, 1), store.placements.items.len);
+    _ = store.feed("\x1b_Ga=d,d=c,q=2;\x1b\\", .{ .row = 1, .col = 2 }, 8, 4, 0);
+    try std.testing.expectEqual(@as(usize, 0), store.placements.items.len);
+    try std.testing.expect(store.find(7) != null);
+    _ = store.feed("\x1b_Ga=p,i=7,c=3,r=2,C=1,q=2;\x1b\\", .{}, 8, 4, 0);
+    _ = store.feed("\x1b_Ga=d,d=p,x=3,y=2,q=2;\x1b\\", .{}, 8, 4, 0);
+    try std.testing.expectEqual(@as(usize, 0), store.placements.items.len);
+}
+
+test "graphics deletion cancels an unfinished upload" {
+    const gpa = std.testing.allocator;
+    var store = Store.init(gpa);
+    defer store.deinit();
+    _ = store.feed("\x1b_Ga=t,f=32,s=1,v=1,i=7,m=1,q=2;/wAA\x1b\\", .{}, 8, 4, 0);
+    try std.testing.expect(store.assembling);
+    _ = store.feed("\x1b_Ga=d,d=i,i=7,q=2;\x1b\\", .{}, 8, 4, 0);
+    try std.testing.expect(!store.assembling);
+    try std.testing.expectEqual(@as(usize, 0), store.chunks.items.len);
+}
+
 test "chunked png transmit places" {
     const gpa = std.testing.allocator;
     var store = Store.init(gpa);
@@ -1088,7 +1406,7 @@ test "chunked png transmit places" {
     try std.testing.expectEqual(@as(u32, 3), store.placements.items[0].rows);
 }
 
-test "delete a frees placed images" {
+test "lowercase deletion retains named data and uppercase deletion frees it" {
     const gpa = std.testing.allocator;
     var store = Store.init(gpa);
     defer store.deinit();
@@ -1097,7 +1415,7 @@ test "delete a frees placed images" {
     try std.testing.expectEqual(@as(usize, 1), store.images.items.len);
     try std.testing.expectEqual(@as(usize, 1), store.placements.items.len);
     _ = store.feed("\x1b_Ga=d,d=a,q=2\x1b\\", .{}, 8, 8, 0);
-    try std.testing.expectEqual(@as(usize, 0), store.images.items.len);
+    try std.testing.expectEqual(@as(usize, 1), store.images.items.len);
     try std.testing.expectEqual(@as(usize, 0), store.placements.items.len);
     _ = store.feed("\x1b_Ga=t,f=100,i=4,q=2;" ++ png_1x1_b64 ++ "\x1b\\", .{}, 8, 8, 0);
     try std.testing.expectEqual(@as(usize, 1), store.images.items.len);
@@ -1295,6 +1613,9 @@ test "placements are anchored to absolute lines and expire with history" {
     try std.testing.expectEqual(@as(u32, 900), store.images.items[0].id);
     try std.testing.expectEqual(@as(i64, 104), store.min_end[0]);
     store.dropHistory(0, 104);
+    try std.testing.expectEqual(@as(usize, 0), store.placements.items.len);
+    try std.testing.expect(store.find(900) != null);
+    _ = store.feed("\x1b_Ga=d,d=I,i=900,q=2\x1b\\", .{}, 4, 4, 0);
     try std.testing.expectEqual(@as(usize, 0), store.images.items.len);
 }
 
@@ -1332,7 +1653,7 @@ test "images decode when first drawn, not when transmitted" {
     try std.testing.expect(store.find(2).?.pending != null);
 }
 
-test "clearing the screen drops its placements and frees unplaced images" {
+test "screen clear removes placements but retains named image data" {
     const gpa = std.testing.allocator;
     var store = Store.init(gpa);
     defer store.deinit();
@@ -1342,14 +1663,14 @@ test "clearing the screen drops its placements and frees unplaced images" {
     _ = store.feed("\x1b_Ga=T,f=32,s=1,v=1,i=7,q=2;/wAA/w==\x1b\\", .{ .row = 2, .base = 100 }, 4, 4, 0);
     try std.testing.expectEqual(@as(usize, 3), store.images.items.len);
     store.dropVisible(0, 100, 4, 16);
-    // The history placement stays; image 7 lost its only placement.
+    // History stays; anonymous visible data is freed, named data is cached.
     try std.testing.expectEqual(@as(usize, 1), store.placements.items.len);
     try std.testing.expectEqual(@as(i64, 90), store.placements.items[0].row);
-    try std.testing.expectEqual(@as(usize, 1), store.images.items.len);
-    try std.testing.expect(store.find(7) == null);
+    try std.testing.expectEqual(@as(usize, 2), store.images.items.len);
+    try std.testing.expect(store.find(7) != null);
 }
 
-test "placed images are freed with their last placement, unplaced ones wait" {
+test "named data can be placed again after expiry deletion and screen drop" {
     const gpa = std.testing.allocator;
     var store = Store.init(gpa);
     defer store.deinit();
@@ -1359,16 +1680,18 @@ test "placed images are freed with their last placement, unplaced ones wait" {
     _ = store.feed("\x1b_Ga=T,f=32,s=1,v=1,i=4,q=2;/wAA/w==\x1b\\", .{ .row = 3 }, 8, 4, 0);
     // History scroll: image 1 (line 0) expires.
     store.expire(0, 1);
-    try std.testing.expect(store.find(1) == null);
+    try std.testing.expect(store.find(1) != null);
     try std.testing.expect(store.find(2) != null);
-    // Deleting placements (lowercase) frees a placed image too.
+    // Lowercase deletion removes only placements, not the named data.
     _ = store.feed("\x1b_Ga=d,d=i,i=3\x1b\\", .{}, 8, 4, 0);
-    try std.testing.expect(store.find(3) == null);
-    // Image 2 is placed later, then a screen drop frees it.
+    try std.testing.expect(store.find(3) != null);
+    // Image 2 is placed later; a screen drop still retains named data.
     _ = store.feed("\x1b_Ga=p,i=2\x1b\\", .{ .row = 1 }, 8, 4, 0);
     try std.testing.expectEqual(@as(usize, 2), store.placements.items.len);
     store.dropScreen(0);
-    try std.testing.expectEqual(@as(usize, 0), store.images.items.len);
+    try std.testing.expectEqual(@as(usize, 4), store.images.items.len);
+    _ = store.feed("\x1b_Ga=p,i=3,C=1,q=2\x1b\\", .{}, 8, 4, 0);
+    try std.testing.expectEqual(@as(usize, 1), store.placements.items.len);
 }
 
 test "a placement partly above the region keeps scrolling out" {

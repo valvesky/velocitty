@@ -21,20 +21,9 @@ const scrollback = 1000;
 const cache_capacity = 2048;
 const size_px: f32 = 16;
 
-const font_paths = [_][]const u8{
-    "/usr/share/fonts/TTF/IosevkaNerdFontMono-Regular.ttf",
-    "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
-    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-};
-// main.zig fallback_paths (Linux).
-const fallback_paths = [_][]const u8{
-    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-    "/usr/share/fonts/noto/NotoSansSymbols-Regular.ttf",
-    "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
-    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/gnu-free/FreeSans.otf",
-    "/usr/share/fonts/noto/NotoColorEmoji.ttf",
-};
+const FontSource = @import("fontsource.zig");
+const loadFile = FontSource.loadFile;
+const Scheme = @import("scheme.zig");
 
 const Options = struct {
     quick: bool = false,
@@ -60,7 +49,7 @@ const usage =
     \\  --ring KIB        ring size, power of two (default 1024, as main.zig)
     \\  --grid COLSxROWS  pipeline/render grid (default 120x40)
     \\  --samples N       render frames / glyph batches per row (10..10000; default 200)
-    \\  --font PATH       primary font (default: fc-match monospace, like main.zig)
+    \\  --font PATH       primary font override (default: application font configuration)
     \\  --only A,B        sections: ascii unicode grapheme csi-short long-escape
     \\                    kitty-image sixel pi drain firehose kitten image glyph render
     \\                    (drain/firehose plus workload names: only those workloads)
@@ -209,7 +198,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
         opt.quick, opt.mib, opt.burst_kib, opt.cols, opt.rows, opt.samples, opt.only orelse "all",
     });
 
-    // Fonts: primary + main.zig fallbacks, cache/atlas sized like main.zig.
     var blobs: std.ArrayList(Font) = .empty;
     defer {
         for (blobs.items) |b| {
@@ -218,35 +206,38 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
         blobs.deinit(gpa);
     }
-    try loadFonts(io, gpa, opt.font, &blobs);
-    var ctx_store: Type.Context = try Type.Context.init(gpa, .{ .cache_capacity = cache_capacity });
-    defer ctx_store.deinit();
+    var ctx_store: ?Type.Context = null;
+    defer if (ctx_store) |*ctx| ctx.deinit();
     var env: Env = .{ .gpa = gpa, .io = io, .opt = opt, .ctx = null, .cell_w = 8, .cell_h = 16, .emoji = false };
-    if (blobs.items.len != 0) {
-        var fallbacks: std.ArrayList(Type.FontId) = .empty;
-        defer fallbacks.deinit(gpa);
-        for (blobs.items, 0..) |b, i| {
-            const id = ctx_store.addFont(b.bytes, .{}) catch {
-                try log.print("font {s}: unusable, skipped\n", .{b.path});
-                continue;
-            };
-            if (i != 0) try fallbacks.append(gpa, id);
-            if (ctx_store.faces.items[@backingInt(id)].font.color != null) env.emoji = true;
-            try log.print("font {s} {s} bytes={d}\n", .{ if (i == 0) "primary " else "fallback", b.path, b.bytes.len });
+    if (needsFonts(opt)) {
+        const config = Scheme.load(io, gpa);
+        try loadFonts(io, gpa, opt.font, &config, &blobs);
+        ctx_store = try Type.Context.init(gpa, .{ .cache_capacity = cache_capacity });
+        const ctx = &ctx_store.?;
+        for (blobs.items) |b| {
+            _ = try ctx.addFont(b.bytes, .{});
+            try log.print("font primary {s} bytes={d}\n", .{ b.path, b.bytes.len });
         }
-        if (ctx_store.primary != null) {
-            try ctx_store.setFallbacks(fallbacks.items);
-            const m = try ctx_store.metrics(size_px);
-            const h = @ceil(m.ascender - m.descender + m.line_gap);
-            const w = @ceil((try ctx_store.glyph('M', size_px)).advance);
-            // Bad float-to-int is UB in ReleaseFast.
-            if (!std.math.isFinite(w) or !std.math.isFinite(h) or w <= 0 or h <= 0 or w > 256 or h > 256) return error.InvalidFontMetrics;
-            env.cell_w = @intFromFloat(w);
-            env.cell_h = @intFromFloat(h);
-            env.ctx = &ctx_store;
+        const family = config.family() orelse "monospace";
+        if (opt.font == null) {
+            try ctx.addLazyFont(io, family, .{ .style = .{ .bold = true } }, false, FontSource.loadFamily);
+            try ctx.addLazyFont(io, family, .{ .style = .{ .italic = true } }, false, FontSource.loadFamily);
+            try ctx.addLazyFont(io, family, .{ .style = .{ .bold = true, .italic = true } }, false, FontSource.loadFamily);
         }
-    }
-    if (env.ctx == null) try log.print("font NONE: placeholder render, glyph section skipped\n", .{});
+        for (config.fallbackFamilies()) |*name| try ctx.addLazyFont(io, name.slice(), .{}, true, FontSource.loadFamily);
+        for (FontSource.fallback_families) |name| try ctx.addLazyFont(io, name, .{ .emoji_only = FontSource.isEmojiFamily(name) }, true, FontSource.loadFamily);
+        const m = try ctx.metrics(size_px);
+        const h = @ceil(m.ascender - m.descender + m.line_gap);
+        const w = @ceil((try ctx.glyph('M', size_px)).advance);
+        if (!std.math.isFinite(w) or !std.math.isFinite(h) or w <= 0 or h <= 0 or w > 256 or h > 256) return error.InvalidFontMetrics;
+        env.cell_w = @intFromFloat(w);
+        env.cell_h = @intFromFloat(h);
+        env.ctx = ctx;
+        if (wanted(opt, "glyph")) {
+            const emoji = try ctx.glyph(0x1F600, size_px);
+            env.emoji = ctx.faces.items[@intFromEnum(emoji.font_id)].font.color != null;
+        }
+    } else try log.print("fonts DISABLED: parser-only benchmark (no font bytes or atlases)\n", .{});
     try log.print("size_px={d} cell={d}x{d} glyph-cache={d} atlas=1024x1024 ring={d} parser-metadata-max={d}\n", .{ size_px, env.cell_w, env.cell_h, cache_capacity, ring_cap, @import("preparser.zig").Preparser.max_metadata_bytes });
     try log.print("p50/p95 are nearest-rank over frames (pipeline/render) or 64-lookup batches (glyph).\n", .{});
 
@@ -1701,57 +1692,31 @@ fn hashTerm(term: *const VtState) u64 {
 
 const Font = struct { path: []u8, bytes: []u8 };
 
-fn loadFonts(io: std.Io, gpa: std.mem.Allocator, override: ?[]const u8, out: *std.ArrayList(Font)) !void {
-    if (override) |path| {
-        const bytes = loadFile(io, gpa, path) catch |err| {
-            std.debug.print("bench: font {s}: {s}\n", .{ path, @errorName(err) });
-            return err;
-        };
-        try out.append(gpa, .{ .path = try gpa.dupe(u8, path), .bytes = bytes });
-    } else if (fcMatch(io, gpa, "monospace")) |path| {
-        if (loadFile(io, gpa, path)) |bytes| {
-            try out.append(gpa, .{ .path = path, .bytes = bytes });
-        } else |_| gpa.free(path);
-    }
-    if (out.items.len == 0) for (font_paths) |path| {
-        const bytes = loadFile(io, gpa, path) catch continue;
-        try out.append(gpa, .{ .path = try gpa.dupe(u8, path), .bytes = bytes });
-        break;
-    };
-    if (out.items.len == 0) return;
-    for (fallback_paths) |path| {
-        if (std.mem.eql(u8, path, out.items[0].path)) continue;
-        const bytes = loadFile(io, gpa, path) catch continue;
-        try out.append(gpa, .{ .path = try gpa.dupe(u8, path), .bytes = bytes });
-    }
-}
-
-fn fcMatch(io: std.Io, gpa: std.mem.Allocator, pattern: []const u8) ?[]u8 {
-    const result = std.process.run(gpa, io, .{
-        .argv = &.{ "fc-match", "-f", "%{file}", pattern },
-        .stdout_limit = .limited(4096),
-        .stderr_limit = .limited(4096),
-    }) catch return null;
-    defer gpa.free(result.stdout);
-    defer gpa.free(result.stderr);
-    switch (result.term) {
-        .exited => |code| if (code != 0) return null,
-        else => return null,
-    }
-    const path = std.mem.trim(u8, result.stdout, " \t\r\n");
-    if (path.len == 0 or path[0] != '/') return null;
-    return gpa.dupe(u8, path) catch null;
-}
-
-fn loadFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
-    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
-    defer file.close(io);
-    const len = try file.length(io);
-    if (len > 64 * 1024 * 1024) return error.FileTooLarge;
-    const bytes = try gpa.alloc(u8, @intCast(len));
+fn loadFonts(io: std.Io, gpa: std.mem.Allocator, override: ?[]const u8, config: *const Scheme.Config, out: *std.ArrayList(Font)) !void {
+    const name = override orelse config.family() orelse "monospace";
+    const bytes = if (override != null) try FontSource.loadFile(io, gpa, name) else try FontSource.loadFamily(gpa, io, name, false, false, false);
     errdefer gpa.free(bytes);
-    if (try file.readPositionalAll(io, bytes, 0) != bytes.len) return error.ShortRead;
-    return bytes;
+    const owned = try gpa.dupe(u8, name);
+    errdefer gpa.free(owned);
+    try out.append(gpa, .{ .path = owned, .bytes = bytes });
+}
+
+test "parser-only benchmark selections do not load fonts or atlases" {
+    for ([_][]const u8{ "drain", "drain,ascii", "kitten", "kitten,csi", "drain,kitten,grapheme" }) |only|
+        try std.testing.expect(!needsFonts(.{ .only = only }));
+    for ([_][]const u8{ "ascii", "firehose,grapheme", "render", "glyph", "image", "drain,render" }) |only|
+        try std.testing.expect(needsFonts(.{ .only = only }));
+    try std.testing.expect(needsFonts(.{}));
+}
+
+fn needsFonts(opt: Options) bool {
+    if (opt.only == null) return true;
+    for ([_][]const u8{ "firehose", "image", "glyph", "render", "pipeline" }) |section| {
+        if (wanted(opt, section)) return true;
+    }
+    if (wanted(opt, "drain") or wanted(opt, "kitten")) return false;
+    for (workloads) |wl| if (wanted(opt, wl.name)) return true;
+    return false;
 }
 
 fn readSmall(io: std.Io, path: []const u8, buf: []u8) ?[]const u8 {

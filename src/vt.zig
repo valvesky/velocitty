@@ -923,6 +923,7 @@ pub const VtState = struct {
 
     /// Decode the images about to be drawn; they stay encoded until then.
     pub fn prepareImages(self: *VtState) void {
+        self.kitty.setCellSize(self.cell_px_w, self.cell_px_h);
         self.kitty.decodeVisible(self.which, self.imageBase(), self.rows, self.cell_px_h);
     }
 
@@ -940,7 +941,7 @@ pub const VtState = struct {
 
     fn imageCursor(self: *VtState) Kitty.Cursor {
         const g = self.grid();
-        return .{ .row = g.cursor.row, .col = g.cursor.col, .base = @intCast(g.base) };
+        return .{ .row = g.cursor.row, .col = g.cursor.col, .base = @intCast(g.base), .cell_w = self.cell_px_w, .cell_h = self.cell_px_h };
     }
 
     pub fn resize(self: *VtState, cols: u16, rows: u16) !void {
@@ -949,9 +950,27 @@ pub const VtState = struct {
         self.join.ok = false;
         const old_cols = self.cols;
         const old_rows = self.rows;
-        try (&self.grids[0]).resize(self.allocator, old_cols, old_rows, cols, rows, self.grids[0].cap, true);
-        // Reflow renumbers history lines; on-screen placements keep their rows.
-        if (cols != old_cols) self.kitty.dropHistory(0, @intCast(self.grids[0].base));
+        var anchors: [Kitty.max_placements + 1]Grid.Anchor = undefined;
+        var indices: [Kitty.max_placements]usize = undefined;
+        var n: usize = 0;
+        for (self.kitty.placements.items, 0..) |p, placement_index| {
+            if (p.screen != 0) continue;
+            anchors[n] = .{ .row = p.row, .col = p.col };
+            indices[n] = placement_index;
+            n += 1;
+        }
+        const keep_view = self.grids[0].scroll != 0;
+        if (keep_view) anchors[n] = .{ .row = @as(i64, @intCast(self.grids[0].base)) - self.grids[0].scroll, .col = 0 };
+        try (&self.grids[0]).resizeAnchored(self.allocator, old_cols, old_rows, cols, rows, self.grids[0].cap, true, anchors[0 .. n + @intFromBool(keep_view)]);
+        if (keep_view) {
+            const offset = @as(i64, @intCast(self.grids[0].base)) - anchors[n].row;
+            self.grids[0].scroll = @intCast(@min(@as(i64, self.grids[0].used -| @as(u32, rows)), @max(0, offset)));
+        }
+        for (anchors[0..n], indices[0..n]) |anchor, placement_index| {
+            self.kitty.placements.items[placement_index].row = anchor.row;
+            self.kitty.placements.items[placement_index].col = anchor.col;
+        }
+        self.kitty.placementsChanged(self.cell_px_w, self.cell_px_h);
         try (&self.grids[1]).resize(self.allocator, old_cols, old_rows, cols, rows, rows, false);
 
         const dirty_len = (rows + 63) / 64;
@@ -1405,6 +1424,7 @@ pub const VtState = struct {
 
     /// A full clear removes the images on screen with the text.
     fn dropScreenImages(self: *VtState) void {
+        self.kitty.setCellSize(self.cell_px_w, self.cell_px_h);
         self.kitty.dropVisible(self.which, @intCast(self.grid().base), self.rows, self.cell_px_h);
     }
 
@@ -1486,6 +1506,7 @@ pub const VtState = struct {
 
     pub fn regionScrollUp(self: *VtState, n: u16) void {
         self.join.ok = false;
+        self.kitty.setCellSize(self.cell_px_w, self.cell_px_h);
         const g = self.grid();
         if (self.which == 0 and g.scroll_top == 0 and g.scroll_bottom + 1 == self.rows) {
             g.historyScrollUp(n, self.cols, self.rows);
@@ -1950,15 +1971,22 @@ pub const VtState = struct {
         const cell_h = @max(@as(u32, 1), self.cell_px_h);
         const cols_used: u32 = (bmp.width + cell_w - 1) / cell_w;
         const rows_used: u32 = (bmp.height + cell_h - 1) / cell_h;
-        const cur = self.grid().cursor;
-        if (!self.flags.sixel_display) {
+        var cur = self.grid().cursor;
+        // The normal cursor advance below performs the required scrolling.
+        // Right-of-image mode instead makes room before placing the bitmap.
+        if (self.flags.sixel_cursor_right and !self.flags.sixel_display) {
             const need: u16 = sat16vt(rows_used);
             const room = self.rows -| cur.row;
-            if (need > room) self.regionScrollUp(need - room);
+            if (need > room) {
+                self.regionScrollUp(need - room);
+                self.grid().cursor.row -|= need - room;
+                cur = self.grid().cursor;
+            }
         }
         self.kitty.placeImage(img, self.imageCursor(), self.which, cols_used, rows_used);
         const g = self.grid();
         if (self.flags.sixel_cursor_right) {
+            g.wrap_pending = false;
             g.cursor.col = @min(self.cols - 1, cur.col +| sat16vt(cols_used));
         } else {
             g.wrap_pending = false;
@@ -2261,6 +2289,7 @@ pub const VtState = struct {
             const g = self.grid();
             g.cursor.row = c.row;
             g.cursor.col = c.col;
+            g.wrap_pending = false;
         }
         if (self.kitty.dirty) self.markDirtyAll();
     }
@@ -3052,6 +3081,54 @@ test "sixel follows its scrollback line until history drops it" {
     while (vt.oldestLine() <= 1) vt.regionScrollUp(1);
     try std.testing.expectEqual(@as(usize, 0), vt.kitty.placements.items.len);
     try std.testing.expectEqual(@as(usize, 0), vt.kitty.images.items.len);
+}
+
+test "kitty placement advances the cursor and clears pending text wrap" {
+    const gpa = std.testing.allocator;
+    var storage: [4096]u8 = undefined;
+    var vt = try VtState.init(gpa, 8, 8, 20, &storage);
+    defer vt.deinit();
+    vt.cell_px_w = 4;
+    vt.cell_px_h = 4;
+    vt.grid().cursor = .{ .row = 1, .col = 7 };
+    vt.grid().wrap_pending = true;
+    vt.feedKitty("\x1b_Ga=T,f=32,s=1,v=1,i=8,q=2;/wAA/w==\x1b\\", true, null);
+    try std.testing.expectEqual(@as(u16, 2), vt.cursor().row);
+    try std.testing.expectEqual(@as(u16, 7), vt.cursor().col);
+    try std.testing.expect(!vt.grid().wrap_pending);
+    vt.printPlain("Z");
+    try std.testing.expectEqual(@as(u21, 'Z'), vt.grid().cellAt(2, 7).codepoint);
+}
+
+test "image cursor insertion point survives reflow through blank cells" {
+    const gpa = std.testing.allocator;
+    var storage: [4096]u8 = undefined;
+    var vt = try VtState.init(gpa, 8, 4, 20, &storage);
+    defer vt.deinit();
+    vt.cell_px_w = 4;
+    vt.cell_px_h = 4;
+    vt.feedKitty("\x1b_Ga=T,f=32,s=1,v=1,i=8,q=2;/wAA/w==\x1b\\", true, null);
+    try std.testing.expectEqual(@as(u16, 1), vt.cursor().row);
+    try std.testing.expectEqual(@as(u16, 1), vt.cursor().col);
+    try vt.resize(4, 4);
+    try std.testing.expectEqual(@as(u16, 1), vt.cursor().row);
+    try std.testing.expectEqual(@as(u16, 1), vt.cursor().col);
+}
+
+test "scrolling sixel anchors before cursor advance without double scrolling" {
+    const gpa = std.testing.allocator;
+    var storage: [4096]u8 = undefined;
+    var vt = try VtState.init(gpa, 4, 4, 8, &storage);
+    defer vt.deinit();
+    vt.cell_px_w = 4;
+    vt.cell_px_h = 4;
+    vt.grid().cursor = .{ .row = 3, .col = 0 };
+    vt.feedSixel("\x1bPq#1;2;100;0;0#1~\x1b\\");
+    try std.testing.expectEqual(@as(u64, 2), vt.grid().base);
+    try std.testing.expectEqual(@as(u16, 3), vt.cursor().row);
+    try std.testing.expectEqual(@as(u16, 0), vt.cursor().col);
+    try std.testing.expectEqual(@as(i64, 3), vt.kitty.placements.items[0].row);
+    try std.testing.expectEqual(@as(i64, 1), vt.kitty.placements.items[0].row - vt.imageBase());
 }
 
 test "large kitty images arrive through the ring, chunked or as one string" {

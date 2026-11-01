@@ -2,6 +2,7 @@
 import importlib.util
 from pathlib import Path
 import plistlib
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -27,6 +28,22 @@ class Packages(unittest.TestCase):
                 self.assertIn(f"{root}/share/applications/velocitty.desktop", files)
                 self.assertIn(f"{root}/share/man/man1/velocitty.1", files)
                 self.assertIn(f"{root}/example.config.toml", files)
+                self.assertIn(f"{root}/Makefile", files)
+                archive.extractall(temp / "extracted", filter="data")
+            package = temp / "extracted" / root
+            dest = temp / "dest"
+            args = ["make", "PREFIX=/opt/velocitty", f"DESTDIR={dest}"]
+            subprocess.run(args + ["install"], cwd=package, check=True)
+            prefix = dest / "opt/velocitty"
+            for path in ("bin/velocitty", "share/applications/velocitty.desktop",
+                         "share/icons/hicolor/512x512/apps/velocitty.png", "share/man/man1/velocitty.1"):
+                self.assertTrue((prefix / path).is_file(), path)
+            self.assertEqual((prefix / "bin/velocitty").stat().st_mode & 0o777, 0o755)
+            subprocess.run(args + ["uninstall"], cwd=package, check=True)
+            self.assertFalse((prefix / "bin/velocitty").exists())
+            self.assertFalse((prefix / "share/applications/velocitty.desktop").exists())
+            self.assertFalse((prefix / "share/icons/hicolor/512x512/apps/velocitty.png").exists())
+            self.assertFalse((prefix / "share/man/man1/velocitty.1").exists())
 
     def test_windows_retains_exe_suffix_and_no_linux_desktop(self):
         with tempfile.TemporaryDirectory() as temp:

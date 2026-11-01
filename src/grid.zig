@@ -546,6 +546,18 @@ pub const Grid = struct {
         self.wraps[self.lineIndex(row)] = if (wrapped) 1 else 0;
     }
 
+    /// A graphics anchor borrows a text-cell position during reflow. Original
+    /// absolute coordinates are replaced only after the new grid commits.
+    pub const Anchor = struct {
+        row: i64,
+        col: i32,
+        offset: ?usize = null,
+        mapped_row: u32 = 0,
+        mapped_col: u16 = 0,
+        outside_rows: i64 = 0,
+        mapped: bool = false,
+    };
+
     /// Compact the ring onto a new cell buffer. Scrollback is kept.
     /// When `reflow` is set and the column count changes, soft-wrapped rows
     /// are joined and re-broken at `new_cols` (primary screen). Alt screen
@@ -561,8 +573,12 @@ pub const Grid = struct {
         reflow: bool,
     ) std.mem.Allocator.Error!void {
         assert(new_cols > 0 and new_rows > 0);
+        return self.resizeAnchored(allocator, old_cols, old_rows, new_cols, new_rows, min_cap, reflow, &.{});
+    }
+
+    pub fn resizeAnchored(self: *Grid, allocator: std.mem.Allocator, old_cols: u16, old_rows: u16, new_cols: u16, new_rows: u16, min_cap: u32, reflow: bool, anchors: []Anchor) std.mem.Allocator.Error!void {
         if (reflow and new_cols != old_cols) {
-            try self.resizeReflow(allocator, old_cols, old_rows, new_cols, new_rows, min_cap);
+            try self.resizeReflow(allocator, old_cols, old_rows, new_cols, new_rows, min_cap, anchors);
             return;
         }
         try self.resizeClip(allocator, old_cols, old_rows, new_cols, new_rows, min_cap);
@@ -632,9 +648,17 @@ pub const Grid = struct {
         new_cols: u16,
         new_rows: u16,
         min_cap: u32,
+        anchors: []Anchor,
     ) std.mem.Allocator.Error!void {
         const hist = self.used -| @as(u32, old_rows);
         const old_total = hist + @as(u32, old_rows);
+        const oldest_line = @as(i64, @intCast(self.base)) - hist;
+        for (anchors) |*anchor| {
+            const relative = anchor.row - oldest_line;
+            const clamped = std.math.clamp(relative, 0, old_total - 1);
+            anchor.outside_rows = relative - clamped;
+            anchor.mapped = false;
+        }
         const oldest = (self.head + self.cap - hist) % self.cap;
         const blank = self.blankCell();
         const cur_abs = hist + @as(u32, self.cursor.row);
@@ -666,6 +690,24 @@ pub const Grid = struct {
                 i += 1;
             }
             const log_end = i;
+            // Images can sit on otherwise blank cells. Pin their anchor cell
+            // so trimming/reflow cannot silently erase their logical row.
+            for (anchors) |*anchor| {
+                anchor.offset = null;
+                const relative = std.math.clamp(anchor.row - oldest_line, 0, old_total - 1);
+                if (relative < log_start or relative > log_end) continue;
+                const col: usize = @intCast(std.math.clamp(anchor.col, 0, old_cols - 1));
+                const offset = @as(usize, @intCast(relative - log_start)) * old_cols + col;
+                anchor.offset = offset;
+                while (logical.items.len <= offset) try logical.append(allocator, blank);
+            }
+            // Graphics may advance the cursor through blank cells. Preserve
+            // that insertion point rather than clamping it to text content.
+            var graphics_cursor: ?u32 = null;
+            if (anchors.len != 0 and cur_abs >= log_start and cur_abs <= log_end) {
+                graphics_cursor = (cur_abs - log_start) * @as(u32, old_cols) + cur_col;
+                while (logical.items.len <= graphics_cursor.?) try logical.append(allocator, blank);
+            }
             const before_rows: u32 = @intCast(out_wraps.items.len);
             try wrapLogical(
                 allocator,
@@ -674,9 +716,10 @@ pub const Grid = struct {
                 logical.items,
                 new_cols,
                 blank,
+                anchors,
             );
             if (!mapped_cursor and cur_abs >= log_start and cur_abs <= log_end) {
-                const offset = cursorOffsetInLogical(
+                const offset = graphics_cursor orelse cursorOffsetInLogical(
                     self,
                     oldest,
                     old_cols,
@@ -697,7 +740,10 @@ pub const Grid = struct {
         }
 
         var out_rows: u32 = @intCast(out_wraps.items.len);
-        const cur_line: u32 = if (mapped_cursor) new_cur_row else out_rows -| 1;
+        var cur_line: u32 = if (mapped_cursor) new_cur_row else out_rows -| 1;
+        for (anchors) |anchor| {
+            if (anchor.mapped and anchor.outside_rows <= 0) cur_line = @max(cur_line, anchor.mapped_row);
+        }
         while (out_rows > new_rows and out_rows > cur_line + 1) {
             const last = out_rows - 1;
             const off = last * @as(u32, new_cols);
@@ -776,6 +822,11 @@ pub const Grid = struct {
         self.saved_cursor.col = @min(self.saved_cursor.col, new_cols - 1);
         self.saved_wrap_pending = false;
         self.clampScrollRegion(old_rows, new_rows);
+        for (anchors) |*anchor| {
+            if (!anchor.mapped) continue;
+            anchor.row = @as(i64, @intCast(self.base)) + anchor.mapped_row - @as(i64, view) - @as(i64, drop) + anchor.outside_rows;
+            anchor.col = anchor.mapped_col;
+        }
     }
 
     fn clampCursors(self: *Grid, new_cols: u16, new_rows: u16, old_rows: u16) void {
@@ -1063,6 +1114,7 @@ fn wrapLogical(
     logical: []const Cell,
     new_cols: u16,
     blank: Cell,
+    anchors: []Grid.Anchor,
 ) std.mem.Allocator.Error!void {
     var col: u16 = 0;
     var i: usize = 0;
@@ -1075,6 +1127,7 @@ fn wrapLogical(
     while (i < logical.len) {
         const cell = logical[i];
         if (cell.codepoint == 0) {
+            mapAnchors(anchors, i, 1, @intCast(out_wraps.items.len), @min(col, new_cols - 1), 1);
             i += 1;
             continue;
         }
@@ -1086,6 +1139,7 @@ fn wrapLogical(
             try out_wraps.append(allocator, 1);
             col = 0;
         }
+        mapAnchors(anchors, i, if (wide) 2 else 1, @intCast(out_wraps.items.len), col, width);
         try out_cells.append(allocator, cell);
         col += 1;
         if (width == 2) {
@@ -1097,6 +1151,17 @@ fn wrapLogical(
     }
     while (col < new_cols) : (col += 1) try out_cells.append(allocator, blank);
     try out_wraps.append(allocator, 0);
+}
+
+fn mapAnchors(anchors: []Grid.Anchor, index: usize, old_width: usize, row: u32, col: u16, width: u16) void {
+    for (anchors) |*anchor| {
+        const offset = anchor.offset orelse continue;
+        if (offset < index or offset >= index + old_width) continue;
+        anchor.mapped_row = row;
+        anchor.mapped_col = col + @as(u16, @intCast(@min(offset - index, width - 1)));
+        anchor.mapped = true;
+        anchor.offset = null;
+    }
 }
 
 fn cursorOffsetInLogical(

@@ -213,7 +213,7 @@ pub const Frame = struct {
         // Images are blitted over text: rows they cover now or covered last
         // frame are repainted; other rows keep the dirty/compare rules.
         var img_rows: [max_rows]bool = @splat(false);
-        imageRows(screen, cell_h, rows, &img_rows);
+        imageRows(screen, cell_w, cell_h, rows, &img_rows);
         var scroll: i32 = 0;
         if (have_prev and mayHaveScrolled(screen, rows)) {
             scroll = scrollDelta(screen, self.prev, cols, rows);
@@ -709,13 +709,15 @@ fn drawUnderline(self: *Frame, x0: u32, y0: u32, cell_w: u32, cell_h: u32, color
 }
 
 /// Marks screen rows covered by visible placements (same geometry as blitKitty).
-fn imageRows(screen: *const Term.Screen, cell_h: u32, rows: u16, out: *[max_rows]bool) void {
+fn imageRows(screen: *const Term.Screen, cell_w: u32, cell_h: u32, rows: u16, out: *[max_rows]bool) void {
     const store = &screen.kitty;
     const base = screen.imageBase();
     for (store.placements.items) |p| {
         if (p.screen != @as(u1, if (screen.altScreen()) 1 else 0)) continue;
         const img = store.find(p.image_id) orelse continue;
-        const span: i64 = if (p.rows != 0) p.rows else (img.height + cell_h - 1) / cell_h;
+        const size = p.pixelSize(img.*, cell_w, cell_h);
+        if (size.width == 0 or size.height == 0) continue;
+        const span: i64 = @intCast(@min(std.math.maxInt(u32), (size.height - 1) / cell_h + 1));
         const row = p.row - base;
         const r0: i64 = @max(0, row);
         const r1: i64 = @min(@as(i64, @min(rows, max_rows)), row + span);
@@ -749,8 +751,9 @@ fn blitKitty(self: *Frame, screen: *const Term.Screen, cell_w: u32, cell_h: u32)
         if (p.screen != @as(u1, if (screen.altScreen()) 1 else 0)) continue;
         const img = store.find(p.image_id) orelse continue;
         if (img.rgba.len < @as(usize, img.width) * img.height * 4) continue;
-        const dest_w: u64 = if (p.columns != 0) @as(u64, p.columns) * cell_w else img.width;
-        const dest_h: u64 = if (p.rows != 0) @as(u64, p.rows) * cell_h else img.height;
+        const size = p.pixelSize(img.*, cell_w, cell_h);
+        const dest_w = size.width;
+        const dest_h = size.height;
         const dx: i64 = @as(i64, p.col) * cell_w;
         const dy: i64 = (p.row - base) * cell_h;
         const src_x = @min(p.src_x, img.width);
@@ -1176,6 +1179,168 @@ fn mixVec(bg: @Vector(vec_len, u32), fg: @Vector(vec_len, u32), cover: @Vector(v
     return (ba << s24) | (r << s16) | (g << s8) | b;
 }
 
+test "image anchors follow wrapped text through repeated width changes" {
+    const a = std.testing.allocator;
+    var storage: [4096]u8 = undefined;
+    var vt = try Term.VtState.init(a, 8, 4, 20, &storage);
+    defer vt.deinit();
+    vt.flags.cursor_visible = false;
+    vt.cell_px_w = 4;
+    vt.cell_px_h = 4;
+    vt.feedText("abcdefghijklmnop");
+    _ = vt.kitty.feed("\x1b_Ga=T,f=32,s=1,v=1,i=8,C=1,c=1,r=1;/wAA/w==\x1b\\", .{ .row = 0, .col = 5, .cell_w = 4, .cell_h = 4 }, 8, 4, 0);
+    var frame = try Frame.init(a, 32, 16);
+    defer frame.deinit();
+    for (0..3) |_| {
+        for ([_]struct { cols: u16, rows: u16, row: i64, col: i32 }{
+            .{ .cols = 4, .rows = 6, .row = 1, .col = 1 },
+            .{ .cols = 8, .rows = 4, .row = 0, .col = 5 },
+        }) |size| {
+            try vt.resize(size.cols, size.rows);
+            try frame.resize(@as(u32, size.cols) * 4, @as(u32, size.rows) * 4);
+            vt.prepareImages();
+            frame.render(&vt, 4, 4, null, 8);
+            try std.testing.expectEqual(@as(usize, 1), vt.kitty.placements.items.len);
+            const p = vt.kitty.placements.items[0];
+            try std.testing.expectEqual(size.row, p.row - vt.imageBase());
+            try std.testing.expectEqual(size.col, p.col);
+            const pixel: usize = @intCast(size.row * 4 * frame.width + size.col * 4);
+            try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[pixel]);
+            vt.clearDirty();
+        }
+    }
+}
+
+test "history images survive reflow instead of being deleted" {
+    const a = std.testing.allocator;
+    var storage: [4096]u8 = undefined;
+    var vt = try Term.VtState.init(a, 4, 4, 20, &storage);
+    defer vt.deinit();
+    vt.flags.cursor_visible = false;
+    vt.cell_px_w = 4;
+    vt.cell_px_h = 4;
+    vt.feedText("abcdefgh");
+    _ = vt.kitty.feed("\x1b_Ga=T,f=32,s=1,v=1,i=8,C=1,c=1,r=1;/wAA/w==\x1b\\", .{ .row = 1, .col = 1, .cell_w = 4, .cell_h = 4 }, 4, 4, 0);
+    vt.regionScrollUp(2);
+    vt.viewScroll(2);
+    try vt.resize(8, 4);
+    var frame = try Frame.init(a, 32, 16);
+    defer frame.deinit();
+    vt.prepareImages();
+    frame.render(&vt, 4, 4, null, 8);
+    try std.testing.expect(vt.kitty.find(8) != null);
+    try std.testing.expectEqual(@as(usize, 1), vt.kitty.placements.items.len);
+    try std.testing.expectEqual(@as(i64, 0), vt.kitty.placements.items[0].row - vt.imageBase());
+    try std.testing.expectEqual(@as(i32, 5), vt.kitty.placements.items[0].col);
+    try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[20]);
+}
+
+test "reflow preserves the scrolled viewport over an image" {
+    const a = std.testing.allocator;
+    var storage: [4096]u8 = undefined;
+    var vt = try Term.VtState.init(a, 4, 4, 50, &storage);
+    defer vt.deinit();
+    vt.flags.cursor_visible = false;
+    vt.cell_px_w = 4;
+    vt.cell_px_h = 4;
+    _ = vt.kitty.feed("\x1b_Ga=T,f=32,s=1,v=1,i=8,C=1,c=1,r=1;/wAA/w==\x1b\\", .{ .row = 1, .col = 1, .cell_w = 4, .cell_h = 4 }, 4, 4, 0);
+    const text: [80]u8 = @splat('a');
+    vt.feedText(&text);
+    vt.viewScroll(1000);
+    try vt.resize(8, 4);
+    try std.testing.expect(vt.scrollOffset() > 0);
+    var frame = try Frame.init(a, 32, 16);
+    defer frame.deinit();
+    vt.prepareImages();
+    frame.render(&vt, 4, 4, null, 8);
+    try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[20]);
+}
+
+test "blank-cell images survive lazy decode redraw and font-sized resize" {
+    const a = std.testing.allocator;
+    var storage: [4096]u8 = undefined;
+    var vt = try Term.VtState.init(a, 8, 4, 20, &storage);
+    defer vt.deinit();
+    vt.flags.cursor_visible = false;
+    vt.cell_px_w = 4;
+    vt.cell_px_h = 4;
+    _ = vt.kitty.feed("\x1b_Ga=T,f=32,s=1,v=1,i=8,C=1,c=1,r=1;/wAA/w==\x1b\\", .{ .row = 2, .col = 5, .cell_w = 4, .cell_h = 4 }, 8, 4, 0);
+    try std.testing.expect(vt.kitty.find(8).?.pending != null);
+    try vt.resize(4, 4); // Resize before the first decode.
+    var frame = try Frame.init(a, 16, 16);
+    defer frame.deinit();
+    vt.prepareImages();
+    frame.render(&vt, 4, 4, null, 8);
+    try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[12 * 16 + 4]);
+    try std.testing.expect(vt.kitty.find(8).?.pending == null);
+    vt.clearDirty();
+    frame.invalidate();
+    frame.render(&vt, 4, 4, null, 8);
+    try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[12 * 16 + 4]);
+    vt.cell_px_w = 8;
+    vt.cell_px_h = 8;
+    try frame.resize(32, 32);
+    vt.prepareImages();
+    frame.render(&vt, 8, 8, null, 16);
+    try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[24 * 32 + 8]);
+    try vt.resize(8, 4);
+    try frame.resize(64, 32);
+    vt.prepareImages();
+    frame.render(&vt, 8, 8, null, 16);
+    try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[16 * 64 + 40]);
+}
+
+test "cached image can be placed again after screen clear and placement deletion" {
+    const a = std.testing.allocator;
+    var storage: [4096]u8 = undefined;
+    var vt = try Term.VtState.init(a, 4, 4, 20, &storage);
+    defer vt.deinit();
+    vt.flags.cursor_visible = false;
+    vt.cell_px_w = 4;
+    vt.cell_px_h = 4;
+    _ = vt.kitty.feed("\x1b_Ga=T,f=32,s=1,v=1,i=8,C=1,c=1,r=1,q=2;/wAA/w==\x1b\\", .{ .cell_w = 4, .cell_h = 4 }, 4, 4, 0);
+    var frame = try Frame.init(a, 16, 16);
+    defer frame.deinit();
+    vt.prepareImages();
+    frame.render(&vt, 4, 4, null, 8);
+    try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[0]);
+    vt.ed(2);
+    frame.render(&vt, 4, 4, null, 8);
+    try std.testing.expectEqual(@as(u32, 0xff000000), frame.pixels[0]);
+    try std.testing.expectEqual(@as(usize, 0), vt.kitty.placements.items.len);
+    try std.testing.expect(vt.kitty.find(8) != null);
+    for (0..2) |_| {
+        _ = vt.kitty.feed("\x1b_Ga=p,i=8,C=1,c=1,r=1,q=2;\x1b\\", .{ .cell_w = 4, .cell_h = 4 }, 4, 4, 0);
+        vt.markDirtyAll();
+        vt.prepareImages();
+        frame.render(&vt, 4, 4, null, 8);
+        try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[0]);
+        _ = vt.kitty.feed("\x1b_Ga=d,d=i,i=8,q=2;\x1b\\", .{}, 4, 4, 0);
+        frame.render(&vt, 4, 4, null, 8);
+        try std.testing.expectEqual(@as(u32, 0xff000000), frame.pixels[0]);
+    }
+}
+
+test "image anchors account for wide glyph wrap padding" {
+    const a = std.testing.allocator;
+    var storage: [4096]u8 = undefined;
+    var vt = try Term.VtState.init(a, 4, 4, 20, &storage);
+    defer vt.deinit();
+    vt.flags.cursor_visible = false;
+    vt.cell_px_w = 4;
+    vt.cell_px_h = 4;
+    vt.feedText("ab\u{4e2d}X");
+    _ = vt.kitty.feed("\x1b_Ga=T,f=32,s=1,v=1,i=8,C=1,c=1,r=1;/wAA/w==\x1b\\", .{ .row = 0, .col = 2, .cell_w = 4, .cell_h = 4 }, 4, 4, 0);
+    try vt.resize(3, 6);
+    var frame = try Frame.init(a, 12, 24);
+    defer frame.deinit();
+    vt.prepareImages();
+    frame.render(&vt, 4, 4, null, 8);
+    try std.testing.expectEqual(@as(i64, 1), vt.kitty.placements.items[0].row - vt.imageBase());
+    try std.testing.expectEqual(@as(i32, 0), vt.kitty.placements.items[0].col);
+    try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[4 * 12]);
+}
+
 test "debug overlay paints grid" {
     if (!Debug.live) return;
     const gpa = std.testing.allocator;
@@ -1212,6 +1377,43 @@ test "graphics repaint after deletion and clip oversized placement" {
     _ = vt.kitty.feed("\x1b_Ga=d,d=a,q=2\x1b\\", .{}, 2, 2, 0);
     vt.markDirtyAll();
     frame.render(&vt, 4, 4, null, 8);
+    try std.testing.expectEqual(@as(u32, 0xff000000), frame.pixels[0]);
+}
+
+test "kitty image scrolls with output and returns in scrollback" {
+    const a = std.testing.allocator;
+    var storage: [4096]u8 = undefined;
+    var vt = try Term.VtState.init(a, 4, 4, 8, &storage);
+    defer vt.deinit();
+    vt.flags.cursor_visible = false;
+    vt.cell_px_w = 4;
+    vt.cell_px_h = 4;
+    var frame = try Frame.init(a, 16, 16);
+    defer frame.deinit();
+
+    _ = vt.kitty.feed("\x1b_Ga=T,f=32,s=1,v=1,i=4,C=1,c=1,r=1;/wAA/w==\x1b\\", .{ .row = 1, .col = 0 }, 4, 4, 0);
+    vt.prepareImages();
+    frame.render(&vt, 4, 4, null, 8);
+    try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[4 * 16]);
+    vt.clearDirty();
+
+    vt.regionScrollUp(1);
+    vt.prepareImages();
+    frame.render(&vt, 4, 4, null, 8);
+    try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[0]);
+    try std.testing.expectEqual(@as(u32, 0xff000000), frame.pixels[4 * 16]);
+    vt.clearDirty();
+
+    vt.regionScrollUp(1);
+    frame.render(&vt, 4, 4, null, 8);
+    try std.testing.expectEqual(@as(u32, 0xff000000), frame.pixels[0]);
+    vt.clearDirty();
+
+    vt.grid().scroll = 2;
+    vt.markDirtyAll();
+    vt.prepareImages();
+    frame.render(&vt, 4, 4, null, 8);
+    try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[4 * 16]);
     try std.testing.expectEqual(@as(u32, 0xff000000), frame.pixels[0]);
 }
 

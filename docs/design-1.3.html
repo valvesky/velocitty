@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Velocitty 1.3</title>
+        <link rel="stylesheet" href="style.css">
+        <link rel="icon" href="favicon.ico" sizes="16x16 32x32">
+    </head>
+
+    <body>
+    <nav class="site-nav" aria-label="Main navigation">
+        <div class="nav-inner">
+            <a class="brand" href="index.html"><img src="icon.svg" alt=""><span>Velocitty</span></a>
+            <a href="index.html">Documentation</a>
+        </div>
+    </nav>
+    <div class="docs-layout">
+        <nav class="docs-sidebar" aria-label="On this page">
+            <a href="#overview">Overview</a>
+            <a href="#obsolete">Obsolete painting</a>
+            <a href="#streaming">Large payloads</a>
+            <a href="#images">Image ownership</a>
+            <a href="#fonts">Font loading</a>
+            <a href="#appendix">Early designs</a>
+            <a href="#benchmarks">Benchmarks</a>
+            <a href="#changelog">Changelog</a>
+        </nav>
+    <main>
+        <h1 class="title">
+            Velocitty 1.3 - Ring Buffer and Pre-parser Redesign
+        </h1>
+
+        <h2 id="overview">Overview</h2>
+
+        <p>Velocitty 1.3 uses a mirrored 1 MiB input ring. The preparser frames input into categorized
+        runs (text, ESC, C0, CSI, OSC and other control strings), whose offsets and lengths reference
+        their backing storage. If the buffer is more than 75% full (e.g. a large read) the runs are
+        fed through a special path that calls <code>isSpanObsolete</code> on each run, either way ends with
+        sequentially feeding the VT parser.</p>
+
+
+        <p><strong>Unconsumed ring bytes are never overwritten.</strong></p>
+
+
+        <p>Normal consumption occurs at a frame boundary or when input closes. Above 75% occupancy,
+        pressure consumption enables <code>skipText=true</code>. This activates lookahead analysis through
+        <code>isSpanObsolete</code>, it is disabled by default. The frame cadence gives reads time to
+        accumulate without running the visibility proof on small workloads.</p>
+
+        <figure>
+            <img src="ring-runs.svg" alt="The 1 MiB ring, categorized runs, temporary stream buffer, ordered VT consumption and independently owned image store">
+            <figcaption>Diagram of the new input feeder and pre-parser.</figcaption>
+        </figure>
+
+        <p>To handle large payloads (APC, OSC clipboard, DCS strings, etc.),  if the preparser reaches an
+        unfinished string, its bytes move into a separate, growable stream buffer. Subsequent reads then
+        append directly to that buffer instead of filling the ring further. Once that sequence ends, the
+        preparser emits a run that references the stream buffer instead of the ring.
+        </p>
+
+<pre><code>
+pub fn isSpanObsolete(self: *Preparser, index: usize) bool {
+    const span = self.runs.items[index];
+    if (span.kind != .text and span.role != .lf) return false;
+    if (self.exact) return false;
+    if (span.flags.ghost) return true;
+    if (self.blind) return false;
+    if (!self.visibility_ready) {
+        self.visibility_ready = true;
+        const need: u32 = 2 * @as(u32, self.rows) -| 1;
+        // No clear and too few scrolling LFs means no safe cutoff:
+        // CSI-heavy, non-scrolling input takes this O(1) exit.
+        var remaining = self.barriers;
+        inline for (0..2) |k| {
+            if (self.scroll_lfs[k] >= need) remaining |= @as(u2, 1) << k;
+        }
+        remaining &= self.screens;
+        var lfs = [2]u32{ 0, 0 };
+        var i = self.runs.items.len;
+        while (i > 0 and remaining != 0) {
+            i -= 1;
+            const run = self.runs.items[i];
+            const screen = run.flags.screen;
+            const bit = @as(u2, 1) << screen;
+            var kills: u2 = 0;
+            switch (run.role) {
+                .lf => {
+                    if (!run.flags.scrolls) {
+                        lfs[screen] = 0;
+                    } else {
+                        lfs[screen] += 1;
+                        if (lfs[screen] >= need) kills = bit;
+                    }
+                },
+                .motion => lfs[screen] = 0,
+                .barrier => kills = bit,
+                .barrier_alt => kills = 0b10,
+                .barrier_all => kills = 0b11,
+                else => {},
+            }
+            inline for (0..2) |k| {
+                const mask = @as(u2, 1) << k;
+                if (kills & remaining & mask != 0) self.cut[k] = @intCast(i);
+            }
+            remaining &= ~kills;
+            if (run.flags.moves) lfs[screen] = 0;
+            if (run.flags.resets) lfs = .{ 0, 0 };
+        }
+    }
+    return index < self.cut[span.flags.screen];
+}
+</code></pre>
+
+        <h2 id="obsolete">Omitting obsolete painting, not terminal state</h2>
+
+        <p><code>isSpanObsolete</code> uses later runs to prove that earlier ASCII/UTF-8 cell painting
+        cannot affect the visible result. Text still advances cursor, wrapping and grapheme state.
+        SGR, mode changes, queries, replies and graphics remain ordered; this is not a license to discard
+        arbitrary input before a byte cutoff.</p>
+
+        <p>The visibility proof is evaluated lazily and cached for each prepared workset. It uses
+        qualifying screen clears or enough full-region scrolling line feeds, conservatively stopping
+        at cursor motion, screen switches and restores it cannot reason about. Parser arrays have hard
+        limits totaling 160 KiB of dynamic metadata, independent of ring size, and are reused rather
+        than growing to describe an entire flood.</p>
+
+        <p>Pressure consumption retains the live suffix in the ring as lookahead for later input,
+        instead of repeatedly painting that suffix on every full-buffer drain. When the oldest content
+        cannot be proven obsolete, a quarter-ring progress floor prevents repeated scans on each small
+        PTY read near the 75% trigger. The next normal frame drain consumes the retained suffix.</p>
+
+        <h2 id="streaming">Large payloads and temporary stream storage</h2>
+
+        <p>A control string can exceed the ring capacity or span many reads. If preparation reaches
+        an unfinished OSC, DCS, APC, PM or SOS string, the bytes seen so far move into a separate,
+        growable stream buffer. While the ring is empty, subsequent reads can append directly there.
+        Once the terminator arrives, a run with <code>flags.stream</code> references stream storage;
+        bytes following the terminator return to the ring. This preserves processing order across
+        both backing stores.</p>
+
+        <p>This covers transport framing for Kitty APC graphics, sixel DCS bodies, OSC 52 clipboard
+        data and other string payloads; individual handlers still determine which commands are supported.
+        The stream cap is 320 MiB, not an upfront allocation. Over-cap strings are discarded through
+        their terminator so ordinary parsing can recover.</p>
+
+        <p>The stream cannot be cleared merely because the ring is empty: its sequence might still be
+        incomplete. After consumption or an ownership transfer, temporary storage can be reused. The
+        current implementation frees idle stream allocations larger than 1 MiB and retains smaller ones;
+        it does not unconditionally shrink them by half.</p>
+
+        <p>Bulk payload traffic is not yet completely separate from pressure accounting: complete
+        strings initially occupy the ring, and large strings can cross 75% before streaming starts.
+        CSI/SGR are not streamed by this mechanism; incomplete CSI/ESC input has a separate 4 KiB hold
+        limit. These are current limitations, not evidence that payload pressure alone explains a
+        benchmark performance difference.</p>
+
+        <h2 id="images">Image storage survives input drains</h2>
+
+        <p>The image store is independent of temporary stream storage. It owns encoded payloads or
+        decoded RGBA pixels, image IDs and placements. A sufficiently large completed Kitty APC can
+        transfer its stream allocation to the store rather than copying the payload again; other paths
+        copy or transfer their own payload storage. Raw, PNG and sixel payloads defer decoding until
+        a placement becomes visible. Formats without a cheap size header, such as JPEG/GIF, decode
+        immediately to determine their dimensions.</p>
+
+        <p>Resize/reflow remaps image anchors alongside text, including blank cells, wide-glyph wrap
+        padding and the scrolled viewport. Redraw and font/cell-size changes do not discard image data.
+        Natural and single-axis-scaled dimensions are shared by rendering, cursor advancement and
+        placement lifetime; <code>C=1</code> suppresses Kitty cursor movement.</p>
+
+        <p>Screen clears remove visible placements. Named Kitty data stays available for a later
+        <code>a=p</code>, including after lowercase placement deletion; uppercase deletion frees data
+        once no placement references it. Anonymous/sixel images expire with their final placement.
+        The cache is bounded to 64 images and a separate 320 MiB logical quota, preferring unplaced
+        entries for eviction. Each image reserves the larger of encoded payload size and decoded RGBA
+        size, keeping quota decisions stable across lazy decoding. Decode scratch and allocator slack
+        are additional memory; this quota is not the stream-buffer cap or an RSS limit.</p>
+
+        <h2 id="fonts">Load fonts when needed</h2>
+
+        <p>The primary family comes from configuration, or the system <code>monospace</code> selection
+        when unset. There is no hardcoded Iosevka preference or emergency font path. Linux discovery
+        uses fontconfig; other platforms use native font resolution.</p>
+
+        <p>Only the primary font file loads initially. Styled faces load on first styled use, and
+        missing glyphs trigger the configured fallback chain before built-in coverage families.
+        Failed lookups are cached until font reload. Rendering benchmarks follow application font
+        selection unless explicitly overridden; parser-only benchmarks load neither font files nor
+        glyph atlases.</p>
+
+        <h2 id="appendix">Early Designs</h2>
+
+        I had other ideas that were similar but wouldn't work in practice. I tried having a "dead zone"
+        where I just ignored all ascii / utf-8 before a certain point but the gains were small, but it did
+        lead me to the current design.
+
+        <figure>
+            <img src="velocitty-1.3-notebook.webp" alt="Original notebook sketch." loading="lazy">
+            <figcaption>First sketch for the 1.3 redesign.</figcaption>
+        </figure>
+
+        <figure>
+            <img src="velocitty-1.3-notebook-2.webp" alt="Original notebook sketch." loading="lazy">
+            <figcaption>Second sketch for the 1.3 redesign.</figcaption>
+        </figure>
+
+
+
+        <h3 id="benchmarks">VT Parsing Speed Compared to Ghostty</h3>
+
+        <figure>
+            <img src="velocitty-vs-ghostty.png" alt="Headless VT throughput: Velocitty exact and text skipping versus Ghostty 1.4.0 exact">
+            <figcaption>Velocitty worktree (<code>74fb03457bae-dirty</code>) in exact and <code>--drop</code> text-skipping modes versus ghostty-bench 1.4.0 exact, on an Intel i7-10610U. Median of five CPU-time runs on 2026-11-01, generated via <code>scripts/bench_vs_ghostty.py</code>; no rendering or window presentation.</figcaption>
+        </figure>
+
+
+        <p>The chart is a historical measurement snapshot, not a benchmark of every subsequent
+        runtime change. Its current grouped bars use independent, zero-based linear scales per workload:
+        compare bar lengths within a workload, not between different workloads. Redrawing the chart
+        does not rerun the measurements.</p>
+
+        <p>The compatible <code>+terminal-stream</code> mode in <code>velocitty-bench</code> compares
+        identical generated input, identical grid dimensions and CPU time (user + system), rather than
+        requiring equal execution time. Exact consumption and text-skipping results are labeled
+        separately. This controls the input differences that can arise when applications choose output
+        based on <code>TERM=xterm-256color</code> versus <code>xterm-ghostty</code>.</p>
+
+        <h2 id="feedback">Technical feedback</h2>
+
+        <p> Special thanks to Mitchell Hashimoto for the accurate and technical feedback. </p>
+        <div class="side">
+            <figure>
+                <img src="mitchell-post.png" alt="Mitchell Hashimoto's post on Velocitty 1.2.0">
+                <figcaption>Mitchell Hashimoto's critique of Velocitty 1.2.0.</figcaption>
+            </figure>
+            <figure>
+                <img src="mitchell-bench.jpeg" alt="VT processing throughput, Velocitty 1.2.1 vs Ghostty, M4 Max">
+                <figcaption>The benchmark attached to the post.</figcaption>
+            </figure>
+        </div>
+
+        <h2 id="changelog">Changelog</h2>
+
+        Besides the main redesign, a few other notable optimizations were made.
+
+        <h4>Performance and output handling</h4>
+        <ul>
+            <li>Bounded, reusable parser metadata and shared CSI parsing.</li>
+            <li>Direct stream-buffer reads and image-buffer handoff to reduce copying for large transfers.</li>
+            <li>SIMD UTF-8 decoding and bulk text-printing paths.</li>
+            <li>Reduced terminal cells to 8 bytes using shared, interned styles.</li>
+            <li>Style-table compaction and renderer invalidation when style IDs change.</li>
+        </ul>
+
+        I got the style table idea from ghostty.
+
+        <h4>Unicode and text</h4>
+        <ul>
+            <li>Unicode 18 grapheme-break tables.</li>
+            <li>Extended grapheme-cluster handling with mode 2027 support.</li>
+            <li>Improved combining marks, variation selectors, emoji sequences, and cluster-width changes at line boundaries.</li>
+            <li>Added combining-mark rendering and Hangul-jamo composition.</li>
+            <li>Updated selection and copying to preserve complete grapheme clusters.</li>
+            <li>Preserved clusters through insertion, deletion, erasure, and reflow.</li>
+        </ul>
+
+        <h4>Graphics</h4>
+        <ul>
+            <li>Anchored kitty and sixel images to scrollback lines.</li>
+            <li>Updated image placement handling for scrolling regions and history expiration.</li>
+            <li>Deferred image decoding until rendering.</li>
+            <li>Improved image-transfer ownership, cleanup, and retransmission handling.</li>
+            <li>Added support for image strings larger than the input ring.</li>
+            <li>Preserved anchors, blank-cell placements and the scrolled viewport through resize/reflow.</li>
+            <li>Corrected natural/scaled cursor advancement, pending wrap and sixel double-scrolling.</li>
+            <li>Retained named image data for re-placement after clears and lowercase deletion.</li>
+            <li>Added bounded, decode-independent cache accounting and unplaced-first eviction.</li>
+            <li>Refined visible/point/placement-ID deletion and cancellation of unfinished uploads.</li>
+        </ul>
+
+        <h4>Font loading</h4>
+        <ul>
+            <li>Resolve the configured primary or system monospace font without hardcoded preferred paths.</li>
+            <li>Load styled and fallback faces on demand, preserve fallback order, deduplicate data and cache failed lookups.</li>
+            <li>Keep valid blank glyphs from triggering unnecessary fallback loads during ASCII warmup.</li>
+            <li>Make rendering benchmarks follow application font selection and parser-only benchmarks font-free.</li>
+        </ul>
+
+        <h4>Correctness and input</h4>
+        <ul>
+            <li>Hardened paste handling against escape/control injection; allocation failures no longer fall back to raw input.</li>
+            <li>Fixed composed Unicode input under kitty’s all-keys reporting mode.</li>
+            <li>Fixed no-button mouse-motion reporting and urxvt mouse-button encoding.</li>
+            <li>Propagated resize allocation errors instead of silently publishing inconsistent dimensions.</li>
+            <li>Reaped Linux notification child processes and protected notification arguments with <code>--</code>.</li>
+            <li>Corrected raw C1-byte handling, reset behavior, and soft-wrap clearing during erasure.</li>
+        </ul>
+
+        <h4>Benchmarks and tests</h4>
+        <ul>
+            <li>Added Ghostty-compatible headless <code>+terminal-stream</code> benchmarking.</li>
+            <li>Added automated Ghostty throughput comparisons with raw samples and generated charts.</li>
+            <li>Changed the chart to grouped horizontal bars with independent, zero-based linear scales.</li>
+            <li>Added startup comparisons for Velocitty, foot, and Monstar.</li>
+            <li>Expanded parsing, graphics, drain, firehose, and rendering benchmark workloads.</li>
+            <li>Added configurable benchmark optimization and a <code>bench-install</code> target.</li>
+            <li>Added differential firehose tests, split-input sweeps, seeded fuzzing, and Unicode/rendering regressions.</li>
+            <li>Removed the obsolete standalone rendering/golden-test harness and older benchmark implementations.</li>
+        </ul>
+
+        <h4>Packaging and documentation</h4>
+        <ul>
+            <li>Consolidated icons, desktop metadata, and Windows resources under <code>assets/</code>.</li>
+            <li>Updated icon generation to use the canonical SVG.</li>
+            <li>Updated build, packaging, and installer asset paths.</li>
+            <li>Added Linux package Makefile installation/uninstallation with PREFIX and DESTDIR support.</li>
+            <li>Added design pages, benchmark imagery, storage diagrams and subsystem references.</li>
+            <li>Updated README branding, feature descriptions, Linux installation instructions, and the man page.</li>
+        </ul>
+
+        <h3>Regression coverage</h3>
+        <p>Automated checks cover bounded metadata reuse, oversized OSC/DCS/APC transport, split
+        terminators, stream-to-image ownership, exact-vs-pressure parsing, graphics redraw/reflow,
+        cached image reuse and lazy font loading. The stream cap is tested with reduced limits;
+        this is not a claim of a full 320 MiB stress run. PM/SOS framing lacks dedicated tests, and
+        live interactive resize behavior remains a separate manual check.</p>
+
+    </main>
+    </div>
+    </body>
+</html>

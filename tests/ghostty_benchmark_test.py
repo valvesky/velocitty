@@ -29,25 +29,53 @@ def fixture(skipping=True):
 
 
 class Charts(unittest.TestCase):
-    def test_three_icons_share_a_baseline_even_when_rates_coincide(self):
-        svg = bench.chart(fixture())
-        root = ET.fromstring(svg)
+    def test_equal_rates_have_separate_lanes_and_aligned_values(self):
+        root = ET.fromstring(bench.chart(fixture()))
         text = " ".join(root.itertext())
         for label in ("Velocitty exact", "Velocitty text skipping", "Ghostty", "--drop",
                       "no rendering/presentation", "Fixture CPU & <test>", "ASCII & UTF-8"):
             self.assertIn(label, text)
-        points = [c for c in root.findall("{*}use") if c.attrib["data-role"] == "point"]
-        self.assertEqual(len(points), 3)
-        self.assertEqual(len({c.attrib["x"] for c in points}), 1)
-        self.assertEqual(len({c.attrib["y"] for c in points}), 1)
-        self.assertEqual({c.attrib["data-series"] for c in points}, set(bench.SERIES))
-        self.assertIn("Exact: even", text)
-        self.assertIn("Skip text: even", text)
+        bars = root.findall('{*}rect[@data-role="bar"]')
+        self.assertEqual(len(bars), 3)
+        self.assertEqual(len({b.attrib["width"] for b in bars}), 1)
+        self.assertEqual(len({b.attrib["y"] for b in bars}), 3)
+        self.assertEqual({b.attrib["data-series"] for b in bars}, set(bench.SERIES))
+        values = [c for c in root.findall("{*}text") if c.text == "100.0 MB/s"]
+        self.assertEqual(len(values), 3)
+        self.assertEqual(len({c.attrib["x"] for c in values}), 1)
+        self.assertIn("reference", text)
+
+    def test_linear_bars_start_at_zero_and_preserve_rate_ratios(self):
+        for metric in ("cpu", "wall"):
+            with self.subTest(metric=metric):
+                result = fixture()
+                result["metric"] = metric
+                for key, rate in zip(bench.SERIES, (100, 200, 300)):
+                    result["rows"][0][key][f"{metric}_mbps"] = rate
+                root = ET.fromstring(bench.chart(result))
+                self.assertIn("linear scale from zero", " ".join(root.itertext()))
+                bars = root.findall('{*}rect[@data-role="bar"]')
+                self.assertEqual(len({b.attrib["x"] for b in bars}), 1)
+                widths = [float(b.attrib["width"]) for b in bars]
+                self.assertAlmostEqual(widths[1], 2 * widths[0], delta=0.2)
+                self.assertAlmostEqual(widths[2], 3 * widths[0], delta=0.2)
+
+    def test_each_workload_has_an_independent_linear_scale(self):
+        result = fixture()
+        other = fixture()["rows"][0]
+        for row, multiplier in ((result["rows"][0], 1), (other, 1000)):
+            for key, rate in zip(bench.SERIES, (100, 200, 300)):
+                row[key]["cpu_mbps"] = rate * multiplier
+        result["rows"].append(other)
+        root = ET.fromstring(bench.chart(result))
+        bars = root.findall('{*}rect[@data-role="bar"]')
+        self.assertEqual([b.attrib["width"] for b in bars[:3]],
+                         [b.attrib["width"] for b in bars[3:]])
+        self.assertIn("compare bar lengths within each workload only", " ".join(root.itertext()))
 
     def test_legacy_exact_only_results_still_render(self):
         root = ET.fromstring(bench.chart(fixture(skipping=False)))
-        points = [c for c in root.findall("{*}use") if c.attrib["data-role"] == "point"]
-        self.assertEqual(len(points), 2)
+        self.assertEqual(len(root.findall('{*}rect[@data-role="bar"]')), 2)
         self.assertNotIn("Velocitty text skipping", " ".join(root.itertext()))
 
     def test_embedded_icons_and_only_skip_lightning_is_inverted(self):

@@ -101,6 +101,7 @@ def package(version, triple, binary, output, *, portable_only=False, app_only=Fa
             subprocess.run(["hdiutil", "verify", str(archive)], check=True)
             print(f"wrote {archive}")
         elif "linux" in triple:
+            copy(ROOT / "scripts/linux-package.mk", root / "Makefile")
             copy(binary, root / "bin" / "velocitty", True)
             copy(ROOT / "assets/velocitty.desktop", root / "share/applications/velocitty.desktop")
             copy(ROOT / "assets/icon.png", root / "share/icons/hicolor/512x512/apps/velocitty.png")
