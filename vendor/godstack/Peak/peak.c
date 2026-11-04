@@ -314,7 +314,7 @@ void
 peak_window_present_rect(PeakWindow *win, uint32_t y, uint32_t h)
 {
     if (!win) return;
-#if defined(PEAK_LINUX)
+#if defined(PEAK_LINUX) || defined(PEAK_WIN32)
     peak_platform_window_present_rect(&win->internal, y, h);
 #else
     (void)y;
@@ -329,6 +329,21 @@ peak_window_set_title(PeakWindow *win, const char *name)
     if (!win || !name)
         return;
     peak_platform_window_set_title(&win->internal, name);
+}
+
+void
+peak_window_set_text_input_rect(PeakWindow *win, int x, int y, int w, int h)
+{
+    if (!win)
+        return;
+#if defined(PEAK_MACOS) || defined(PEAK_WIN32)
+    peak_platform_window_set_text_input_rect(&win->internal, x, y, w, h);
+#else
+    (void)x;
+    (void)y;
+    (void)w;
+    (void)h;
+#endif
 }
 
 void
@@ -394,6 +409,17 @@ peak_window_scale(PeakWindow *win)
     if (!win)
         return 1.f;
     return peak_platform_window_scale(&win->internal);
+}
+
+unsigned
+peak_window_refresh_rate(PeakWindow *win)
+{
+#if defined(PEAK_MACOS)
+    return win ? peak_platform_window_refresh_rate(&win->internal) : 0;
+#else
+    (void)win;
+    return 0;
+#endif
 }
 
 #ifdef PEAK_WEB

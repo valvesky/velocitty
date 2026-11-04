@@ -13,6 +13,7 @@
 /* windows.h must precede mmsystem.h */
 #include <windows.h>
 #include <shellapi.h>
+#include <imm.h>
 #include <mmsystem.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -125,10 +126,15 @@ typedef struct {
 	HMODULE user32;
 	HMODULE gdi32;
 	int class_reg;
+	int timer_period;
 } PeakWin32;
 
 struct peak_win32_win {
     WCHAR high_surrogate;
+	int ime_x, ime_y, ime_w, ime_h;
+	int ime_set;
+	int ime_applied;
+	int ime_ax, ime_ay, ime_aw, ime_ah;
 	HWND hwnd;
 	HDC hdc;
 	uint32_t *buffer;
@@ -138,6 +144,7 @@ struct peak_win32_win {
 	int cursor_on;
 	int relative;
 	int layered;
+	int wheel_acc;
 	int touch_n;
 	float last_x, last_y;
 	WINDOWPLACEMENT place;
@@ -158,6 +165,9 @@ static PeakWindowInternal peak_platform_window_open(const char *name, uint32_t w
 static void peak_platform_window_close(PeakWindowInternal *intern);
 static uint32_t *peak_platform_window_buffer(PeakWindowInternal *intern, size_t *width, size_t *height);
 static void peak_platform_window_present(PeakWindowInternal *intern);
+static void peak_platform_window_present_rect(PeakWindowInternal *intern, uint32_t y, uint32_t h);
+static void peak_internal_win32_timer_begin(void);
+static void peak_internal_win32_timer_end(void);
 static bool peak_platform_epoll(PeakWindowInternal *intern, PeakEvent *ev);
 static int peak_platform_fd(PeakWindowInternal *intern);
 static int peak_platform_pending(PeakWindowInternal *intern);
@@ -171,6 +181,8 @@ static void peak_platform_sleep_ns(int64_t ns);
 static const char **peak_platform_vulkan_get_extensions(uint32_t *count);
 static int peak_platform_vulkan_create_surface(PeakWindowInternal *intern, void *instance, const void *allocator, void *out_surface);
 static void peak_platform_window_set_title(PeakWindowInternal *intern, const char *name);
+static void peak_platform_window_set_text_input_rect(PeakWindowInternal *intern, int x, int y, int w, int h);
+static void peak_internal_win32_ime_apply(struct peak_win32_win *w, int force);
 static void peak_platform_window_set_size(PeakWindowInternal *intern, uint32_t width, uint32_t height);
 static void peak_platform_window_fullscreen(PeakWindowInternal *intern, int on);
 static void peak_platform_window_cursor(PeakWindowInternal *intern, int on);
@@ -186,6 +198,11 @@ static PeakAudio peak_audio;
 static void (WINAPI *peak_DragAcceptFiles)(HWND, BOOL);
 static UINT (WINAPI *peak_DragQueryFileA)(HDROP, UINT, LPSTR, UINT);
 static void (WINAPI *peak_DragFinish)(HDROP);
+static HIMC (WINAPI *peak_ImmGetContext)(HWND);
+static BOOL (WINAPI *peak_ImmReleaseContext)(HWND, HIMC);
+static BOOL (WINAPI *peak_ImmSetCompositionWindow)(HIMC, LPCOMPOSITIONFORM);
+static BOOL (WINAPI *peak_ImmSetCandidateWindow)(HIMC, LPCANDIDATEFORM);
+static int peak_imm_tried;
 
 static int
 peak_internal_user32_load(HMODULE handle)
@@ -345,6 +362,9 @@ peak_internal_win32_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 	case WM_KEYUP: /* FALLTHROUGH */
 	case WM_SYSKEYDOWN: /* FALLTHROUGH */
 	case WM_SYSKEYUP:
+		/* Alt+F4 (close) and Alt+Space (system menu) belong to the system. */
+		if ((msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP) && (wparam == VK_F4 || wparam == VK_SPACE))
+			return peak_user32.DefWindowProcW(hwnd, msg, wparam, lparam);
 		memset(&ev, 0, sizeof ev);
 		ev.type = (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) ? PEAK_EVENT_KEY_DOWN : PEAK_EVENT_KEY_UP;
 		ev.key.key = peak_internal_win32_key_map(wparam);
@@ -358,6 +378,11 @@ peak_internal_win32_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
             ev.key.mod &= ~(PEAK_KEYMOD_CTRL | PEAK_KEYMOD_ALT);
 		peak_q_push(&w->q, ev);
 		return 0;
+	case WM_SYSCHAR:
+		/* The key already arrived via WM_SYSKEYDOWN; swallow to avoid the beep. */
+		if (wparam == ' ')
+			return peak_user32.DefWindowProcW(hwnd, msg, wparam, lparam);
+		return 0;
     case WM_CHAR: {
         WCHAR chars[2];
         char utf8[8];
@@ -370,7 +395,7 @@ peak_internal_win32_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
         }
         w->high_surrogate = 0;
         n = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, chars, count, utf8, sizeof utf8, NULL, NULL);
-        if (n > 0 && ch >= 32) peak_q_text(&w->q, utf8, (size_t)n);
+        if (n > 0 && ch >= 32 && ch != 0x7f) peak_q_text(&w->q, utf8, (size_t)n);
         return 0;
     }
     case 0x02e0: { /* WM_DPICHANGED */
@@ -378,18 +403,30 @@ peak_internal_win32_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
         peak_user32.SetWindowPos(hwnd, NULL, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
         return 0;
     }
-	case WM_MOUSEWHEEL:
-		memset(&ev, 0, sizeof ev);
-		ev.type = PEAK_EVENT_POINTER;
-		ev.pointer.state = PEAK_POINTER_PRESSED;
-		ev.pointer.type = ((short)HIWORD(wparam) > 0) ? PEAK_POINTER_WHEEL_UP : PEAK_POINTER_WHEEL_DOWN;
-		POINT pt = { (short)LOWORD(lparam), (short)HIWORD(lparam) };
-        peak_user32.ScreenToClient(hwnd, &pt);
-        ev.pointer.x = (float)pt.x;
-        ev.pointer.y = (float)pt.y;
-        ev.pointer.mod = peak_internal_win32_mod_map();
-		peak_q_push(&w->q, ev);
+	case WM_MOUSEWHEEL: {
+		POINT pt;
+		int delta;
+
+		delta = (int)(short)HIWORD(wparam);
+		if ((delta > 0 && w->wheel_acc < 0) || (delta < 0 && w->wheel_acc > 0))
+			w->wheel_acc = 0;
+		w->wheel_acc += delta;
+		pt.x = (short)LOWORD(lparam);
+		pt.y = (short)HIWORD(lparam);
+		peak_user32.ScreenToClient(hwnd, &pt);
+		while (w->wheel_acc >= WHEEL_DELTA || w->wheel_acc <= -WHEEL_DELTA) {
+			memset(&ev, 0, sizeof ev);
+			ev.type = PEAK_EVENT_POINTER;
+			ev.pointer.state = PEAK_POINTER_PRESSED;
+			ev.pointer.type = (w->wheel_acc > 0) ? PEAK_POINTER_WHEEL_UP : PEAK_POINTER_WHEEL_DOWN;
+			ev.pointer.x = (float)pt.x;
+			ev.pointer.y = (float)pt.y;
+			ev.pointer.mod = peak_internal_win32_mod_map();
+			peak_q_push(&w->q, ev);
+			w->wheel_acc += (w->wheel_acc > 0) ? -WHEEL_DELTA : WHEEL_DELTA;
+		}
 		return 0;
+	}
 	case WM_DROPFILES:
 		if (peak_DragQueryFileA) {
 			char path[MAX_PATH];
@@ -430,10 +467,14 @@ peak_internal_win32_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 			                  (wparam & MK_MBUTTON) ? PEAK_POINTER_MIDDLE : PEAK_POINTER_LEFT;
 		} else if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN) {
 			ev.pointer.state = PEAK_POINTER_PRESSED;
+			if (peak_user32.SetCapture)
+				peak_user32.SetCapture(hwnd);
 			ev.pointer.type = (msg == WM_RBUTTONDOWN) ? PEAK_POINTER_RIGHT :
 			                  (msg == WM_MBUTTONDOWN) ? PEAK_POINTER_MIDDLE : PEAK_POINTER_LEFT;
 		} else {
 			ev.pointer.state = PEAK_POINTER_RELEASED;
+			if (!w->relative && !(wparam & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON)) && peak_user32.ReleaseCapture)
+				peak_user32.ReleaseCapture();
 			ev.pointer.type = (msg == WM_RBUTTONUP) ? PEAK_POINTER_RIGHT :
 			                  (msg == WM_MBUTTONUP) ? PEAK_POINTER_MIDDLE : PEAK_POINTER_LEFT;
 		}
@@ -452,6 +493,9 @@ peak_internal_win32_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 			w->last_y = (float)((rc.bottom - rc.top) / 2);
 		}
 		return 0;
+	case WM_IME_STARTCOMPOSITION:
+		peak_internal_win32_ime_apply(w, 1);
+		return peak_user32.DefWindowProcW(hwnd, msg, wparam, lparam);
     case WM_SETFOCUS:
     case WM_KILLFOCUS:
         memset(&ev, 0, sizeof ev);
@@ -484,6 +528,7 @@ peak_platform_init(void)
 {
 	WNDCLASSEXW wc;
 
+	peak_internal_win32_timer_begin();
 	if (!peak_user32.CreateWindowExW) {
 		if (!(peak_win32.user32 = LoadLibraryA(PEAK_WIN32_USER32))) {
 			fputs("Failed to load user32.dll. What system are you fucking using and abusing?", stderr);
@@ -534,8 +579,42 @@ peak_platform_init(void)
 }
 
 static void
+peak_internal_win32_timer_begin(void)
+{
+	typedef UINT (WINAPI *TimerFn)(UINT);
+	HMODULE mm;
+	TimerFn fn;
+
+	if (peak_win32.timer_period)
+		return;
+	if (!(mm = LoadLibraryA(PEAK_WIN32_WINMM)))
+		return;
+	fn = (TimerFn)(void *)GetProcAddress(mm, "timeBeginPeriod");
+	if (fn && fn(1) == 0)
+		peak_win32.timer_period = 1;
+}
+
+static void
+peak_internal_win32_timer_end(void)
+{
+	typedef UINT (WINAPI *TimerFn)(UINT);
+	HMODULE mm;
+	TimerFn fn;
+
+	if (!peak_win32.timer_period)
+		return;
+	peak_win32.timer_period = 0;
+	if (!(mm = GetModuleHandleA(PEAK_WIN32_WINMM)))
+		return;
+	fn = (TimerFn)(void *)GetProcAddress(mm, "timeEndPeriod");
+	if (fn)
+		fn(1);
+}
+
+static void
 peak_platform_quit(void)
 {
+	peak_internal_win32_timer_end();
 	if (!peak_win32.class_reg)
 		return;
 	peak_user32.UnregisterClassW(PEAK_WIN32_CLASS, GetModuleHandleA(NULL));
@@ -703,6 +782,46 @@ peak_platform_window_present(PeakWindowInternal *intern)
 		w->buffer, &bmi, DIB_RGB_COLORS, SRCCOPY);
 }
 
+static void
+peak_internal_win32_blit_rows(struct peak_win32_win *w, uint32_t x, uint32_t y, uint32_t cw, uint32_t h)
+{
+	BITMAPINFO bmi;
+
+	if (x >= w->width || y >= w->height || !cw || !h)
+		return;
+	if (cw > w->width - x)
+		cw = w->width - x;
+	if (h > w->height - y)
+		h = w->height - y;
+	memset(&bmi, 0, sizeof bmi);
+	bmi.bmiHeader.biSize = sizeof (BITMAPINFOHEADER);
+	bmi.bmiHeader.biWidth = (LONG)w->width;
+	bmi.bmiHeader.biHeight = -(LONG)h;
+	bmi.bmiHeader.biPlanes = 1;
+	bmi.bmiHeader.biBitCount = 32;
+	bmi.bmiHeader.biCompression = BI_RGB;
+	/* Bits start at row y; the DIB is h rows tall, so source rows are 0..h. */
+	peak_gdi32.StretchDIBits(w->hdc,
+		(int)x, (int)y, (int)cw, (int)h,
+		(int)x, 0, (int)cw, (int)h,
+		w->buffer + (size_t)y * w->width, &bmi, DIB_RGB_COLORS, SRCCOPY);
+}
+
+static void
+peak_platform_window_present_rect(PeakWindowInternal *intern, uint32_t y, uint32_t h)
+{
+	struct peak_win32_win *w;
+
+	w = intern ? intern->w : NULL;
+	if (!w || !w->hwnd || !w->hdc || !w->buffer)
+		return;
+	if (w->layered) {
+		peak_platform_window_present(intern);
+		return;
+	}
+	peak_internal_win32_blit_rows(w, 0, y, w->width, h);
+}
+
 static int
 peak_platform_drop_drag(PeakWindowInternal *intern, const char *utf8, size_t n)
 {
@@ -839,7 +958,19 @@ peak_platform_epoll(PeakWindowInternal *intern, PeakEvent *ev)
 	if (!w || !w->hwnd)
 		return 0;
 
-	while (peak_user32.PeekMessageW(&msg, w->hwnd, 0, 0, PM_REMOVE)) {
+	if (peak_q_pop(&w->q, ev))
+		return 1;
+	while (peak_user32.PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+		if (msg.message == WM_QUIT) {
+			PeakEvent close;
+
+			memset(&close, 0, sizeof close);
+			close.type = PEAK_EVENT_WINDOW_CLOSE;
+			peak_q_push(&w->q, close);
+			if (peak_q_pop(&w->q, ev))
+				return 1;
+			continue;
+		}
 		peak_user32.TranslateMessage(&msg);
 		peak_user32.DispatchMessageW(&msg);
 		if (peak_q_pop(&w->q, ev))
@@ -866,7 +997,7 @@ peak_platform_pending(PeakWindowInternal *intern)
 		return 0;
 	if (w->q.n)
 		return (int)w->q.n;
-	if (peak_user32.PeekMessageW && peak_user32.PeekMessageW(&msg, w->hwnd, 0, 0, PM_NOREMOVE))
+	if (peak_user32.PeekMessageW && peak_user32.PeekMessageW(&msg, NULL, 0, 0, PM_NOREMOVE))
 		return 1;
 	return 0;
 }
@@ -1185,6 +1316,76 @@ peak_platform_window_scale(PeakWindowInternal *intern)
     GetDpiFn get_dpi = (GetDpiFn)GetProcAddress(GetModuleHandleA("user32.dll"), "GetDpiForWindow");
     UINT dpi = (w && get_dpi) ? get_dpi(w->hwnd) : 96;
     return dpi ? (float)dpi / 96.f : 1.f;
+}
+
+static void
+peak_internal_win32_ime_apply(struct peak_win32_win *w, int force)
+{
+	HIMC imc;
+	COMPOSITIONFORM cf;
+	CANDIDATEFORM df;
+
+	if (!w || !w->hwnd || !w->ime_set)
+		return;
+	if (!peak_imm_tried) {
+		HMODULE imm;
+
+		peak_imm_tried = 1;
+		imm = LoadLibraryA("imm32.dll");
+		if (imm) {
+			peak_ImmGetContext = (HIMC (WINAPI *)(HWND))(void *)GetProcAddress(imm, "ImmGetContext");
+			peak_ImmReleaseContext = (BOOL (WINAPI *)(HWND, HIMC))(void *)GetProcAddress(imm, "ImmReleaseContext");
+			peak_ImmSetCompositionWindow = (BOOL (WINAPI *)(HIMC, LPCOMPOSITIONFORM))(void *)GetProcAddress(imm, "ImmSetCompositionWindow");
+			peak_ImmSetCandidateWindow = (BOOL (WINAPI *)(HIMC, LPCANDIDATEFORM))(void *)GetProcAddress(imm, "ImmSetCandidateWindow");
+		}
+	}
+	if (!peak_ImmGetContext || !peak_ImmReleaseContext || !peak_ImmSetCompositionWindow || !peak_ImmSetCandidateWindow)
+		return;
+	if (!force && w->ime_applied && w->ime_ax == w->ime_x && w->ime_ay == w->ime_y &&
+	    w->ime_aw == w->ime_w && w->ime_ah == w->ime_h)
+		return;
+	imc = peak_ImmGetContext(w->hwnd);
+	if (!imc)
+		return;
+	memset(&cf, 0, sizeof cf);
+	cf.dwStyle = CFS_POINT;
+	cf.ptCurrentPos.x = w->ime_x;
+	cf.ptCurrentPos.y = w->ime_y;
+	peak_ImmSetCompositionWindow(imc, &cf);
+	memset(&df, 0, sizeof df);
+	df.dwIndex = 0;
+	df.dwStyle = CFS_EXCLUDE;
+	df.ptCurrentPos.x = w->ime_x;
+	df.ptCurrentPos.y = w->ime_y + w->ime_h;
+	df.rcArea.left = w->ime_x;
+	df.rcArea.top = w->ime_y;
+	df.rcArea.right = w->ime_x + w->ime_w;
+	df.rcArea.bottom = w->ime_y + w->ime_h;
+	peak_ImmSetCandidateWindow(imc, &df);
+	peak_ImmReleaseContext(w->hwnd, imc);
+	w->ime_applied = 1;
+	w->ime_ax = w->ime_x;
+	w->ime_ay = w->ime_y;
+	w->ime_aw = w->ime_w;
+	w->ime_ah = w->ime_h;
+}
+
+static void
+peak_platform_window_set_text_input_rect(PeakWindowInternal *intern, int x, int y, int w, int h)
+{
+	struct peak_win32_win *win;
+
+	win = intern ? intern->w : NULL;
+	if (!win || !win->hwnd)
+		return;
+	if (win->ime_set && win->ime_x == x && win->ime_y == y && win->ime_w == w && win->ime_h == h)
+		return;
+	win->ime_x = x;
+	win->ime_y = y;
+	win->ime_w = w;
+	win->ime_h = h;
+	win->ime_set = 1;
+	peak_internal_win32_ime_apply(win, 0);
 }
 
 #include "p_win32_proc.c"

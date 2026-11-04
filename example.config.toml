@@ -2,7 +2,12 @@
 # Linux: ~/.config/velocitty/config.toml
 # Windows: %APPDATA%/velocitty/config.toml
 # macOS: ~/Library/Application Support/velocitty/config.toml
-# XDG_CONFIG_HOME overrides these locations when set.
+# The first file that exists is used, in this order:
+#   1. $XDG_CONFIG_HOME/velocitty/config.toml (when set)
+#   2. the platform location above (Windows/macOS)
+#   3. ~/.config/velocitty/config.toml (Windows: %USERPROFILE%\.config or %HOME%\.config)
+# If the file cannot be parsed, the error and line are shown in the window when
+# there is no terminal (Windows, macOS app launch) and printed to stderr.
 # On Linux, Omarchy theme colors overlay this palette when a current theme is present.
 foreground = "#ebdbb2"
 background = "#282828"
@@ -41,5 +46,5 @@ family = "monospace"
 # fallbacks = ["Symbols Nerd Font Mono"]
 fallbacks = []
 # Point size. Omit to use Alacritty's size, then 9 pt with an Omarchy theme,
-# or 8 pt otherwise.
+# or 8 pt otherwise on Linux. Windows and macOS default to 12 pt.
 size = 16

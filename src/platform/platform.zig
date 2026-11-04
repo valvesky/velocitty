@@ -179,6 +179,10 @@ pub const Window = struct {
         return self.impl.win.scale();
     }
 
+    pub fn refreshRate(self: *Window) u32 {
+        return self.impl.win.refreshRate();
+    }
+
     pub fn eventsPending(self: *Window) bool {
         return self.impl.eventsPending();
     }
@@ -210,6 +214,10 @@ pub const Window = struct {
 
     pub fn setTitle(self: *Window, title: [:0]const u8) void {
         self.impl.setTitle(title);
+    }
+
+    pub fn setTextInputRect(self: *Window, x: i32, y: i32, w: i32, h: i32) void {
+        self.impl.setTextInputRect(x, y, w, h);
     }
 
     pub fn setClass(self: *Window, class: [:0]const u8) void {
@@ -350,6 +358,10 @@ const PeakWindow = struct {
 
     pub fn setTitle(self: *PeakWindow, title: [:0]const u8) void {
         self.win.setTitle(title);
+    }
+
+    pub fn setTextInputRect(self: *PeakWindow, x: i32, y: i32, w: i32, h: i32) void {
+        self.win.setTextInputRect(x, y, w, h);
     }
 
     pub fn setClass(self: *PeakWindow, class: [:0]const u8) void {

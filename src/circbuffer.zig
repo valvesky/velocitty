@@ -148,10 +148,23 @@ pub const CircBuffer = struct {
 
     /// Source read contract.
     pub fn readSource(self: *CircBuffer, source: anytype, hz: u32, pump: ?Pump, sink: ?Sink) error{Hangup}!void {
+        return self.readSourceImpl(source, hz, pump, sink, false);
+    }
+
+    /// Flush the first burst after an idle wait promptly; continuous output
+    /// remains frame-paced and still uses pressure draining.
+    pub fn readSourceInteractive(self: *CircBuffer, source: anytype, hz: u32, pump: ?Pump, sink: ?Sink) error{Hangup}!void {
+        return self.readSourceImpl(source, hz, pump, sink, true);
+    }
+
+    fn readSourceImpl(self: *CircBuffer, source: anytype, hz: u32, pump: ?Pump, sink: ?Sink, comptime interactive: bool) error{Hangup}!void {
         const rate: u32 = if (hz == 0) 30 else hz;
         const period_ns: i128 = @divTrunc(1_000_000_000, rate);
         const start_ns = nowNs();
         const mask = self.capacity - 1;
+        var idle = false;
+        var read_any = false;
+        var read_after_idle = false;
 
         while (true) {
 
@@ -180,6 +193,8 @@ pub const CircBuffer = struct {
             }
             const n = source.read(dest) catch |err| switch (err) {
                 error.WouldBlock => {
+                    if (interactive and read_after_idle) return;
+                    if (interactive and !read_any) idle = true;
                     const elapsed = nowNs() - start_ns;
                     if (elapsed >= period_ns) return;
                     // Never poll(0): a readable X fd plus 0ms timeout busy-loops.
@@ -192,7 +207,7 @@ pub const CircBuffer = struct {
                         // Motion/XI floods keep the X fd readable so poll returns
                         // immediately. Sleep on the PTY only for the rest of the
                         // frame instead of spinning at 100% CPU.
-                        if (nowNs() - t0 < 200_000) {
+                        if ((builtin.os.tag != .macos or p.fd >= 0) and nowNs() - t0 < 200_000) {
                             const elapsed2 = nowNs() - start_ns;
                             if (elapsed2 >= period_ns) return;
                             const rest = period_ns - elapsed2;
@@ -207,6 +222,8 @@ pub const CircBuffer = struct {
                 else => return error.Hangup,
             };
             if (n == 0) return error.Hangup;
+            if (interactive) read_any = true;
+            if (interactive and idle) read_after_idle = true;
             if (direct != null) {
                 self.streamRead(n);
                 continue;
@@ -843,6 +860,62 @@ fn expectSameRuns(a: []const Run, b: []const Run) !void {
         try std.testing.expectEqual(x.flags, y.flags);
         try std.testing.expectEqual(x.len, y.len);
     }
+}
+
+test "interactive source flushes the first burst after an idle wait" {
+    const Source = struct {
+        step: u8 = 0,
+        waits: u32 = 0,
+
+        pub fn read(s: *@This(), dest: []u8) error{ WouldBlock, Hangup }!usize {
+            if (s.step != 1) return error.WouldBlock;
+            s.step = 2;
+            @memcpy(dest[0..5], "hello");
+            return 5;
+        }
+
+        pub fn wait(s: *@This(), _: ?c_int, _: c_int) void {
+            s.waits += 1;
+            s.step = 1;
+        }
+    };
+    var buffer = try CircBuffer.create(std.testing.allocator, 1024);
+    defer buffer.destroy();
+    var source: Source = .{};
+    try buffer.readSourceInteractive(&source, 1, null, null);
+    try std.testing.expectEqual(@as(u32, 1), source.waits);
+    try std.testing.expectEqualStrings("hello", buffer.storage[0..5]);
+    try std.testing.expect(buffer.pending());
+}
+
+test "interactive source keeps already active output frame-paced" {
+    const Source = struct {
+        step: u8 = 0,
+        waits: u32 = 0,
+        until: i128,
+
+        pub fn read(s: *@This(), dest: []u8) error{ WouldBlock, Hangup }!usize {
+            if (s.step != 0 and s.step != 2) return error.WouldBlock;
+            dest[0] = if (s.step == 0) 'a' else 'b';
+            s.step += 1;
+            return 1;
+        }
+
+        pub fn wait(s: *@This(), _: ?c_int, _: c_int) void {
+            s.waits += 1;
+            if (s.step == 1) {
+                s.step = 2;
+            } else {
+                while (nowNs() < s.until) std.atomic.spinLoopHint();
+            }
+        }
+    };
+    var buffer = try CircBuffer.create(std.testing.allocator, 1024);
+    defer buffer.destroy();
+    var source: Source = .{ .until = nowNs() + 60_000_000 };
+    try buffer.readSourceInteractive(&source, 20, null, null);
+    try std.testing.expect(source.waits >= 2);
+    try std.testing.expectEqualStrings("ab", buffer.storage[0..2]);
 }
 
 test "readSource pressure leaves the final input for normal span consumption" {

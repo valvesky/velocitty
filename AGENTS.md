@@ -24,7 +24,7 @@
 - `python3 tests/package_test.py`: package layout checks.
 - Linux inline checks (musl avoids host GNU CRT `.sframe` issues):
   ```sh
-  zig test src/main.zig src/type/stb_truetype.c src/stb_image.c -Ilib -lc -target x86_64-linux-musl
+  zig test src/main.zig src/type/stb_truetype.c src/stb_image.c src/platform/font.c -Ilib -lc -target x86_64-linux-musl
   zig test src/firehose_test.zig src/stb_image.c -Ilib -lc -target x86_64-linux-musl
   ```
 - Select targeted checks from the testing reference. Rendering regressions live inline in `src/draw.zig`; there is no standalone golden/render harness.
