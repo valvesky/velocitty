@@ -127,9 +127,18 @@ Windows
 .IR %APPDATA%/velocitty/config.toml ,
 or macOS
 .IR "~/Library/Application Support/velocitty/config.toml" .
-If set,
+Windows and macOS also read
+.I ~/.config/velocitty/config.toml
+(Windows:
+.I %USERPROFILE%/.config
+or
+.IR %HOME%/.config )
+when the platform file does not exist. Only the first existing file in this
+order is used: if set,
 .I $XDG_CONFIG_HOME/velocitty/config.toml
-overrides the platform location.
+then the platform location, then the ~/.config location. A config that fails to
+parse is skipped; the file and line are printed to stderr and, when stderr is
+not a terminal (Windows GUI build, macOS app launch), shown in the window.
 .IP 2.
 .I ./config.toml
 in the current working directory
@@ -146,7 +155,7 @@ is still unset, size is taken from
 .IR ~/.config/alacritty/alacritty.toml ,
 then 9 pt if the current Omarchy theme's
 .I colors.toml
-exists, otherwise 8 pt. The default family is
+exists, otherwise 8 pt (12 pt on Windows and macOS). The default family is
 .BR monospace :
 fontconfig
 .RB ( "omarchy font current" )
@@ -210,7 +219,7 @@ SIGUSR1 or SIGUSR2, or let the config watcher detect the change.
 .BR size " / " font_size
 Point size. Default: Alacritty config, else 9 pt if the current Omarchy theme's
 .I colors.toml
-exists, else 8 pt.
+exists, else 8 pt. On Windows and macOS the unset default is 12 pt.
 .PP
 Example:
 .PP
@@ -267,6 +276,11 @@ is not given.
 .B APPDATA
 Windows user-config root; USERPROFILE/AppData/Roaming is the fallback.
 .TP
+.B USERPROFILE ", " HOME
+Windows: home for the
+.I .config/velocitty/config.toml
+fallback. macOS: HOME locates both the Library and .config locations.
+.TP
 .B GDK_SCALE ", " QT_SCALE_FACTOR
 Linux UI scale fallback when Hyprland scale is unavailable.
 .TP
@@ -296,8 +310,11 @@ Windows user configuration.
 .TP
 .I "~/Library/Application Support/velocitty/config.toml"
 macOS user configuration.
+.TP
+.I ~/.config/velocitty/config.toml
+Also read on Windows (under %USERPROFILE% or %HOME%) and macOS when the platform file is absent.
 .PP
-XDG_CONFIG_HOME overrides the platform user-config root.
+XDG_CONFIG_HOME takes priority over the platform user-config root.
 .TP
 .I $XDG_STATE_HOME/omarchy/current/theme/colors.toml
 .TQ

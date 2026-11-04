@@ -5,6 +5,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <locale.h>
 #include <linux/joystick.h>
 #ifndef PEAK_NO_AUDIO
 #include <pthread.h>
@@ -54,6 +55,17 @@
 	X(XPutBackEvent,       void, (Display *, XEvent *)) \
 	X(XPending,            int, (Display *)) \
 	X(XLookupKeysym,       KeySym, (XKeyEvent *, int)) \
+	X(XOpenIM, XIM, (Display *, struct _XrmHashBucketRec *, char *, char *)) \
+	X(XCloseIM, Status, (XIM)) \
+	X(XCreateIC, XIC, (XIM, ...)) \
+	X(XDestroyIC, void, (XIC)) \
+	X(XGetICValues, char *, (XIC, ...)) \
+	X(XSetICFocus, void, (XIC)) \
+	X(XUnsetICFocus, void, (XIC)) \
+	X(XFilterEvent, Bool, (XEvent *, Window)) \
+	X(Xutf8LookupString, int, (XIC, XKeyPressedEvent *, char *, int, KeySym *, Status *)) \
+	X(XSupportsLocale, Bool, (void)) \
+	X(XSetLocaleModifiers, char *, (const char *)) \
 	X(XLookupString,       int, (XKeyEvent *, char *, int, KeySym *, XComposeStatus *)) \
 	X(XPutImage,           int, (Display *, Drawable, GC, XImage *, int, int, int, int, unsigned int, unsigned int)) \
 	X(XSetSelectionOwner,  int, (Display *, Atom, Window, Time)) \
@@ -97,8 +109,11 @@ typedef struct {
 } PeakPaSampleSpec;
 #endif
 
+struct peak_linux_win;
 typedef struct {
 	Display *display;
+	XIM im;
+	struct peak_linux_win *windows;
 	Atom wm_delete_window;
 	Atom clip_clipboard;
 	Atom clip_utf8;
@@ -136,7 +151,11 @@ typedef struct {
 #endif
 
 struct peak_linux_win {
+	struct peak_linux_win *next;
 	Window window;
+	XIC ic;
+	char *text_pending;
+	size_t text_n, text_off;
 	GC gfx_ctx;
 	XImage *ximage;
 	Visual *visual;
@@ -168,6 +187,7 @@ static char *peak_clip_incr;
 static size_t peak_clip_incr_n;
 static PeakClip peak_clip_incr_which;
 static int peak_clip_incr_on;
+static Atom peak_clip_incr_type;
 static PeakClip peak_clip_req_which;
 static int peak_clip_req_on;
 static int peak_clip_req_xa;
@@ -215,13 +235,13 @@ peak_internal_x11_key_map(KeySym sym)
 	if (sym >= XK_0 && sym <= XK_9)
 		return (PeakKeyCode)(PEAK_KEY_0 + (int)(sym - XK_0));
 	switch (sym) {
-	case XK_Up: return PEAK_KEY_UP;
-	case XK_Down: return PEAK_KEY_DOWN;
-	case XK_Left: return PEAK_KEY_LEFT;
-	case XK_Right: return PEAK_KEY_RIGHT;
+	case XK_KP_Up: case XK_Up: return PEAK_KEY_UP;
+	case XK_KP_Down: case XK_Down: return PEAK_KEY_DOWN;
+	case XK_KP_Left: case XK_Left: return PEAK_KEY_LEFT;
+	case XK_KP_Right: case XK_Right: return PEAK_KEY_RIGHT;
 	case XK_space: return PEAK_KEY_SPACE;
 	case XK_Escape: return PEAK_KEY_ESCAPE;
-	case XK_Return: return PEAK_KEY_ENTER;
+	case XK_KP_Enter: case XK_Return: return PEAK_KEY_ENTER;
 	case XK_BackSpace: return PEAK_KEY_BACKSPACE;
 	case XK_Tab:
 	case XK_ISO_Left_Tab: return PEAK_KEY_TAB;
@@ -279,33 +299,90 @@ peak_internal_x11_window_match(Display *dpy, XEvent *ev, XPointer arg)
 	return ev->xany.window == *(Window *)arg;
 }
 
+/* The predicate must not call Xlib. Filtering happens only after removal. */
+static Bool
+peak_internal_x11_any_event(Display *display, XEvent *event, XPointer arg)
+{
+	(void)display; (void)event; (void)arg;
+	return True;
+}
+
+static int
+peak_linux_other_window(struct peak_linux_win *w, Window window)
+{
+	struct peak_linux_win *p;
+	for (p = peak_linux.windows; p; p = p->next)
+		if (p != w && p->window == window) return 1;
+	return 0;
+}
+
+/* Scan private XIM traffic while retaining unrelated events in queue order.
+ * A client event is filtered only immediately before its dispatch; in
+ * particular, pending() must never advance compose state for a client key. */
+static int
+peak_linux_next_event(struct peak_linux_win *w, XEvent *out, int dispatch)
+{
+	XEvent *held = NULL, event;
+	size_t n = 0, cap = 0;
+	int found = 0, remaining;
+	if (!peak_linux.im || !peak_x11.XPending || !peak_x11.XPutBackEvent) {
+		int got = peak_x11.XCheckIfEvent(peak_linux.display, out, peak_internal_x11_window_match, (XPointer)&w->window);
+		if (got && !dispatch && peak_x11.XPutBackEvent) peak_x11.XPutBackEvent(peak_linux.display, out);
+		return got;
+	}
+	remaining = peak_x11.XPending(peak_linux.display);
+	while (remaining-- > 0) {
+		if (!peak_x11.XCheckIfEvent(peak_linux.display, &event, peak_internal_x11_any_event, NULL)) break;
+		if (event.xany.window == w->window) {
+			if (dispatch && peak_x11.XFilterEvent(&event, None)) {
+				remaining = peak_x11.XPending(peak_linux.display);
+				continue;
+			}
+			*out = event;
+			found = 1;
+			break;
+		}
+		if (!peak_linux_other_window(w, event.xany.window) &&
+			!((event.type == KeyPress || event.type == KeyRelease) && event.xkey.keycode != 0) &&
+			peak_x11.XFilterEvent(&event, None)) {
+			remaining = peak_x11.XPending(peak_linux.display);
+			continue;
+		}
+		if (n == cap) {
+			size_t new_cap = cap ? cap * 2 : 16;
+			XEvent *next = realloc(held, new_cap * sizeof *held);
+			if (!next) { peak_x11.XPutBackEvent(peak_linux.display, &event); break; }
+			held = next; cap = new_cap;
+		}
+		held[n++] = event;
+	}
+	if (found && !dispatch) peak_x11.XPutBackEvent(peak_linux.display, out);
+	while (n) peak_x11.XPutBackEvent(peak_linux.display, &held[--n]);
+	free(held);
+	return found;
+}
+
 static int
 peak_linux_buffer(struct peak_linux_win *w, uint32_t width, uint32_t height)
 {
 	int screen;
-
-	if (w->ximage) {
-		w->ximage->data = NULL;
-		XDestroyImage(w->ximage);
-		w->ximage = NULL;
-	}
-	free(w->buffer);
-	w->buffer = calloc((size_t)width * height, sizeof *w->buffer);
-	if (!w->buffer)
-		return 0;
-
-	w->width = width;
-	w->height = height;
+	uint32_t *buffer;
+	XImage *image;
+	if (!width || !height || (size_t)width > SIZE_MAX / height / sizeof *buffer) return 0;
+	buffer = calloc((size_t)width * height, sizeof *buffer);
+	if (!buffer) return 0;
 	screen = DefaultScreen(peak_linux.display);
-	w->ximage = peak_x11.XCreateImage(peak_linux.display,
+	image = peak_x11.XCreateImage(peak_linux.display,
 		w->visual ? w->visual : DefaultVisual(peak_linux.display, screen),
 		w->depth ? (unsigned int)w->depth : (unsigned int)DefaultDepth(peak_linux.display, screen),
-		ZPixmap, 0, (char *)w->buffer, width, height, 32, 0);
-	if (!w->ximage) {
-		free(w->buffer);
-		w->buffer = NULL;
-		return 0;
-	}
+		ZPixmap, 0, (char *)buffer, width, height, 32, 0);
+	if (!image) { free(buffer); return 0; }
+	if (w->ximage) { w->ximage->data = NULL; XDestroyImage(w->ximage); }
+	free(w->buffer);
+	w->buffer = buffer;
+	w->ximage = image;
+	w->width = width;
+	w->height = height;
 	return 1;
 }
 
@@ -422,6 +499,13 @@ peak_platform_init(void)
 			fputs("Failed to open X11 display", stderr);
 			return 0;
 		}
+		setlocale(LC_CTYPE, "");
+		if (peak_x11.XSupportsLocale()) {
+			if (peak_x11.XSetLocaleModifiers(""))
+				peak_linux.im = peak_x11.XOpenIM(peak_linux.display, NULL, NULL, NULL);
+			if (!peak_linux.im && peak_x11.XSetLocaleModifiers("@im=none"))
+				peak_linux.im = peak_x11.XOpenIM(peak_linux.display, NULL, NULL, NULL);
+		}
 		peak_linux.wm_delete_window = peak_x11.XInternAtom(peak_linux.display, "WM_DELETE_WINDOW", False);
 		peak_linux.net_wm_state = peak_x11.XInternAtom(peak_linux.display, "_NET_WM_STATE", False);
 		peak_linux.net_wm_state_fullscreen = peak_x11.XInternAtom(peak_linux.display, "_NET_WM_STATE_FULLSCREEN", False);
@@ -465,6 +549,8 @@ peak_platform_quit(void)
 	 * into unmapped memory. The connection is dropped on process exit. */
 	if (!peak_linux.display)
 		return;
+	if (peak_linux.im) peak_x11.XCloseIM(peak_linux.im);
+	peak_linux.im = NULL;
 	peak_linux.display = 0;
 	peak_linux_kind = PEAK_LINUX_NONE;
 }
@@ -537,12 +623,20 @@ peak_platform_window_open(const char *name, uint32_t width, uint32_t height, uin
 			BlackPixel(peak_linux.display, screen), BlackPixel(peak_linux.display, screen));
 		peak_x11.XSelectInput(peak_linux.display, w->window, evmask);
 	}
+	if (peak_linux.im) {
+		long filter_mask = 0;
+		w->ic = peak_x11.XCreateIC(peak_linux.im, XNInputStyle, XIMPreeditNothing | XIMStatusNothing,
+			XNClientWindow, w->window, XNFocusWindow, w->window, NULL);
+		if (w->ic && !peak_x11.XGetICValues(w->ic, XNFilterEvents, &filter_mask, NULL))
+			peak_x11.XSelectInput(peak_linux.display, w->window, evmask | filter_mask);
+	}
 	peak_x11.XStoreName(peak_linux.display, w->window, name);
 	peak_x11.XSetWMProtocols(peak_linux.display, w->window, &peak_linux.wm_delete_window, 1);
 	w->gfx_ctx = peak_x11.XCreateGC(peak_linux.display, w->window, 0, NULL);
 
 	if (!peak_linux_buffer(w, width, height)) {
 		peak_x11.XFreeGC(peak_linux.display, w->gfx_ctx);
+		if (w->ic) peak_x11.XDestroyIC(w->ic);
 		peak_x11.XDestroyWindow(peak_linux.display, w->window);
 		if (w->colormap_owned)
 			peak_x11.XFreeColormap(peak_linux.display, w->colormap);
@@ -550,6 +644,8 @@ peak_platform_window_open(const char *name, uint32_t width, uint32_t height, uin
 		return intern;
 	}
 
+	w->next = peak_linux.windows;
+	peak_linux.windows = w;
 	w->flags = (int)flags;
 	w->cursor_on = 1;
 	intern.w = w;
@@ -582,6 +678,13 @@ peak_platform_window_close(PeakWindowInternal *intern)
 	w = intern ? intern->w : NULL;
 	if (!w || !w->window || !peak_linux.display)
 		return;
+	{
+		struct peak_linux_win **link = &peak_linux.windows;
+		while (*link && *link != w) link = &(*link)->next;
+		if (*link) *link = w->next;
+	}
+	if (w->ic) peak_x11.XDestroyIC(w->ic);
+	free(w->text_pending);
 	if (w->blank && peak_x11.XFreeCursor)
 		peak_x11.XFreeCursor(peak_linux.display, w->blank);
 	if (w->glyph && peak_x11.XFreeCursor)
@@ -817,10 +920,17 @@ peak_linux_clip_take_prop(Window window, Atom prop, PeakClip which, PeakEvent *e
 		return 0;
 	}
 	if (type == peak_linux.clip_incr) {
+		if (fmt != 32 || nitems != 1 || remain) {
+			peak_x11.XFree(data);
+			peak_x11.XDeleteProperty(peak_linux.display, window, prop);
+			peak_clip_req_on = 0;
+			return 0;
+		}
 		free(peak_clip_incr);
 		peak_clip_incr = NULL;
 		peak_clip_incr_n = 0;
 		peak_clip_incr_on = 1;
+		peak_clip_incr_type = None;
 		peak_clip_incr_which = which;
 		peak_x11.XFree(data);
 		peak_x11.XDeleteProperty(peak_linux.display, window, prop);
@@ -828,7 +938,13 @@ peak_linux_clip_take_prop(Window window, Atom prop, PeakClip which, PeakEvent *e
 	}
 	utf8 = NULL;
 	un = 0;
-	if (type == XA_STRING || fmt != 8) {
+	if (fmt != 8 || remain || (type != XA_STRING && type != peak_linux.clip_utf8 && type != peak_linux.clip_text)) {
+		peak_x11.XFree(data);
+		peak_x11.XDeleteProperty(peak_linux.display, window, prop);
+		peak_clip_req_on = 0;
+		return 0;
+	}
+	if (type == XA_STRING) {
 		if (!peak_linux_latin1_utf8(data, (size_t)nitems, &utf8, &un)) {
 			peak_x11.XFree(data);
 			peak_x11.XDeleteProperty(peak_linux.display, window, prop);
@@ -863,26 +979,38 @@ peak_linux_clip_property(struct peak_linux_win *w, XPropertyEvent *pe, PeakEvent
 	data = NULL;
 	if (peak_x11.XGetWindowProperty(peak_linux.display, w->window, pe->atom, 0,
 			(long)(PEAK_CLIP_MAX / 4), False, AnyPropertyType, &type, &fmt, &nitems, &remain, &data) != Success)
-		return 0;
+		goto fail;
+	if (remain || fmt != 8 || (type != XA_STRING && type != peak_linux.clip_utf8 && type != peak_linux.clip_text) ||
+		(peak_clip_incr_type != None && type != peak_clip_incr_type) || (nitems && !data)) goto fail;
 	if (!nitems) {
-		if (data)
-			peak_x11.XFree(data);
+		char *utf8 = NULL;
+		size_t un = 0;
+		if (peak_clip_incr_type == XA_STRING) {
+			if (!peak_linux_latin1_utf8((const unsigned char *)peak_clip_incr, peak_clip_incr_n, &utf8, &un)) goto fail;
+			peak_clip_paste_store(peak_clip_incr_which, utf8, un);
+			free(utf8);
+		} else peak_clip_paste_store(peak_clip_incr_which, peak_clip_incr ? peak_clip_incr : "", peak_clip_incr_n);
+		if (data) peak_x11.XFree(data);
 		peak_x11.XDeleteProperty(peak_linux.display, w->window, pe->atom);
-		peak_clip_paste_store(peak_clip_incr_which, peak_clip_incr ? peak_clip_incr : "", peak_clip_incr_n);
 		free(peak_clip_incr);
-		peak_clip_incr = NULL;
-		peak_clip_incr_n = 0;
-		peak_clip_incr_on = 0;
-		peak_clip_req_on = 0;
+		peak_clip_incr = NULL; peak_clip_incr_n = 0; peak_clip_incr_type = None;
+		peak_clip_incr_on = 0; peak_clip_req_on = 0;
 		ev->type = PEAK_EVENT_CLIP;
 		ev->clip.which = peak_clip_incr_which;
 		ev->clip.n = peak_clip.paste_n;
 		return 1;
 	}
-	peak_linux_clip_incr_add((const char *)data, (size_t)nitems);
-	if (data)
-		peak_x11.XFree(data);
+	peak_clip_incr_type = type;
+	if (nitems > PEAK_CLIP_MAX - peak_clip_incr_n || !peak_linux_clip_incr_add((const char *)data, (size_t)nitems)) goto fail;
+	if (data) peak_x11.XFree(data);
 	peak_x11.XDeleteProperty(peak_linux.display, w->window, pe->atom);
+	return 0;
+fail:
+	if (data) peak_x11.XFree(data);
+	peak_x11.XDeleteProperty(peak_linux.display, w->window, pe->atom);
+	free(peak_clip_incr);
+	peak_clip_incr = NULL; peak_clip_incr_n = 0; peak_clip_incr_type = None;
+	peak_clip_incr_on = 0; peak_clip_req_on = 0;
 	return 0;
 }
 
@@ -1187,10 +1315,25 @@ peak_platform_epoll(PeakWindowInternal *intern, PeakEvent *ev)
 		w->extra_on = 0;
 		return 1;
 	}
+	if (w->text_pending) {
+		size_t n = w->text_n - w->text_off;
+		if (n > sizeof ev->text.bytes) {
+			n = sizeof ev->text.bytes;
+			while (n && ((unsigned char)w->text_pending[w->text_off + n] & 0xc0) == 0x80) n--;
+		}
+		if (n) {
+			ev->type = PEAK_EVENT_TEXT; ev->text.n = n;
+			memcpy(ev->text.bytes, w->text_pending + w->text_off, n);
+			w->text_off += n;
+			if (w->text_off == w->text_n) { free(w->text_pending); w->text_pending = NULL; }
+			return 1;
+		}
+		free(w->text_pending); w->text_pending = NULL;
+	}
 	if (peak_linux_gamepad_poll(ev))
 		return 1;
 
-	while (peak_x11.XCheckIfEvent(peak_linux.display, &xev, peak_internal_x11_window_match, (XPointer)&w->window)) {
+	while (peak_linux_next_event(w, &xev, 1)) {
 		switch (xev.type) {
 		case ClientMessage:
 			if ((Atom)xev.xclient.data.l[0] == peak_linux.wm_delete_window) {
@@ -1233,33 +1376,56 @@ peak_platform_epoll(PeakWindowInternal *intern, PeakEvent *ev)
 			continue;
 		case KeyPress:
 		case KeyRelease: {
-			char buf[8];
+			char legacy[8], buf[64];
 			KeySym ks = 0;
-			int n;
-
-			memset(buf, 0, sizeof buf);
-			n = peak_x11.XLookupString(&xev.xkey, buf, (int)sizeof buf, &ks, NULL);
+			int n = 0, legacy_n, commit_only = 0;
+			char *text = buf;
+			Status status = XLookupNone;
+			legacy_n = xev.xkey.keycode ? peak_x11.XLookupString(&xev.xkey, legacy, sizeof legacy, &ks, NULL) : 0;
 			ev->type = (xev.type == KeyPress) ? PEAK_EVENT_KEY_DOWN : PEAK_EVENT_KEY_UP;
-			ev->key.key = peak_internal_x11_key_map(ks ? ks : peak_x11.XLookupKeysym(&xev.xkey, 0));
+			ev->key.key = peak_internal_x11_key_map(ks ? ks : (xev.xkey.keycode ? peak_x11.XLookupKeysym(&xev.xkey, 0) : 0));
 			ev->key.mod = peak_internal_x11_mod_map(xev.xkey.state);
-			ev->key.code = (n > 0) ? (uint32_t)(unsigned char)buf[0] : 0;
-			if (ev->key.key == PEAK_KEY_UNKNOWN && n == 1 && (unsigned char)buf[0] == 0x7f)
+			ev->key.code = legacy_n > 0 ? (uint32_t)(unsigned char)legacy[0] : 0;
+			if (ev->key.key == PEAK_KEY_UNKNOWN && legacy_n == 1 && (unsigned char)legacy[0] == 0x7f)
 				ev->key.key = PEAK_KEY_DELETE;
-			/* DEL is tty erase, not forward delete. Do not emit it as text. */
-			if (xev.type == KeyPress && n > 0 && (unsigned char)buf[0] >= 32
-				&& (unsigned char)buf[0] != 0x7f
-				&& ev->key.key != PEAK_KEY_DELETE && ev->key.key != PEAK_KEY_BACKSPACE
-				&& !((ev->key.mod & (PEAK_KEYMOD_CTRL | PEAK_KEYMOD_ALT | PEAK_KEYMOD_SUPER)) && n == 1 && (unsigned char)buf[0] < 128)) {
-				w->extra_on = 1;
-				memset(&w->extra, 0, sizeof w->extra);
-				w->extra.type = PEAK_EVENT_TEXT;
-				w->extra.text.n = (size_t)n;
-				memcpy(w->extra.text.bytes, buf, (size_t)n);
+			if (xev.type == KeyPress && w->ic) {
+				KeySym lookup_sym = NoSymbol;
+				n = peak_x11.Xutf8LookupString(w->ic, &xev.xkey, buf, sizeof buf, &lookup_sym, &status);
+				if (status == XBufferOverflow && n > 0 && n <= PEAK_CLIP_MAX) {
+					text = malloc((size_t)n);
+					if (text) n = peak_x11.Xutf8LookupString(w->ic, &xev.xkey, text, n, &lookup_sym, &status);
+					else n = 0;
+				}
+				if (status == XLookupNone || status == XBufferOverflow) {
+					if (text != buf) free(text);
+					continue;
+				}
+				if (status == XLookupChars || (status == XLookupBoth && (n != 1 || (unsigned char)text[0] >= 128))) {
+					commit_only = 1;
+					ev->key.key = PEAK_KEY_UNKNOWN;
+					ev->key.code = 0;
+					ev->key.mod = 0;
+				} else if (status == XLookupKeySym || status == XLookupBoth) {
+					ev->key.key = peak_internal_x11_key_map(lookup_sym);
+				}
+				if (status != XLookupChars && status != XLookupBoth) n = 0;
+			} else if (xev.type == KeyPress && legacy_n > 0) {
+				size_t un = 0;
+				if (peak_linux_latin1_utf8((unsigned char *)legacy, (size_t)legacy_n, &text, &un)) n = (int)un;
+				else text = buf;
 			}
+			if (n > 0 && (unsigned char)text[0] >= 32 && (unsigned char)text[0] != 0x7f &&
+				ev->key.key != PEAK_KEY_DELETE && ev->key.key != PEAK_KEY_BACKSPACE &&
+				!(!commit_only && xev.xkey.keycode && (ev->key.mod & (PEAK_KEYMOD_CTRL | PEAK_KEYMOD_ALT | PEAK_KEYMOD_SUPER)) && n == 1 && (unsigned char)text[0] < 128)) {
+				if (text == buf) { text = malloc((size_t)n); if (text) memcpy(text, buf, (size_t)n); }
+				if (text) { w->text_pending = text; w->text_n = (size_t)n; w->text_off = 0; text = NULL; }
+			}
+			if (text != buf) free(text);
 			return 1;
 		}
 		case ButtonPress:
 		case ButtonRelease:
+			if (xev.xbutton.button < Button1 || xev.xbutton.button > Button5) continue;
 			ev->type = PEAK_EVENT_POINTER;
 			ev->pointer.state = (xev.type == ButtonPress) ? PEAK_POINTER_PRESSED : PEAK_POINTER_RELEASED;
 			ev->pointer.x = (float)xev.xbutton.x;
@@ -1296,10 +1462,12 @@ peak_platform_epoll(PeakWindowInternal *intern, PeakEvent *ev)
 					(int)w->width / 2, (int)w->height / 2);
 			return 1;
 		case FocusIn:
+			if (w->ic) peak_x11.XSetICFocus(w->ic);
 			ev->type = PEAK_EVENT_FOCUS;
 			ev->focus.on = 1;
 			return 1;
 		case FocusOut:
+			if (w->ic) peak_x11.XUnsetICFocus(w->ic);
 			if (w->relative && peak_x11.XUngrabPointer)
 				peak_x11.XUngrabPointer(peak_linux.display, CurrentTime);
 			ev->type = PEAK_EVENT_FOCUS;
@@ -1340,12 +1508,11 @@ peak_platform_epoll(PeakWindowInternal *intern, PeakEvent *ev)
 					continue;
 				}
 				if (peak_x11.XGetWindowProperty(peak_linux.display, w->window, xev.xselection.property,
-						0, 0x10000, True, AnyPropertyType, &type, &fmt, &nitems, &after, &data) == Success && data) {
+						0, 0x10000, True, AnyPropertyType, &type, &fmt, &nitems, &after, &data) == Success && data && type == peak_linux.uri_list && fmt == 8 && !after) {
 					p = (const char *)data;
-					if (!strncmp(p, "file://", 7))
-						p += 7;
-					nl = strchr(p, '\n');
-					nitems = nl ? (unsigned long)(nl - p) : nitems;
+					if (nitems >= 7 && !memcmp(p, "file://", 7)) { p += 7; nitems -= 7; }
+					nl = memchr(p, '\n', nitems);
+					if (nl) nitems = (unsigned long)(nl - p);
 					while (nitems && (p[nitems - 1] == '\r' || p[nitems - 1] == '\n'))
 						nitems--;
 					peak_drop_store(p, (size_t)nitems);
@@ -1410,16 +1577,10 @@ peak_platform_pending(PeakWindowInternal *intern)
 	if (peak_linux_kind == PEAK_LINUX_WAYLAND)
 		return peak_wayland_pending(intern);
 	w = intern ? intern->w : NULL;
-	if (!w || !w->window || !peak_linux.display || !peak_x11.XPending)
-		return 0;
-	/* Display-wide XPending is true for Vulkan WSI / other windows too.
-	 * Timeout 0 on that spins the client after the first present. */
-	if (peak_x11.XPending(peak_linux.display) <= 0)
-		return 0;
-	if (!peak_x11.XCheckIfEvent(peak_linux.display, &ev, peak_internal_x11_window_match, (XPointer)&w->window))
-		return 0;
-	peak_x11.XPutBackEvent(peak_linux.display, &ev);
-	return 1;
+	if (!w || !w->window || !peak_linux.display) return 0;
+	if (w->extra_on || w->text_pending) return 1;
+	if (!peak_x11.XPending) return 0;
+	return peak_linux_next_event(w, &ev, 0);
 }
 
 #ifndef PEAK_NO_AUDIO

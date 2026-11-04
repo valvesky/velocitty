@@ -98,7 +98,7 @@ The executable is installed in `zig-out/bin/`. On Omarchy, `zig build install-us
 | Windows | `%APPDATA%/velocitty/config.toml` |
 | macOS | `~/Library/Application Support/velocitty/config.toml` |
 
-`$XDG_CONFIG_HOME/velocitty/config.toml` overrides these locations when set. A `config.toml` in the working directory overlays the user file. On Linux, Omarchy theme colors overlay the configured palette without rewriting the file.
+The first existing file wins: `$XDG_CONFIG_HOME/velocitty/config.toml`, then the platform location, then (Windows and macOS) `~/.config/velocitty/config.toml` (`%USERPROFILE%\.config` or `%HOME%\.config` on Windows). Invalid configs are reported with a line number on stderr and, without a console, inside the window. Default font size is 12 pt on Windows and macOS. A `config.toml` in the working directory overlays the user file. On Linux, Omarchy theme colors overlay the configured palette without rewriting the file.
 
 See [example.config.toml](example.config.toml). The TOML subset is similar to Alacritty. Font families use fontconfig on Linux, GDI on Windows, and Core Text on macOS; `monospace` selects the desktop/default monospace font. Installed fallback families can be listed in priority order. Config changes reload automatically; Linux/macOS also accept SIGUSR1 or SIGUSR2.
 

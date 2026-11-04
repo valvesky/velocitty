@@ -459,7 +459,7 @@ peak_wait(PeakWindow *win, const PEAK_HANDLE *fds, uint32_t n, int timeout_ms)
 				slice = left;
 		}
 		if (win)
-			got = MsgWaitForMultipleObjects(0, NULL, FALSE, slice, QS_ALLINPUT);
+			got = MsgWaitForMultipleObjectsEx(0, NULL, slice, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
 		else
 			got = WaitForSingleObject(GetCurrentProcess(), slice);
 		(void)got;

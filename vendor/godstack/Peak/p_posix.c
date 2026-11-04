@@ -512,6 +512,60 @@ peak_pty_close(PeakProc *pty)
 	}
 }
 
+#ifdef PEAK_MACOS
+/* A plain poll cannot wake for an AppKit event. Register the PTY descriptors
+ * with the main run loop while waiting for an NSEvent, and post a harmless
+ * application event when a descriptor becomes readable. Do not consume the
+ * event here: the normal window pump owns event dispatch. */
+static void
+peak_internal_macos_fd_ready(CFFileDescriptorRef fd, CFOptionFlags types, void *info)
+{
+	(void)fd; (void)types; (void)info;
+	NSEvent *ev = [NSEvent otherEventWithType:NSEventTypeApplicationDefined
+		location:NSZeroPoint modifierFlags:0 timestamp:0 windowNumber:0
+		context:nil subtype:0 data1:0 data2:0];
+	[peak_macos_app postEvent:ev atStart:YES];
+}
+
+static int
+peak_internal_macos_wait(struct pollfd *pfd, uint32_t n, int timeout_ms)
+{
+	CFFileDescriptorRef descriptors[PEAK_WAIT_MAX] = {0};
+	CFRunLoopSourceRef sources[PEAK_WAIT_MAX] = {0};
+	CFRunLoopRef loop = CFRunLoopGetCurrent();
+	uint32_t i;
+	int ready, failed = 0;
+	@autoreleasepool {
+		ready = poll(pfd, (nfds_t)n, 0);
+		if (ready > 0 || timeout_ms == 0) return ready > 0;
+		for (i = 0; i < n; i++) {
+			descriptors[i] = CFFileDescriptorCreate(NULL, pfd[i].fd, false,
+				peak_internal_macos_fd_ready, NULL);
+			if (!descriptors[i]) { failed = 1; break; }
+			sources[i] = CFFileDescriptorCreateRunLoopSource(NULL, descriptors[i], 0);
+			if (!sources[i]) { failed = 1; break; }
+			CFRunLoopAddSource(loop, sources[i], kCFRunLoopDefaultMode);
+			CFFileDescriptorEnableCallBacks(descriptors[i], kCFFileDescriptorReadCallBack);
+		}
+		if (!failed) {
+			NSDate *until = timeout_ms < 0 ? [NSDate distantFuture] :
+				[NSDate dateWithTimeIntervalSinceNow:(double)timeout_ms / 1000.0];
+			[peak_macos_app nextEventMatchingMask:NSEventMaskAny untilDate:until
+				inMode:NSDefaultRunLoopMode dequeue:NO];
+		}
+		for (i = 0; i < n; i++) {
+			if (sources[i]) { CFRunLoopRemoveSource(loop, sources[i], kCFRunLoopDefaultMode); CFRelease(sources[i]); }
+			if (descriptors[i]) { CFFileDescriptorInvalidate(descriptors[i]); CFRelease(descriptors[i]); }
+		}
+		/* Allocation failure still bounds event latency without losing PTY data. */
+		if (failed) return poll(pfd, (nfds_t)n, timeout_ms < 0 || timeout_ms > 2 ? 2 : timeout_ms) > 0;
+		return poll(pfd, (nfds_t)n, 0) > 0 ||
+			[peak_macos_app nextEventMatchingMask:NSEventMaskAny untilDate:[NSDate distantPast]
+				inMode:NSDefaultRunLoopMode dequeue:NO] != nil;
+	}
+}
+#endif
+
 int
 peak_wait(PeakWindow *win, const PEAK_HANDLE *fds, uint32_t n, int timeout_ms)
 {
@@ -550,6 +604,10 @@ peak_wait(PeakWindow *win, const PEAK_HANDLE *fds, uint32_t n, int timeout_ms)
 	}
 	if (!np)
 		return 0;
+#ifdef PEAK_MACOS
+	if (win && peak_macos_app)
+		return peak_internal_macos_wait(pfd, np, timeout_ms);
+#endif
 	return poll(pfd, (nfds_t)np, timeout_ms) > 0;
 }
 

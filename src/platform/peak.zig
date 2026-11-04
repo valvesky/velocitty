@@ -241,6 +241,10 @@ pub const Window = extern struct {
         return peak_window_scale(self);
     }
 
+    pub fn refreshRate(self: *Window) u32 {
+        return peak_window_refresh_rate(self);
+    }
+
     pub fn pending(self: *Window) i32 {
         return peak_window_pending(self);
     }
@@ -263,6 +267,10 @@ pub const Window = extern struct {
 
     pub fn setTitle(self: *Window, name: [:0]const u8) void {
         peak_window_set_title(self, name.ptr);
+    }
+
+    pub fn setTextInputRect(self: *Window, x: i32, y: i32, w: i32, h: i32) void {
+        peak_window_set_text_input_rect(self, x, y, w, h);
     }
 
     pub fn setClass(self: *Window, name: [:0]const u8) void {
@@ -421,10 +429,12 @@ extern fn peak_window_close(window: *Window) void;
 extern fn peak_window_epoll(win: *Window, ev: *RawEvent) c_int;
 extern fn peak_window_fd(win: *Window) c_int;
 extern fn peak_window_scale(win: *Window) f32;
+extern fn peak_window_refresh_rate(win: *Window) c_uint;
 extern fn peak_window_pending(win: *Window) c_int;
 extern fn peak_window_backbuffer(win: *Window, width: *usize, height: *usize) ?[*]u32;
 extern fn peak_window_present(win: *Window) void;
 extern fn peak_window_present_rect(win: *Window, y: u32, h: u32) void;
+extern fn peak_window_set_text_input_rect(win: *Window, x: c_int, y: c_int, w: c_int, h: c_int) void;
 extern fn peak_window_set_title(win: *Window, name: [*:0]const u8) void;
 extern fn peak_window_set_class(win: *Window, name: [*:0]const u8) void;
 extern fn peak_window_set_opacity(win: *Window, alpha: u8) void;

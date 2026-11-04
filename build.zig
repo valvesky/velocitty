@@ -41,6 +41,14 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&exe.step);
     check_step.dependOn(&tests.step);
     check_step.dependOn(&native_tests.step);
+    if (target.result.os.tag == .linux) {
+        const x11_mod = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true });
+        addPeakSource(x11_mod, b, target, "tests/peak_x11.c");
+        const x11_tests = b.addExecutable(.{ .name = "peak-x11-test", .root_module = x11_mod });
+        test_step.dependOn(&b.addRunArtifact(x11_tests).step);
+        check_step.dependOn(&x11_tests.step);
+    }
+
 
     // Standard run step
     const run_cmd = b.addRunArtifact(exe);
