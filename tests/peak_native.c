@@ -5,6 +5,22 @@
 #include "../vendor/godstack/Peak/peak.c"
 #include <assert.h>
 
+#if defined(PEAK_LINUX) || defined(PEAK_MACOS)
+static void mirror_test(void)
+{
+    size_t size = peak_page_size();
+    assert(size > 1 && !peak_mirror_map(size - 1));
+    unsigned char *p = peak_mirror_map(size);
+    assert(p);
+    p[0] = 0x12;
+    p[size - 1] = 0x34;
+    assert(p[size] == 0x12 && p[2 * size - 1] == 0x34);
+    p[size + 1] = 0x56;
+    assert(p[1] == 0x56);
+    peak_mirror_unmap(p, size);
+}
+#endif
+
 static void text_queue_test(void)
 {
     PeakQ q = {0};
@@ -125,6 +141,9 @@ static void macos_events_test(void)
 int main(void)
 {
     text_queue_test();
+#if defined(PEAK_LINUX) || defined(PEAK_MACOS)
+    mirror_test();
+#endif
 #if defined(PEAK_WIN32) || defined(PEAK_MACOS)
     primary_test();
 #endif

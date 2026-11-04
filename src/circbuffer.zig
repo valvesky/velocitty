@@ -7,6 +7,9 @@ const builtin = @import("builtin");
 const assert = std.debug.assert;
 const posix = std.posix;
 
+extern fn peak_mirror_map(size: usize) ?[*]u8;
+extern fn peak_mirror_unmap(ptr: [*]u8, size: usize) void;
+
 const Preparse = @import("preparser.zig");
 const stEnd = Preparse.stringEnd;
 
@@ -101,6 +104,7 @@ pub const CircBuffer = struct {
         if (self.mapped) {
             switch (builtin.os.tag) {
                 .linux => posix.munmap(@alignCast(self.storage)),
+                .macos => peak_mirror_unmap(self.storage.ptr, self.capacity),
                 else => unreachable,
             }
         } else {
@@ -444,6 +448,10 @@ pub const CircBuffer = struct {
     }
 
     fn mapMirror(size: usize) ?[]u8 {
+        if (builtin.os.tag == .macos) {
+            const ptr = peak_mirror_map(size) orelse return null;
+            return ptr[0 .. size * 2];
+        }
         if (builtin.os.tag != .linux) return null;
         if (size == 0 or size % std.heap.pageSize() != 0) return null;
         const fd = posix.memfd_create("zt-ring", 0) catch return null;
