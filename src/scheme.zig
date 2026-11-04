@@ -988,11 +988,13 @@ test "font size fallback requires an actual Omarchy theme file" {
     const dir_len = try tmp.dir.realPath(io, &path_buf);
     const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/colors.toml", .{path_buf[0..dir_len]});
     defer std.testing.allocator.free(path);
-    try std.testing.expectEqual(@as(f32, 8), fontSizeFallback(io, null));
-    try std.testing.expectEqual(@as(f32, 8), fontSizeFallback(io, path));
+    const none = defaultFontSize(builtin.os.tag, false);
+    const themed = defaultFontSize(builtin.os.tag, true);
+    try std.testing.expectEqual(none, fontSizeFallback(io, null));
+    try std.testing.expectEqual(none, fontSizeFallback(io, path));
     try tmp.dir.writeFile(io, .{ .sub_path = "colors.toml", .data = "foreground = '#ffffff'\n" });
-    try std.testing.expectEqual(@as(f32, 9), fontSizeFallback(io, path));
-    try std.testing.expectEqual(@as(f32, 8), fontSizeFallback(io, path_buf[0..dir_len]));
+    try std.testing.expectEqual(themed, fontSizeFallback(io, path));
+    try std.testing.expectEqual(none, fontSizeFallback(io, path_buf[0..dir_len]));
 }
 
 test "alacritty tables" {
