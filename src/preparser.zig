@@ -304,7 +304,7 @@ pub const Preparser = struct {
             // CSI: found and parsed in one pass, straight into the drain's
             // arrays (the VT applies this parse).
             if (self.csi_ok and (self.csis.items.len == max_csis or
-                self.csi_params.items.len + Csi.max_params > max_csi_params or
+                self.csi_params.items.len + Csi.param_slots > max_csi_params or
                 self.csi_subs.items.len + Csi.max_subs > max_csi_subs))
                 return .{ .held = @intCast(rest.len), .retry = true };
             const ok = self.reserveCsi();
@@ -348,7 +348,7 @@ pub const Preparser = struct {
     /// cleared: the VT parses the bytes itself) when it cannot grow.
     inline fn reserveCsi(self: *Preparser) bool {
         if (self.csi_ok and self.csis.items.len < self.csis.capacity and
-            self.csi_params.capacity - self.csi_params.items.len >= Csi.max_params and
+            self.csi_params.capacity - self.csi_params.items.len >= Csi.param_slots and
             self.csi_subs.capacity - self.csi_subs.items.len >= Csi.max_subs) return true;
         return self.growCsi();
     }
@@ -356,7 +356,7 @@ pub const Preparser = struct {
     noinline fn growCsi(self: *Preparser) bool {
         if (!self.csi_ok) return false;
         self.reserveBounded(CsiHead, &self.csis, 1, max_csis) catch return self.csiFailed();
-        self.reserveBounded(Csi.Param, &self.csi_params, Csi.max_params, max_csi_params) catch return self.csiFailed();
+        self.reserveBounded(Csi.Param, &self.csi_params, Csi.param_slots, max_csi_params) catch return self.csiFailed();
         self.reserveBounded(u32, &self.csi_subs, Csi.max_subs, max_csi_subs) catch return self.csiFailed();
         return true;
     }

@@ -1032,22 +1032,13 @@ pub const Grid = struct {
         fillCells(self.cells[offset + cols - del_count .. offset + cols], self.blankCell());
     }
 
-    /// Scroll defined region up by n lines
+    /// Scroll defined region up by n lines. Rows trade storage (`starts`
+    /// and the per-row metadata) instead of copying cells, so a scroll costs
+    /// O(region rows), not O(region cells); the rows that come in at the
+    /// bottom reuse the storage of the rows scrolled out, then are cleared.
     pub fn scrollUp(self: *Grid, top: u16, bottom: u16, n: u16, cols: u16) void {
         const count = @min(n, bottom - top + 1);
-        var i: u16 = top;
-        while (@as(u32, i) + count <= bottom) : (i += 1) {
-            const src_idx = (self.head + i + count) % self.cap;
-            const dst_idx = (self.head + i) % self.cap;
-            std.mem.copyForwards(
-                Cell,
-                self.cells[self.starts[dst_idx] .. self.starts[dst_idx] + cols],
-                self.cells[self.starts[src_idx] .. self.starts[src_idx] + cols],
-            );
-            self.wraps[dst_idx] = self.wraps[src_idx];
-            self.extent[dst_idx] = self.extent[src_idx];
-            self.tail[dst_idx] = self.tail[src_idx];
-        }
+        self.rotateRowsUp(top, bottom, count);
         var clear_row: u16 = @intCast(@as(u32, bottom) + 1 - count);
         while (clear_row <= bottom) : (clear_row += 1) {
             self.clearRange(clear_row, 0, cols);
@@ -1057,24 +1048,69 @@ pub const Grid = struct {
 
     pub fn scrollDown(self: *Grid, top: u16, bottom: u16, n: u16, cols: u16) void {
         const count = @min(n, bottom - top + 1);
-        var i: u16 = bottom;
-        while (i >= top + count) : (i -= 1) {
-            const src_idx = (self.head + i - count) % self.cap;
-            const dst_idx = (self.head + i) % self.cap;
-            std.mem.copyForwards(
-                Cell,
-                self.cells[self.starts[dst_idx] .. self.starts[dst_idx] + cols],
-                self.cells[self.starts[src_idx] .. self.starts[src_idx] + cols],
-            );
-            self.wraps[dst_idx] = self.wraps[src_idx];
-            self.extent[dst_idx] = self.extent[src_idx];
-            self.tail[dst_idx] = self.tail[src_idx];
-            if (i == top + count) break;
-        }
+        // Down by `count` is up by the rest of the region.
+        self.rotateRowsUp(top, bottom, bottom - top + 1 - count);
         var clear_row: u16 = top;
         while (clear_row < top + count) : (clear_row += 1) {
             self.clearRange(clear_row, 0, cols);
             self.setRowWrap(clear_row, false);
+        }
+    }
+
+    /// Rotate the storage of rows `top..bottom` up by `k`: row `r` takes the
+    /// storage row `r + k` had, and the first `k` wrap around to the bottom.
+    fn rotateRowsUp(self: *Grid, top: u16, bottom: u16, k: u16) void {
+        // 0 or the whole region: every row keeps its storage.
+        if (k == 0 or k > bottom - top) return;
+        if (top == 0 and @as(u32, bottom) + 1 == self.cap) {
+            // The region is the whole ring (the alt screen, which keeps no
+            // history): rotating every row is moving the ring's start.
+            self.head += k;
+            if (self.head >= self.cap) self.head -= self.cap;
+            return;
+        }
+        if (k == 1) {
+            // The common one-line scroll: one move per row.
+            const first = self.lineIndex(top);
+            const start = self.starts[first];
+            const wrap = self.wraps[first];
+            const ext = self.extent[first];
+            const tl = self.tail[first];
+            var dst = first;
+            var r = top;
+            while (r < bottom) : (r += 1) {
+                const src = self.lineIndex(r + 1);
+                self.starts[dst] = self.starts[src];
+                self.wraps[dst] = self.wraps[src];
+                self.extent[dst] = self.extent[src];
+                self.tail[dst] = self.tail[src];
+                dst = src;
+            }
+            self.starts[dst] = start;
+            self.wraps[dst] = wrap;
+            self.extent[dst] = ext;
+            self.tail[dst] = tl;
+            return;
+        }
+        // Three reversals: every row is swapped at most twice.
+        self.reverseRows(top, top + k - 1);
+        self.reverseRows(top + k, bottom);
+        self.reverseRows(top, bottom);
+    }
+
+    fn reverseRows(self: *Grid, lo: u16, hi: u16) void {
+        var a = lo;
+        var b = hi;
+        while (a < b) : ({
+            a += 1;
+            b -= 1;
+        }) {
+            const i = self.lineIndex(a);
+            const j = self.lineIndex(b);
+            std.mem.swap(u32, &self.starts[i], &self.starts[j]);
+            std.mem.swap(u8, &self.wraps[i], &self.wraps[j]);
+            std.mem.swap(u16, &self.extent[i], &self.extent[j]);
+            std.mem.swap(u64, &self.tail[i], &self.tail[j]);
         }
     }
 
@@ -1305,6 +1341,78 @@ test "saved cursor beyond text survives reflow" {
     try g.resize(a, 4, 2, 5, 2, 4, true);
     try std.testing.expectEqual(Cursor{ .col = 2 }, g.saved_cursor);
     try std.testing.expectEqual(@as(u21, 'Y'), g.cellAt(1, 0).codepoint);
+}
+
+test "region scrolls move whole rows and clear the incoming ones" {
+    // A ring with history (one-line, multi-line and partial-region paths)
+    // and one exactly the screen's height (the alt screen: whole-ring
+    // scrolls move `head`).
+    try checkRegionScrolls(12);
+    try checkRegionScrolls(7);
+}
+
+fn checkRegionScrolls(cap: u32) !void {
+    const a = std.testing.allocator;
+    const styles = try Styles.create(a);
+    defer styles.destroy();
+    const cols = 5;
+    const rows = 7;
+    var g = try Grid.init(a, cols, rows, cap, styles, 0);
+    defer g.deinit(a);
+    // Start away from ring index 0 so rows wrap around the ring.
+    if (cap > rows) g.historyScrollUp(9, cols, rows) else g.head = 3;
+    // Reference: each row holds one marker in every cell (' ' = cleared)
+    // and a soft-wrap flag; both must travel with the row.
+    var model: [rows]u21 = undefined;
+    var wrapped: [rows]bool = undefined;
+    var next: u21 = 'A';
+    for (0..rows) |r| {
+        model[r] = next;
+        wrapped[r] = r % 2 == 0;
+        next += 1;
+    }
+    var prng = std.Random.DefaultPrng.init(0x5c011);
+    const rand = prng.random();
+    for (0..500) |step| {
+        // Refill rows the last scroll cleared, so every row stays distinct.
+        for (0..rows) |r| {
+            if (model[r] != ' ' and step != 0) continue;
+            if (model[r] == ' ') {
+                model[r] = next;
+                wrapped[r] = rand.boolean();
+                next = if (next == 'z') 'A' else next + 1;
+            }
+            // Written rows have a full `extent`: the lazy clear of a row that
+            // moved must clear its own cells, not the row that was there.
+            for (0..cols) |c| g.writeCell(@intCast(r), @intCast(c), model[r]);
+            g.setRowWrap(@intCast(r), wrapped[r]);
+        }
+        const top = rand.intRangeAtMost(u16, 0, rows - 1);
+        const bottom = rand.intRangeAtMost(u16, top, rows - 1);
+        const n = rand.intRangeAtMost(u16, 1, bottom - top + 2);
+        const height = bottom - top + 1;
+        const count = @min(n, height);
+        const before = model;
+        const before_wrap = wrapped;
+        if (rand.boolean()) {
+            g.scrollUp(top, bottom, n, cols);
+            for (top..bottom + 1) |r| {
+                const src = r + count;
+                model[r] = if (src <= bottom) before[src] else ' ';
+                wrapped[r] = if (src <= bottom) before_wrap[src] else false;
+            }
+        } else {
+            g.scrollDown(top, bottom, n, cols);
+            for (top..bottom + 1) |r| {
+                model[r] = if (r >= top + count) before[r - count] else ' ';
+                wrapped[r] = if (r >= top + count) before_wrap[r - count] else false;
+            }
+        }
+        for (0..rows) |r| {
+            for (g.rowSliceConst(@intCast(r), cols)) |cell| try std.testing.expectEqual(model[r], cell.codepoint);
+            try std.testing.expectEqual(wrapped[r], g.wraps[g.lineIndex(@intCast(r))] != 0);
+        }
+    }
 }
 
 test "fillCells matches memset" {

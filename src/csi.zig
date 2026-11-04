@@ -104,11 +104,11 @@ fn applyAnsi(final: u8, params: []const Param, subs: []const u32, vt: *Vt) void 
         'I' => vt.tabForward(n1),
         'Z' => vt.tabBackN(n1),
         'h' => {
-            var buf: [16]u32 = undefined;
+            var buf: [Parse.max_params]u32 = undefined;
             vt.setMode(copyParams(params, &buf), true);
         },
         'l' => {
-            var buf: [16]u32 = undefined;
+            var buf: [Parse.max_params]u32 = undefined;
             vt.setMode(copyParams(params, &buf), false);
         },
         'r' => vt.decstbm(p0, sat16(if (params.len > 1) params[1].value else 0)),
@@ -123,19 +123,19 @@ fn applyDec(final: u8, params: []const Param, vt: *Vt) void {
     const p0 = if (params.len > 0) params[0].value else 0;
     switch (final) {
         'h' => {
-            var buf: [16]u32 = undefined;
+            var buf: [Parse.max_params]u32 = undefined;
             vt.setPrivate(copyParams(params, &buf), true);
         },
         'l' => {
-            var buf: [16]u32 = undefined;
+            var buf: [Parse.max_params]u32 = undefined;
             vt.setPrivate(copyParams(params, &buf), false);
         },
         's' => {
-            var buf: [16]u32 = undefined;
+            var buf: [Parse.max_params]u32 = undefined;
             vt.savePrivate(copyParams(params, &buf));
         },
         'r' => {
-            var buf: [16]u32 = undefined;
+            var buf: [Parse.max_params]u32 = undefined;
             vt.restorePrivate(copyParams(params, &buf));
         },
         'n' => switch (p0) {
@@ -164,7 +164,7 @@ fn applyGt(final: u8, params: []const Param, vt: *Vt) void {
     switch (final) {
         'c' => if (p0 == 0) vt.respond("\x1b[>1;000001;0c"),
         'm' => {
-            var buf: [16]u32 = undefined;
+            var buf: [Parse.max_params]u32 = undefined;
             vt.setModifyKeys(copyParams(params, &buf));
         },
         'n' => if (pget(params, 0, 2) == 4) {
@@ -262,7 +262,7 @@ fn respondCursor(vt: *Vt) void {
     vt.respondFmt("\x1b[{d};{d}R", .{ row, col });
 }
 
-fn copyParams(params: []const Param, buf: *[16]u32) []const u32 {
+fn copyParams(params: []const Param, buf: *[Parse.max_params]u32) []const u32 {
     const n = @min(params.len, buf.len);
     for (params[0..n], 0..) |p, i| buf[i] = p.value;
     return buf[0..n];

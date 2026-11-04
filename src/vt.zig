@@ -2820,6 +2820,23 @@ test "sgr underline color on cell" {
 }
 
 
+test "sgr with more than 16 parameters keeps its trailing underline color" {
+    // kitty's long-escape benchmark SGR: 18 parameters, underline color last.
+    var dummy: [1]u8 = .{0};
+    var vt = try VtState.init(std.testing.allocator, 8, 1, 2, &dummy);
+    defer vt.deinit();
+    applyCsi(&vt, "\x1b[38;2;10;20;30;48;2;40;50;60;1;3;4:3;58;2;7;8;9m");
+    vt.printCodepoint('X');
+    const s = vt.styleOf(vt.grid().cellAt(0, 0));
+    try std.testing.expect(s.attrs.bold and s.attrs.italic and s.attrs.underline);
+    try std.testing.expectEqual(@as(u8, 10), s.fg.r);
+    try std.testing.expectEqual(@as(u8, 60), s.bg.b);
+    try std.testing.expect(s.attrs.ul_color);
+    try std.testing.expectEqual(@as(u8, 7), s.ul.r);
+    try std.testing.expectEqual(@as(u8, 8), s.ul.g);
+    try std.testing.expectEqual(@as(u8, 9), s.ul.b);
+}
+
 test "xtsmgraphics color registers" {
     var dummy: [1]u8 = .{0};
     var vt = try VtState.init(std.testing.allocator, 8, 2, 2, &dummy);

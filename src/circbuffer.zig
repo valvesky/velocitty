@@ -1069,6 +1069,29 @@ test "the scanner's CSI parse is what the VT applies" {
     try std.testing.expectEqual(@as(u32, 1), sgr.value(1));
 }
 
+test "cached long CSI sequences preserve the last retained parameter" {
+    var buf = try CircBuffer.create(std.testing.allocator, 32768);
+    defer buf.destroy();
+    const params = comptime blk: {
+        var text: []const u8 = "";
+        for (0..31) |_| text = text ++ "1;";
+        break :blk text;
+    };
+    const seq = "\x1b[" ++ params ++ "4;7;9:5:6;31m";
+    for (0..100) |_| append(&buf, seq);
+    append(&buf, "\x1b[31m");
+    const result = buf.scan(.{ .rows = 4, .alt = false }, false);
+    try std.testing.expectEqual(@as(u32, 0), result.held);
+    try std.testing.expectEqual(@as(usize, 101), buf.preparser.csis.items.len);
+    for (0..100) |i| {
+        const parsed = buf.preparser.csiAt(i);
+        try std.testing.expectEqual(@as(usize, 32), parsed.params.len);
+        try std.testing.expectEqual(@as(u32, 4), parsed.value(31));
+        try std.testing.expectEqual(@as(usize, 0), parsed.subs.len);
+    }
+    try std.testing.expectEqual(@as(u32, 31), buf.preparser.csiAt(100).value(0));
+}
+
 test "pressure retains live lookahead across reads instead of painting each suffix" {
     const gpa = std.testing.allocator;
     var buf = try CircBuffer.create(gpa, 4096);

@@ -4,9 +4,15 @@
 
 const std = @import("std");
 
-pub const max_params = 16;
-/// Subparameters of one CSI (at most 8 per parameter).
-pub const max_subs = max_params * max_param_subs;
+/// `;` parameters kept per CSI (xterm keeps 30, Ghostty 24); later ones
+/// are dropped.
+pub const max_params = 32;
+/// Parameter storage `scan` needs: `max_params` kept plus one sink that
+/// takes every later value and is dropped at the final byte. The sink is
+/// set up with a full subparameter count, so it stores none.
+pub const param_slots = max_params + 1;
+/// `:` subparameters kept per CSI (at most `max_param_subs` per parameter).
+pub const max_subs = 128;
 pub const max_param_subs = 8;
 
 /// One `;`-separated parameter; its `:` subparameters are
@@ -39,7 +45,7 @@ pub const Seq = struct {
 
 /// Stack buffers for one parse.
 pub const Bufs = struct {
-    params: [max_params]Param = undefined,
+    params: [param_slots]Param = undefined,
     subs: [max_subs]u32 = undefined,
 };
 
@@ -57,10 +63,10 @@ const char_map: [256]CharKind = blk: {
 };
 
 /// Parse `seq` (ESC [ ... final) into `params`/`subs` (at least
-/// `max_params`/`max_subs` long); the result's slices point into them.
-/// Values wrap on overflow; parameters past `max_params`, more than
-/// `max_param_subs` subparameters of one parameter and subparameters past
-/// `max_subs` are dropped.
+/// `param_slots`/`max_subs` long); the result's slices point into them.
+/// Values wrap on overflow; parameters past `max_params` (with their
+/// subparameters), more than `max_param_subs` subparameters of one
+/// parameter and subparameters past `max_subs` are dropped.
 pub fn parse(seq: []const u8, params: []Param, subs: []u32) Seq {
     if (seq.len < 3 or seq[0] != 0x1b or seq[1] != '[') return .{};
     const r = scan(seq, params, subs);
@@ -80,7 +86,7 @@ pub const Scanned = struct {
 pub inline fn scan(rest: []const u8, param_storage: []Param, sub_storage: []u32) Scanned {
     // The drain passes spare array capacity, not fixed-size stack buffers.
     // Keep the same limits regardless of how much capacity is available.
-    const params = param_storage[0..max_params];
+    const params = param_storage[0..param_slots];
     const subs = sub_storage[0..max_subs];
     var private: u32 = 0;
     var priv_n: u5 = 0;
@@ -106,8 +112,13 @@ pub inline fn scan(rest: []const u8, param_storage: []Param, sub_storage: []u32)
             .digit => unreachable,
             .semi => {
                 push(params, subs, &n, &ns, val, in_sub);
-                if (n < params.len) {
+                if (n < max_params) {
                     params[n] = .{};
+                    n += 1;
+                } else if (n == max_params) {
+                    // Every parameter is taken: later values go to the sink,
+                    // never over the last kept parameter.
+                    params[n] = .{ .sub_len = max_param_subs };
                     n += 1;
                 }
                 val = 0;
@@ -138,6 +149,8 @@ pub inline fn scan(rest: []const u8, param_storage: []Param, sub_storage: []u32)
                 const len: u32 = @intCast(i);
                 if (bad) return .{ .len = len, .seq = .{} };
                 if (have or in_sub or n > 0 or i > 3) push(params, subs, &n, &ns, val, in_sub);
+                // Drop the sink.
+                n = @min(n, max_params);
                 return .{ .len = len, .seq = .{ .private = private, .final = c, .params = params[0..n], .subs = subs[0..ns] } };
             },
         }
@@ -162,21 +175,63 @@ inline fn addSub(p: *Param, subs: []u32, ns: *usize, val: u32) void {
     p.sub_len += 1;
 }
 
+/// `s` repeated `n` times (test input).
+fn repeat(comptime s: []const u8, comptime n: usize) []const u8 {
+    comptime var out: []const u8 = "";
+    inline for (0..n) |_| out = out ++ s;
+    return out;
+}
+
 test "scanner capacity does not change parameter limits" {
     var params: [256]Param = undefined;
     var subs: [256]u32 = undefined;
-    const many = "\x1b[1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;2m";
+    const many = "\x1b[" ++ comptime repeat("1;", max_params + 4) ++ "2m";
     const s = parse(many, &params, &subs);
     try std.testing.expectEqual(@as(usize, max_params), s.params.len);
     var fixed: Bufs = .{};
     const reference = parse(many, &fixed.params, &fixed.subs);
     for (s.params, reference.params) |got, want| try std.testing.expectEqual(want.value, got.value);
 
-    // Preserve all eight subparameters for all sixteen parameters.
+    // Preserve all eight subparameters for sixteen parameters (`max_subs`).
     const full = "\x1b[1:2:3:4:5:6:7:8:9;1:2:3:4:5:6:7:8:9;1:2:3:4:5:6:7:8:9;1:2:3:4:5:6:7:8:9;1:2:3:4:5:6:7:8:9;1:2:3:4:5:6:7:8:9;1:2:3:4:5:6:7:8:9;1:2:3:4:5:6:7:8:9;1:2:3:4:5:6:7:8:9;1:2:3:4:5:6:7:8:9;1:2:3:4:5:6:7:8:9;1:2:3:4:5:6:7:8:9;1:2:3:4:5:6:7:8:9;1:2:3:4:5:6:7:8:9;1:2:3:4:5:6:7:8:9;1:2:3:4:5:6:7:8:9m";
     const t = parse(full, &params, &subs);
     try std.testing.expectEqual(@as(usize, 128), t.subs.len);
     for (t.params) |p| try std.testing.expectEqualSlices(u32, &.{ 2, 3, 4, 5, 6, 7, 8, 9 }, t.subsOf(p));
+}
+
+test "parameters past the limit are dropped, not written over the last kept one" {
+    var b: Bufs = .{};
+    // Values after the limit (7;9;31) must not replace parameter 32.
+    const s = parse("\x1b[" ++ comptime repeat("1;", max_params - 1) ++ "4;7;9:5:6;31m", &b.params, &b.subs);
+    try std.testing.expectEqual(@as(usize, max_params), s.params.len);
+    try std.testing.expectEqual(@as(u32, 4), s.params[max_params - 1].value);
+    try std.testing.expectEqual(@as(u8, 0), s.params[max_params - 1].sub_len);
+    try std.testing.expectEqual(@as(usize, 0), s.subs.len);
+    // A subparameter list cut at the limit keeps its first part only.
+    const t = parse("\x1b[" ++ comptime repeat("1;", max_params - 1) ++ "4:3;58:2::1:2:3m", &b.params, &b.subs);
+    try std.testing.expectEqual(@as(u32, 4), t.params[max_params - 1].value);
+    try std.testing.expectEqualSlices(u32, &.{3}, t.subsOf(t.params[max_params - 1]));
+    // Past the limit, intermediates and invalid bytes still count, and the
+    // sequence ends at the same final byte (or is still incomplete).
+    const long = "\x1b[" ++ comptime repeat("1;", max_params + 3);
+    const dollar = scan(long ++ "$xtext", &b.params, &b.subs);
+    try std.testing.expectEqual(@as(u32, long.len + 2), dollar.len);
+    try std.testing.expectEqual(@as(u8, 'x'), dollar.seq.final);
+    try std.testing.expectEqual(@as(u32, '$'), dollar.seq.private);
+    try std.testing.expectEqual(@as(usize, max_params), dollar.seq.params.len);
+    const bad = scan(long ++ "\x01m", &b.params, &b.subs);
+    try std.testing.expectEqual(@as(u32, long.len + 2), bad.len);
+    try std.testing.expectEqual(@as(u8, 0), bad.seq.final);
+    try std.testing.expectEqual(@as(u32, 0), scan(long ++ "7:8", &b.params, &b.subs).len);
+}
+
+test "kitty long-escape SGR keeps all 18 parameters" {
+    var b: Bufs = .{};
+    const s = parse("\x1b[38;2;1;2;3;48;2;4;5;6;1;3;4:3;58;2;7;8;9m", &b.params, &b.subs);
+    try std.testing.expectEqual(@as(usize, 18), s.params.len);
+    const want = [_]u32{ 38, 2, 1, 2, 3, 48, 2, 4, 5, 6, 1, 3, 4, 58, 2, 7, 8, 9 };
+    for (s.params, want) |p, w| try std.testing.expectEqual(w, p.value);
+    try std.testing.expectEqualSlices(u32, &.{3}, s.subsOf(s.params[12]));
 }
 
 test "parse cup" {
