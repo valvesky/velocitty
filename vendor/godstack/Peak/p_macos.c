@@ -8,7 +8,7 @@
 #include <AppKit/AppKit.h>
 #include <AudioToolbox/AudioToolbox.h>
 #include <CoreGraphics/CoreGraphics.h>
-#include <QuartzCore/CAMetalLayer.h>
+#include <QuartzCore/QuartzCore.h> /* CATransaction, CAMetalLayer */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

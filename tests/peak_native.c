@@ -180,9 +180,9 @@ static void macos_events_test(void)
     [(PeakMacView *)w->view insertText:@"a😀" replacementRange:NSMakeRange(NSNotFound, 0)];
     assert(peak_q_pop(&w->q, &ev) && ev.text.n == 5);
     assert(memcmp(ev.text.bytes, "a\xf0\x9f\x98\x80", 5) == 0);
-    [(PeakMacDelegate *)w->delegate windowDidResignKey:nil];
+    [(PeakMacDelegate *)w->delegate windowDidResignKey:[NSNotification notificationWithName:NSWindowDidResignKeyNotification object:w->window]];
     assert(peak_q_pop(&w->q, &ev) && ev.type == PEAK_EVENT_FOCUS && !ev.focus.on);
-    [(PeakMacDelegate *)w->delegate windowDidBecomeKey:nil];
+    [(PeakMacDelegate *)w->delegate windowDidBecomeKey:[NSNotification notificationWithName:NSWindowDidBecomeKeyNotification object:w->window]];
     assert(peak_q_pop(&w->q, &ev) && ev.type == PEAK_EVENT_FOCUS && ev.focus.on);
     [w->window performClose:nil];
     int closed = 0;
