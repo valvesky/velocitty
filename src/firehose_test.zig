@@ -1193,3 +1193,16 @@ test "progress proof preserves intervening replies, REP and screen switches unde
     try std.testing.expect(p.compare());
     try std.testing.expectEqual(p.vt[0].last_cp, p.vt[1].last_cp);
 }
+
+test "long CSI SGR survives cached input parsing" {
+    const p = try Pair.create("long SGR", 8, 2, 4096);
+    defer p.destroy();
+    const input = "\x1b[38;2;10;20;30;48;2;40;50;60;1;3;4:3;58;2;7;8;9mX";
+    for (0..2) |i| try p.write(i, input);
+    try std.testing.expect(p.compare());
+    const style = p.vt[1].styleOf(p.vt[1].grid().cellAt(0, 0));
+    try std.testing.expect(style.attrs.bold and style.attrs.italic and style.attrs.underline and style.attrs.ul_color);
+    try std.testing.expectEqual(@as(u8, 7), style.ul.r);
+    try std.testing.expectEqual(@as(u8, 8), style.ul.g);
+    try std.testing.expectEqual(@as(u8, 9), style.ul.b);
+}

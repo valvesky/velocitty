@@ -7,6 +7,9 @@ const builtin = @import("builtin");
 const assert = std.debug.assert;
 const posix = std.posix;
 
+extern fn peak_mirror_map(size: usize) ?[*]u8;
+extern fn peak_mirror_unmap(ptr: [*]u8, size: usize) void;
+
 const Preparse = @import("preparser.zig");
 const stEnd = Preparse.stringEnd;
 
@@ -101,6 +104,7 @@ pub const CircBuffer = struct {
         if (self.mapped) {
             switch (builtin.os.tag) {
                 .linux => posix.munmap(@alignCast(self.storage)),
+                .macos => peak_mirror_unmap(self.storage.ptr, self.capacity),
                 else => unreachable,
             }
         } else {
@@ -461,6 +465,10 @@ pub const CircBuffer = struct {
     }
 
     fn mapMirror(size: usize) ?[]u8 {
+        if (builtin.os.tag == .macos) {
+            const ptr = peak_mirror_map(size) orelse return null;
+            return ptr[0 .. size * 2];
+        }
         if (builtin.os.tag != .linux) return null;
         if (size == 0 or size % std.heap.pageSize() != 0) return null;
         const fd = posix.memfd_create("zt-ring", 0) catch return null;
@@ -1132,6 +1140,29 @@ test "the scanner's CSI parse is what the VT applies" {
     try std.testing.expectEqual(@as(usize, 2), sgr.params.len);
     try std.testing.expectEqualSlices(u32, &.{ 2, 1, 2, 3 }, sgr.subsOf(sgr.params[0]));
     try std.testing.expectEqual(@as(u32, 1), sgr.value(1));
+}
+
+test "cached long CSI sequences preserve the last retained parameter" {
+    var buf = try CircBuffer.create(std.testing.allocator, 32768);
+    defer buf.destroy();
+    const params = comptime blk: {
+        var text: []const u8 = "";
+        for (0..31) |_| text = text ++ "1;";
+        break :blk text;
+    };
+    const seq = "\x1b[" ++ params ++ "4;7;9:5:6;31m";
+    for (0..100) |_| append(&buf, seq);
+    append(&buf, "\x1b[31m");
+    const result = buf.scan(.{ .rows = 4, .alt = false }, false);
+    try std.testing.expectEqual(@as(u32, 0), result.held);
+    try std.testing.expectEqual(@as(usize, 101), buf.preparser.csis.items.len);
+    for (0..100) |i| {
+        const parsed = buf.preparser.csiAt(i);
+        try std.testing.expectEqual(@as(usize, 32), parsed.params.len);
+        try std.testing.expectEqual(@as(u32, 4), parsed.value(31));
+        try std.testing.expectEqual(@as(usize, 0), parsed.subs.len);
+    }
+    try std.testing.expectEqual(@as(u32, 31), buf.preparser.csiAt(100).value(0));
 }
 
 test "pressure retains live lookahead across reads instead of painting each suffix" {

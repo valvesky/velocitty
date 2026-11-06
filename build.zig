@@ -65,6 +65,11 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addStbTrueType(bench_mod, b);
+    // The macOS ring uses Peak's shared-memory mirror in benchmarks as well.
+    if (target.result.os.tag == .macos) {
+        addPeak(bench_mod, b, target);
+        addMacSdk(bench_mod, b, target, macos_sdk);
+    }
     const bench_exe = b.addExecutable(.{
         .name = "velocitty-bench",
         .root_module = bench_mod,

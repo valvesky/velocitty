@@ -9,6 +9,24 @@ test {
     _ = @import("firehose_test.zig");
 }
 
+test "macOS ring aliases both halves and falls back for small buffers" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    var buffer = try CircBuffer.create(std.testing.allocator, CircBuffer.default_capacity);
+    defer buffer.destroy();
+    try std.testing.expect(buffer.mapped);
+    const n = buffer.capacity;
+    buffer.storage[0] = 0x12;
+    buffer.storage[n - 1] = 0x34;
+    try std.testing.expectEqual(@as(u8, 0x12), buffer.storage[n]);
+    try std.testing.expectEqual(@as(u8, 0x34), buffer.storage[2 * n - 1]);
+    buffer.storage[n + 1] = 0x56;
+    try std.testing.expectEqual(@as(u8, 0x56), buffer.storage[1]);
+
+    var small = try CircBuffer.create(std.testing.allocator, 1024);
+    defer small.destroy();
+    try std.testing.expect(!small.mapped);
+}
+
 test "Peak PTY spawns, resizes, drains output and reports child exit" {
     const argv: []const [*:0]const u8 = if (builtin.os.tag == .windows)
         &.{ "cmd.exe", "/d", "/c", "echo velocitty-port-ready" }
