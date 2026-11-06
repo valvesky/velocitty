@@ -13,7 +13,7 @@ pub const Match = struct { path: []const u8, index: u32 };
 pub const Resolved = struct { path: []u8, index: u32 };
 
 pub const fallback_families: []const []const u8 = switch (builtin.os.tag) {
-    .windows => &.{ "Segoe UI Emoji", "Segoe UI Symbol", "Microsoft YaHei" },
+    .windows => &.{ "Segoe UI Emoji", "Segoe UI Symbol", "Microsoft YaHei", "Malgun Gothic" },
     .macos, .ios, .tvos, .watchos, .visionos => &.{ "Apple Color Emoji", "Apple Symbols", "PingFang SC" },
     else => &.{ "Noto Color Emoji", "DejaVu Sans Mono", "Noto Sans Symbols", "Noto Sans Symbols 2", "Noto Sans CJK JP" },
 };
@@ -79,7 +79,8 @@ pub fn loadFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
     return bytes;
 }
 
-pub extern fn velocitty_font_load(family: [*:0]const u8, bold: c_int, italic: c_int, exact: c_int, len: *usize) ?[*]u8;
+pub extern fn velocitty_font_load(family: [*:0]const u8, bold: c_int, italic: c_int, exact: c_int, len: *usize, index: *c_uint) ?[*]u8;
+pub extern fn velocitty_ttc_member(ttc: [*]const u8, ttc_len: usize, dir: [*]const u8, dir_len: usize, index: *c_uint) c_int;
 pub extern fn velocitty_font_free(data: [*]u8) void;
 
 pub fn loadFamily(gpa: std.mem.Allocator, io: std.Io, family: []const u8, bold: bool, italic: bool, exact: bool) anyerror!Loaded {
@@ -97,9 +98,10 @@ pub fn loadFamily(gpa: std.mem.Allocator, io: std.Io, family: []const u8, bold: 
     @memcpy(name[0..family.len], family);
     name[family.len] = 0;
     var n: usize = 0;
-    const data = velocitty_font_load(@ptrCast(&name), @intFromBool(bold), @intFromBool(italic), @intFromBool(exact), &n) orelse return error.InvalidFont;
+    var index: c_uint = 0;
+    const data = velocitty_font_load(@ptrCast(&name), @intFromBool(bold), @intFromBool(italic), @intFromBool(exact), &n, &index) orelse return error.InvalidFont;
     defer velocitty_font_free(data);
-    return .{ .bytes = try gpa.dupe(u8, data[0..n]) };
+    return .{ .bytes = try gpa.dupe(u8, data[0..n]), .index = index };
 }
 
 test "fontconfig matches retain collection members and family validation" {
@@ -111,4 +113,22 @@ test "fontconfig matches retain collection members and family validation" {
     try std.testing.expectEqual(@as(u32, 2), matchFace("/fonts/cjk.ttc\nSubstitute\n65538\n", null).?.index);
     try std.testing.expect(matchFace("/fonts/cjk.ttc\nFamily\ninvalid\n", null) == null);
     try std.testing.expect(matchFace("/fonts/cjk.ttc\nFamily\n", null) == null);
+}
+
+test "ttc member selection matches the sfnt directory" {
+    const ttc = &@import("type/truetype.zig").testing.collection;
+    var idx: c_uint = 99;
+    // Member 1 directory: 12-byte header + 7 entries at offset 144.
+    try std.testing.expectEqual(@as(c_int, 1), velocitty_ttc_member(ttc, ttc.len, ttc[144..].ptr, 124, &idx));
+    try std.testing.expectEqual(@as(c_uint, 1), idx);
+    try std.testing.expectEqual(@as(c_int, 1), velocitty_ttc_member(ttc, ttc.len, ttc[20..].ptr, 124, &idx));
+    try std.testing.expectEqual(@as(c_uint, 0), idx);
+    var bad: [124]u8 = undefined;
+    @memcpy(&bad, ttc[144..268]);
+    bad[40] ^= 1;
+    try std.testing.expectEqual(@as(c_int, 0), velocitty_ttc_member(ttc, ttc.len, &bad, bad.len, &idx));
+    // Directory running past the end of the collection never matches.
+    try std.testing.expectEqual(@as(c_int, 0), velocitty_ttc_member(ttc, ttc.len, ttc[144..].ptr, 124 + 4096, &idx));
+    // Not a collection.
+    try std.testing.expectEqual(@as(c_int, 0), velocitty_ttc_member(ttc[20..].ptr, 508, ttc[20..].ptr, 124, &idx));
 }

@@ -117,8 +117,15 @@ pub const Frame = struct {
     last_fill_ns: u64 = 0,
     last_glyph_ns: u64 = 0,
     prev_sel: Select.State = .{},
-    /// Rows that held kitty/sixel pixels last frame; repainted next frame.
+    /// Rows that held kitty/sixel pixels last frame; repainted when the
+    /// placements change.
     prev_img_rows: [max_rows]bool = @splat(false),
+    /// Last frame's placement signature, screen and image base line: while
+    /// they match (base moving only with the detected pixel scroll), image
+    /// pixels in the framebuffer are current and rows repaint only for text.
+    prev_img_sig: u64 = 0,
+    prev_img_which: u1 = 0,
+    prev_img_base: i64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, width: u32, height: u32) std.mem.Allocator.Error!Frame {
         assert(width > 0);
@@ -212,19 +219,35 @@ pub const Frame = struct {
         self.dirty_y = 0;
         self.dirty_h = 0;
 
-        // Images are blitted over text: rows they cover now or covered last
-        // frame are repainted; other rows keep the dirty/compare rules.
+        // Images are blitted over text, clipped to each repainted run. Rows
+        // they cover now or covered last frame are forced only when the
+        // placements changed; otherwise the framebuffer already holds them.
         var img_rows: [max_rows]bool = @splat(false);
         imageRows(screen, cell_w, cell_h, rows, &img_rows);
+        const img_which: u1 = if (screen.altScreen()) 1 else 0;
+        const img_base = screen.imageBase();
+        const img_sig = imageSignature(screen, img_which, cell_w, cell_h);
         var scroll: i32 = 0;
         if (have_prev and mayHaveScrolled(screen, rows)) {
             scroll = scrollDelta(screen, self.prev, cols, rows);
         }
+        const img_changed = !have_prev or img_sig != self.prev_img_sig or
+            img_which != self.prev_img_which or img_base - self.prev_img_base != scroll;
+        // Rows a scroll exposes keep stale pixels (possibly image pixels)
+        // and stale snapshot cells; repaint them while images exist.
+        const exposed: u16 = if (img_sig != 0) @intCast(@min(@abs(scroll), rows)) else 0;
+        const exposed_lo: u16 = if (scroll > 0) rows - exposed else 0;
+        const exposed_hi: u16 = if (scroll > 0) rows else exposed;
+        // Where the erased cursor's row lands after the shift. Inverting it
+        // back is exact only over text: over an image (drawn above the
+        // cursor) it corrupts pixels, so that row is always repainted.
+        var erased_row: i32 = -1;
         if (scroll != 0 and self.prev_cursor_on) {
             var pc = self.prev_cursor;
             if (pc.row >= rows) pc.row = rows - 1;
             if (pc.col >= cols) pc.col = cols - 1;
             paintCursor(self, pc.col, pc.row, cell_w, cell_h, self.prev_cursor_style);
+            erased_row = @as(i32, pc.row) - scroll;
         }
         if (scroll != 0) {
             const dir: Shift = if (scroll > 0) .up else .down;
@@ -243,12 +266,14 @@ pub const Frame = struct {
         while (r < rows) : (r += 1) {
             const cursor_row = mustPaintCursorRow(r, self.prev_cursor, self.prev_cursor_on, cur, cur_on) or
                 (style_changed and (r == cur.row or r == self.prev_cursor.row)) or
-                (scroll != 0 and cur_on and r == cur.row);
+                (scroll != 0 and cur_on and r == cur.row) or
+                @as(i32, r) == erased_row;
             const shifted_row = @as(i32, r) + scroll;
             const shifted_sel = scroll != 0 and shifted_row >= 0 and shifted_row < rows and
                 self.prev_sel.coversRow(@intCast(shifted_row), cols);
             const sel_row = sel.coversRow(r, cols) or self.prev_sel.coversRow(r, cols) or shifted_sel;
-            const img_row = r < max_rows and (img_rows[r] or self.prev_img_rows[r]);
+            const img_row = (r >= exposed_lo and r < exposed_hi) or
+                (img_changed and r < max_rows and (img_rows[r] or self.prev_img_rows[r]));
             var need = true;
             if (!paint_all and !cursor_row and !sel_row and !img_row) {
                 if (use_bits and !screen.lineDirty(r)) {
@@ -315,9 +340,9 @@ pub const Frame = struct {
             if (cur_on and cur.row >= run.start and cur.row < run.end) {
                 paintCursor(self, cur.col, cur.row, cell_w, cell_h, style);
             }
+            if (img_sig != 0) blitKitty(self, screen, cell_w, cell_h, y0, @as(u32, run.end) * cell_h);
             glyph_ns += @intCast(nowNs() - tg0);
         }
-        blitKitty(self, screen, cell_w, cell_h);
         if (overlay_on) {
             paintDebugOverlay(self, screen, cell_w, cell_h, cur);
             self.dirty_full = true;
@@ -331,6 +356,9 @@ pub const Frame = struct {
         self.prev_cursor_style = style;
         self.prev_sel = sel;
         self.prev_img_rows = img_rows;
+        self.prev_img_sig = img_sig;
+        self.prev_img_which = img_which;
+        self.prev_img_base = img_base;
         if (self.dirty_h == self.height) self.dirty_full = true;
     }
 
@@ -748,7 +776,32 @@ fn shiftRows(flags: *[max_rows]bool, k: u16, dir: Shift) void {
     }
 }
 
-fn blitKitty(self: *Frame, screen: *const Term.Screen, cell_w: u32, cell_h: u32) void {
+/// Hash of every placement on `which` with the pixels and geometry it would
+/// draw (absolute rows, so scrolling alone does not change it). 0 means no
+/// placements.
+fn imageSignature(screen: *const Term.Screen, which: u1, cell_w: u32, cell_h: u32) u64 {
+    const store = &screen.kitty;
+    var h = std.hash.Wyhash.init(0);
+    var any = false;
+    for (store.placements.items) |p| {
+        if (p.screen != which) continue;
+        any = true;
+        std.hash.autoHash(&h, p.image_id);
+        std.hash.autoHash(&h, p.row);
+        std.hash.autoHash(&h, p.col);
+        std.hash.autoHash(&h, [4]u32{ p.src_x, p.src_y, p.src_w, p.src_h });
+        const img = store.find(p.image_id) orelse continue;
+        const size = p.pixelSize(img.*, cell_w, cell_h);
+        std.hash.autoHash(&h, img.serial);
+        std.hash.autoHash(&h, img.rgba.len);
+        std.hash.autoHash(&h, [2]u64{ size.width, size.height });
+    }
+    if (!any) return 0;
+    return h.final() | 1;
+}
+
+/// Draws visible placements over framebuffer rows `clip_y0..clip_y1`.
+fn blitKitty(self: *Frame, screen: *const Term.Screen, cell_w: u32, cell_h: u32, clip_y0: u32, clip_y1: u32) void {
     const store = &screen.kitty;
     if (store.placements.items.len == 0) return;
     const base = screen.imageBase();
@@ -765,7 +818,7 @@ fn blitKitty(self: *Frame, screen: *const Term.Screen, cell_w: u32, cell_h: u32)
         const src_y = @min(p.src_y, img.height);
         const crop_w: u32 = if (p.src_w == 0) img.width - src_x else @min(p.src_w, img.width - src_x);
         const crop_h: u32 = if (p.src_h == 0) img.height - src_y else @min(p.src_h, img.height - src_y);
-        blitRgba(self, img.rgba, img.width, img.height, src_x, src_y, crop_w, crop_h, dx, dy, dest_w, dest_h);
+        blitRgba(self, img.rgba, img.width, img.height, src_x, src_y, crop_w, crop_h, dx, dy, dest_w, dest_h, clip_y0, clip_y1);
     }
 }
 
@@ -812,15 +865,18 @@ fn blitRgba(
     dest_y: i64,
     dest_w: u64,
     dest_h: u64,
+    clip_y0: u32,
+    clip_y1: u32,
 ) void {
     _ = stride_h;
     if (src_w == 0 or src_h == 0 or dest_w == 0 or dest_h == 0) return;
-    // Iterate only the intersection with the framebuffer; placements may be
-    // much larger than the window or start outside it.
+    // Iterate only the intersection with the framebuffer rows being
+    // repainted; placements may be much larger than the window or start
+    // outside it.
     const x0: i64 = @max(0, dest_x);
-    const y0: i64 = @max(0, dest_y);
+    const y0: i64 = @max(clip_y0, dest_y);
     const x1: i64 = @intCast(@min(@as(i128, self.width), @as(i128, dest_x) + dest_w));
-    const y1: i64 = @intCast(@min(@as(i128, self.height), @as(i128, dest_y) + dest_h));
+    const y1: i64 = @intCast(@min(@as(i128, @min(self.height, clip_y1)), @as(i128, dest_y) + dest_h));
     if (x0 >= x1 or y0 >= y1) return;
     // Exact floor(n * src / dest) stepped incrementally (Bresenham): one u128
     // division per axis per call, then only u64 adds per pixel.
@@ -1464,6 +1520,120 @@ test "incremental render after multi-line scroll and image moves matches full re
         if (step.lines > 0 and step.lines <= 3 and frame.prev.len != 0) {
             try std.testing.expectEqual(@as(i32, step.lines), scrollDelta(&vt, frame.prev, 6, 6));
         }
+        vt.prepareImages();
+        frame.render(&vt, 4, 4, null, 8);
+        vt.clearDirty();
+        fresh.invalidate();
+        fresh.forgetPrev();
+        fresh.render(&vt, 4, 4, null, 8);
+        try std.testing.expectEqualSlices(u32, fresh.pixels, frame.pixels);
+    }
+}
+
+test "static images are not re-blitted yet match full renders through edits scrolls and id reuse" {
+    const a = std.testing.allocator;
+    var storage: [4096]u8 = undefined;
+    var vt = try Term.VtState.init(a, 6, 6, 32, &storage);
+    defer vt.deinit();
+    vt.flags.cursor_visible = false;
+    var frame = try Frame.init(a, 24, 24);
+    defer frame.deinit();
+    var fresh = try Frame.init(a, 24, 24);
+    defer fresh.deinit();
+    // 2x2 RGBA with opaque, half-alpha and transparent pixels, over text.
+    const img_a = "\x1b_Ga=T,f=32,s=2,v=2,i=4,C=1,c=3,r=3,q=2;/wAA/wD/AIAAAAAAAAD//w==\x1b\\";
+    const img_b = "\x1b_Ga=T,f=32,s=2,v=2,i=4,C=1,c=3,r=3,q=2;CQkJ/8hkAEAAAAAAMjxG/w==\x1b\\";
+    const put = struct {
+        fn go(t: *Term.VtState, row: u16, col: u16, cp: u21) void {
+            const g = t.grid();
+            g.cursor.row = row;
+            g.cursor.col = col;
+            g.wrap_pending = false;
+            t.printCodepoint(cp);
+        }
+    }.go;
+    const Action = union(enum) { place: struct { seq: []const u8, row: u16 }, edit: struct { row: u16, col: u16, cp: u21 }, lines: u8, blank_lines: u8, idle };
+    const steps = [_]Action{
+        .{ .edit = .{ .row = 2, .col = 2, .cp = 'x' } },
+        .{ .place = .{ .seq = img_a, .row = 1 } },
+        .idle,
+        .{ .edit = .{ .row = 2, .col = 2, .cp = 'y' } },
+        .{ .edit = .{ .row = 3, .col = 3, .cp = 'z' } },
+        .{ .edit = .{ .row = 0, .col = 0, .cp = 'q' } },
+        .{ .place = .{ .seq = img_b, .row = 1 } },
+        .{ .lines = 1 },
+        .{ .blank_lines = 1 },
+        .{ .lines = 2 },
+        .{ .edit = .{ .row = 1, .col = 2, .cp = 'w' } },
+        // Touching the bottom edge: scrolls expose rows that held image pixels.
+        .{ .place = .{ .seq = img_a, .row = 3 } },
+        .{ .blank_lines = 1 },
+        .{ .lines = 1 },
+        .{ .blank_lines = 2 },
+    };
+    frame.render(&vt, 4, 4, null, 8);
+    vt.clearDirty();
+    var n: u8 = 0;
+    for (steps, 0..) |step, i| {
+        errdefer std.debug.print("step {d}: {any}\n", .{ i, step });
+        var expect_rows: ?u32 = null;
+        switch (step) {
+            .place => |pl| {
+                const g = vt.grid();
+                g.cursor.row = pl.row;
+                g.cursor.col = 1;
+                _ = vt.kitty.feed(pl.seq, .{ .row = pl.row, .col = 1, .base = @intCast(vt.imageBase()), .cell_w = 4, .cell_h = 4 }, 6, 6, 0);
+            },
+            .edit => |e| {
+                put(&vt, e.row, e.col, e.cp);
+                expect_rows = 1;
+            },
+            .lines, .blank_lines => |k| for (0..k) |_| {
+                const g = vt.grid();
+                g.cursor.row = 5;
+                g.cursor.col = 0;
+                if (step == .lines) {
+                    for (0..4) |c| vt.printCodepoint('A' + @as(u21, (n +% @as(u8, @intCast(c))) % 26));
+                    n +%= 1;
+                }
+                vt.carriageReturn();
+                vt.index();
+            },
+            .idle => expect_rows = 0,
+        }
+        vt.prepareImages();
+        frame.render(&vt, 4, 4, null, 8);
+        vt.clearDirty();
+        // An edit under a static image repaints only its own row.
+        if (expect_rows) |rows| try std.testing.expectEqual(rows * 4, frame.dirty_h);
+        fresh.invalidate();
+        fresh.forgetPrev();
+        fresh.render(&vt, 4, 4, null, 8);
+        try std.testing.expectEqualSlices(u32, fresh.pixels, frame.pixels);
+    }
+}
+
+test "scrolling the cursor out from under an image leaves no inverted pixels" {
+    const a = std.testing.allocator;
+    var storage: [4096]u8 = undefined;
+    var vt = try Term.VtState.init(a, 6, 6, 32, &storage);
+    defer vt.deinit();
+    var frame = try Frame.init(a, 24, 24);
+    defer frame.deinit();
+    var fresh = try Frame.init(a, 24, 24);
+    defer fresh.deinit();
+    for (0..6) |r| {
+        const g = vt.grid();
+        g.cursor.row = @intCast(r);
+        g.cursor.col = 0;
+        for (0..5) |c| vt.printCodepoint('a' + @as(u21, @intCast((r * 5 + c) % 26)));
+    }
+    // Opaque image over row 2; the cursor sits beneath it.
+    _ = vt.kitty.feed("\x1b_Ga=T,f=32,s=1,v=1,i=4,C=1,c=3,r=1,q=2;/wAA/w==\x1b\\", .{ .row = 2, .col = 0, .cell_w = 4, .cell_h = 4 }, 6, 6, 0);
+    vt.grid().cursor = .{ .row = 2, .col = 1 };
+    vt.grid().wrap_pending = false;
+    for (0..3) |step| {
+        if (step != 0) vt.regionScrollUp(1);
         vt.prepareImages();
         frame.render(&vt, 4, 4, null, 8);
         vt.clearDirty();

@@ -106,6 +106,12 @@ figcaption {
 }
 
 code { color: #0f0; }
+.axioms pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.performance-results { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.performance-results caption { text-align: left; color: #c8c8c8; margin-bottom: 0.5rem; }
+.performance-results th, .performance-results td { padding: 0.6rem 0.4rem; border-bottom: 1px solid #41443a; text-align: right; overflow-wrap: normal; }
+.performance-results td { white-space: nowrap; }
+.performance-results th:first-child, .performance-results td:first-child { text-align: left; }
 summary { color: #b9d99a; cursor: pointer; }
 summary:hover { color: #d2efa9; }
 
@@ -142,13 +148,15 @@ blockquote + p {
     place-items: center;
     min-height: clamp(14rem, 35vw, 23rem);
     padding: clamp(1.25rem, 4vw, 3rem);
-    background-image: linear-gradient(rgba(40, 40, 40, 0.72), rgba(40, 40, 40, 0.72)), url("payloads.svg");
+    background-image: linear-gradient(rgba(40, 40, 40, 0.72), rgba(40, 40, 40, 0.72)), var(--title-image, url("payloads.svg"));
     background-position: center;
     background-size: cover;
     background-repeat: no-repeat;
     text-align: center;
     text-shadow: 0 2px 6px #282828;
 }
+
+.title-progress { --title-image: url("obsolete3.svg"); }
 
 h2 {
     color: #d79921;

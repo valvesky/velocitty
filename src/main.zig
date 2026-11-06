@@ -969,7 +969,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     var config = loadConfig(io.io(), allocator);
     const hypr = hyprlandFocusedMonitor(io.io(), allocator);
-    const display_hz: u32 = hypr.hz orelse 60;
+    var display_hz: u32 = hypr.hz orelse 60;
     var hz: u32 = display_hz;
     var scale: f32 = hypr.scale orelse gdkScale();
     scale_cache = scale;
@@ -1003,7 +1003,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         cellMetrics(&type_ctx, size_px, &cell_w, &cell_h);
         type_ptr = &type_ctx;
     } else |_| {
-        Debug.log("no fonts found; drawing without glyphs\n", .{});
+        Scheme.report("no usable font for \"{s}\"; drawing without glyphs", .{config.family() orelse "monospace"});
     }
 
     var circbuffer: CircBuffer = try CircBuffer.create(allocator, CircBuffer.default_capacity);
@@ -1011,6 +1011,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     var term: VtState = try VtState.init(allocator, cols, rows, 1000, circbuffer.storage);
     defer term.deinit();
+    // Image decodes run on worker threads; a frame never waits for one.
+    term.kitty.async_decode = true;
     term.applyScheme(config.scheme);
     term.grids[0].reset(cols, rows, config.scheme);
     term.grids[1].reset(cols, rows, config.scheme);
@@ -1021,6 +1023,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const win_h = @as(u32, rows) * cell_h + 2 * pad_px;
     var window = try Platform.Window.open(allocator, cli.title, cli.class, win_w, win_h);
     defer window.close();
+    if (builtin.os.tag == .macos) {
+        const rate = window.refreshRate();
+        if (rate != 0) display_hz = rate;
+        hz = display_hz;
+    }
 
     var frame = try Draw.Frame.init(allocator, @as(u32, cols) * cell_w, @as(u32, rows) * cell_h);
     defer frame.deinit();
@@ -1040,8 +1047,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var need_draw = true;
     var need_layout = true;
     var last_alpha: u8 = 255;
+    var last_ime: [4]i32 = .{ -1, -1, -1, -1 };
     var last_watch_ns: i128 = 0;
     var sync_hold: u32 = 0;
+    // Config and font errors from startup, shown in-window when stderr is not visible.
+    term.feedText(Scheme.takeDiagnostics());
 
     var eloop = EventLoop{
         .window = &window,
@@ -1068,6 +1078,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const now_ns: i128 = @intCast(std.Io.Timestamp.now(io.io(), .awake).nanoseconds);
         if (now_ns -| last_watch_ns >= 250_000_000) {
             last_watch_ns = now_ns;
+            if (builtin.os.tag == .macos) {
+                const rate = window.refreshRate();
+                if (rate != 0) {
+                    display_hz = rate;
+                    hz = rate;
+                }
+            }
             const stamp = Scheme.watchStamp(io.io());
             if (stamp != theme_stamp) reload_requested.store(true, .release);
         }
@@ -1092,9 +1109,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     new_blobs.deinit(allocator);
                 }
             } else |_| {
+                Scheme.report("no usable font for \"{s}\" after reload", .{config.family() orelse "monospace"});
                 for (new_blobs.items) |b| allocator.free(b.bytes);
                 new_blobs.deinit(allocator);
             }
+            term.feedText(Scheme.takeDiagnostics());
             applyMetrics(type_ptr, size_px, scale, config.pad_px, &cell_w, &cell_h, &pad_px);
             try syncGrid(&window, &term, &frame, &pty, &cols, &rows, cell_w, cell_h, pad_px);
             frame.invalidate();
@@ -1128,13 +1147,21 @@ pub fn main(init: std.process.Init.Minimal) !void {
         );
 
         var hangup = false;
-        circbuffer.readSource(Platform.PtySource{ .pty = &pty, .window = &window }, hz, .{
+        const source = Platform.PtySource{ .pty = &pty, .window = &window };
+        const pump: CircBuffer.Pump = .{
             .fd = x_fd,
             .ctx = @ptrCast(&eloop),
             .tick = EventLoop.pump,
-        }, term.sink()) catch {
+        };
+        (if (builtin.os.tag == .macos and !term.flags.sync_output)
+            circbuffer.readSourceInteractive(source, hz, pump, term.sink())
+        else
+            circbuffer.readSource(source, hz, pump, term.sink())) catch {
             hangup = true;
         };
+        // readSource returns at least once per frame period, so finished
+        // decodes appear within a frame even when the PTY is idle.
+        if (term.kitty.collectDecoded()) need_draw = true;
 
         try layoutIfNeeded(
             &need_layout,
@@ -1178,6 +1205,24 @@ pub fn main(init: std.process.Init.Minimal) !void {
             eloop.presenter.present(&window, &frame, padColor(&term));
             need_draw = false;
             sync_hold = 0;
+            {
+                // IME candidate window follows the cursor cell (buffer pixels).
+                const o = frameOrigin(window.framebuffer(), &frame);
+                const cur = term.cursor();
+                // Pending-wrap cursors sit one past the margin; clamp like draw.zig.
+                const col: u32 = @min(cur.col, cols -| 1);
+                const row: u32 = @min(cur.row, rows -| 1);
+                const ime: [4]i32 = .{
+                    @intCast(o.x + col * cell_w),
+                    @intCast(o.y + row * cell_h),
+                    @intCast(cell_w),
+                    @intCast(cell_h),
+                };
+                if (!std.mem.eql(i32, &ime, &last_ime)) {
+                    last_ime = ime;
+                    window.setTextInputRect(ime[0], ime[1], ime[2], ime[3]);
+                }
+            }
         } else if (need_draw and hold_sync) {
             sync_hold += 1;
         }
@@ -1224,9 +1269,47 @@ test "native fonts load real primary faces and reject unrelated substitutions" {
     const glyph = try ctx.glyph('A', 16);
     try std.testing.expect(glyph.advance > 0);
     var n: usize = 0;
-    const missing = velocitty_font_load("VelocittyMissingFont123", 0, 0, 1, &n);
+    var missing_index: c_uint = 0;
+    const missing = velocitty_font_load("VelocittyMissingFont123", 0, 0, 1, &n, &missing_index);
     if (missing) |data| velocitty_font_free(data);
     try std.testing.expect(missing == null);
+}
+
+test "macOS emoji fallback loads on demand and rasterizes color pixels" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var blobs: std.ArrayList(FontBlob) = .empty;
+    defer {
+        for (blobs.items) |blob| gpa.free(blob.bytes);
+        blobs.deinit(gpa);
+    }
+    const config: Scheme.Config = .{};
+    try loadNativeFonts(gpa, &blobs, &config);
+    var ctx = try TypeCtx.init(gpa, .{});
+    defer ctx.deinit();
+    try bindFonts(gpa, &ctx, blobs.items);
+    _ = try ctx.glyph('A', 16);
+    try std.testing.expectEqual(@as(usize, 1), ctx.faces.items.len);
+
+    const glyph = try ctx.glyph(0x1F638, 32);
+    try std.testing.expect(glyph.color and glyph.glyph_id != 0);
+    try std.testing.expect(glyph.width > 0 and glyph.height > 0);
+    var colored: usize = 0;
+    for (0..glyph.height) |y| {
+        for (0..glyph.width) |x| {
+            const offset = (@as(usize, glyph.atlas_y) + y) * ctx.color_atlas.width + glyph.atlas_x + x;
+            const pixel = ctx.color_atlas.pixels[offset];
+            const r = (pixel >> 16) & 0xff;
+            const g = (pixel >> 8) & 0xff;
+            const b = pixel & 0xff;
+            if (pixel >> 24 >= 32 and (r != g or r != b)) colored += 1;
+        }
+    }
+    try std.testing.expect(colored > 8);
+    const loaded_faces = ctx.faces.items.len;
+    const cached = try ctx.glyph(0x1F638, 32);
+    try std.testing.expectEqual(glyph.font_id, cached.font_id);
+    try std.testing.expectEqual(loaded_faces, ctx.faces.items.len);
 }
 
 test "configured fonts defer coverage and styles while preserving fallback order" {

@@ -63,3 +63,15 @@ int zt_stb_glyph_empty(const void *storage, int glyph) {
     if (!stbtt_GetGlyphBox(info, glyph, &x0, &y0, &x1, &y1)) return 1;
     return x0 >= x1 || y0 >= y1;
 }
+
+void zt_stb_glyph_origin(const void *storage, int glyph, int *x, int *y) {
+    const stbtt_fontinfo *info = (const stbtt_fontinfo *)storage;
+    int x1 = 0, y1 = 0;
+    *x = 0;
+    *y = 0;
+    if (stbtt_IsGlyphEmpty(info, glyph)) return;
+    if (!stbtt_GetGlyphBox(info, glyph, x, y, &x1, &y1)) {
+        *x = 0;
+        *y = 0;
+    }
+}

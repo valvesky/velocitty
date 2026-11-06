@@ -3,6 +3,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Cbdt = @import("cbdt.zig");
+const Sbix = @import("sbix.zig");
 
 const c = struct {
     extern fn zt_stb_init(storage: *anyopaque, data: [*]const u8, len: c_int, offset: c_int) callconv(.c) c_int;
@@ -13,6 +14,7 @@ const c = struct {
     extern fn zt_stb_glyph_box(storage: *const anyopaque, glyph: c_int, size_px: f32, x0: *c_int, y0: *c_int, x1: *c_int, y1: *c_int) callconv(.c) void;
     extern fn zt_stb_make_glyph(storage: *const anyopaque, glyph: c_int, size_px: f32, out: [*]u8, w: c_int, h: c_int) callconv(.c) void;
     extern fn zt_stb_glyph_empty(storage: *const anyopaque, glyph: c_int) callconv(.c) c_int;
+    extern fn zt_stb_glyph_origin(storage: *const anyopaque, glyph: c_int, x: *c_int, y: *c_int) callconv(.c) void;
 };
 
 const info_cap = 256;
@@ -47,6 +49,7 @@ pub const Font = struct {
     info: [info_cap]u8 align(8) = undefined,
     outline: bool = false,
     color: ?Cbdt.ColorFont = null,
+    sbix: ?Sbix.ColorFont = null,
 
     pub fn open(bytes: []const u8) Error!Font {
         return openIndex(bytes, 0);
@@ -58,7 +61,8 @@ pub const Font = struct {
         var font: Font = .{ .bytes = bytes, .index = index };
         font.outline = c.zt_stb_init(&font.info, bytes.ptr, @intCast(bytes.len), @intCast(offset)) != 0;
         font.color = Cbdt.ColorFont.parseAt(bytes, offset);
-        if (!font.outline and font.color == null) return error.InvalidFont;
+        font.sbix = Sbix.ColorFont.parseAt(bytes, offset);
+        if (!font.outline and font.color == null and font.sbix == null) return error.InvalidFont;
         return font;
     }
 
@@ -83,6 +87,15 @@ pub const Font = struct {
                 .units_per_em = @intCast(upem),
             };
         }
+        if (self.sbix) |col| {
+            const scale = size_px / @as(f32, @floatFromInt(col.units_per_em));
+            return .{
+                .ascender = @as(f32, @floatFromInt(col.ascender)) * scale,
+                .descender = @as(f32, @floatFromInt(col.descender)) * scale,
+                .line_gap = @as(f32, @floatFromInt(col.line_gap)) * scale,
+                .units_per_em = col.units_per_em,
+            };
+        }
         const col = self.color orelse return error.InvalidFont;
         if (col.units_per_em == 0) return error.InvalidFont;
         const scale = size_px / @as(f32, @floatFromInt(col.units_per_em));
@@ -102,12 +115,21 @@ pub const Font = struct {
             if (adv < 0) return 0;
             return std.math.cast(u16, adv) orelse std.math.maxInt(u16);
         }
+        if (self.sbix) |col| {
+            if (glyph_id >= col.num_glyphs) return error.GlyphNotFound;
+            return col.advanceWidth(glyph_id);
+        }
         const col = self.color orelse return error.GlyphNotFound;
         if (glyph_id >= col.num_glyphs) return error.GlyphNotFound;
         return col.advanceWidth(glyph_id);
     }
 
     pub fn glyphIndex(self: Font, codepoint: u21) Error!?u16 {
+        if (self.sbix) |col| {
+            if (col.glyphIndex(codepoint)) |g| {
+                if (g != 0) return g;
+            }
+        }
         if (self.color) |col| {
             if (col.glyphIndex(codepoint)) |g| {
                 if (g != 0) return g;
@@ -122,6 +144,9 @@ pub const Font = struct {
     }
 
     pub fn hasDrawable(self: Font, glyph_id: u16) bool {
+        if (self.sbix) |col| {
+            if (col.hasBitmap(glyph_id)) return true;
+        }
         if (self.color) |col| {
             if (col.hasBitmap(glyph_id)) return true;
         }
@@ -133,6 +158,31 @@ pub const Font = struct {
 
     pub fn rasterize(self: Font, allocator: std.mem.Allocator, glyph_id: u16, size_px: f32) Error!Bitmap {
         assert(size_px > 0);
+        if (self.sbix) |col| {
+            if (try col.rasterize(allocator, glyph_id, size_px)) |bmp| {
+                var bx: i32 = bmp.bearing_x;
+                var by: i32 = bmp.bearing_y;
+                // sbix offsets are relative to the contour's lower-left corner
+                // when an outline exists, and to the pen origin otherwise.
+                if (self.outline) {
+                    var x: c_int = 0;
+                    var y: c_int = 0;
+                    c.zt_stb_glyph_origin(self.storage(), glyph_id, &x, &y);
+                    const scale = size_px / @as(f32, @floatFromInt(col.units_per_em));
+                    bx += @as(i16, @intFromFloat(@max(-32768, @min(32767, @round(@as(f32, @floatFromInt(x)) * scale)))));
+                    by += @as(i16, @intFromFloat(@max(-32768, @min(32767, @round(@as(f32, @floatFromInt(y)) * scale)))));
+                }
+                return .{
+                    .width = bmp.width,
+                    .height = bmp.height,
+                    .bearing_x = clampI16(bx),
+                    .bearing_y = clampI16(by),
+                    .advance = bmp.advance,
+                    .pixels = bmp.pixels,
+                    .color = true,
+                };
+            }
+        }
         if (self.color) |col| {
             if (try col.rasterize(allocator, glyph_id, size_px)) |bmp| return .{
                 .width = bmp.width,
@@ -242,6 +292,81 @@ test "open rejects junk" {
     try std.testing.expectError(error.InvalidFont, Font.open(&empty_dir));
     std.mem.writeInt(u16, empty_dir[4..6], 1, .big);
     try std.testing.expectError(error.InvalidFont, Font.open(&empty_dir));
+}
+
+test "sbix bitmap-only fonts rasterize through standalone and collection faces" {
+    const sfnt = Sbix.testing.font();
+    var collection: [16 + sfnt.len]u8 = @splat(0);
+    @memcpy(collection[0..4], "ttcf");
+    Sbix.testing.write(u32, &collection, 4, 0x00010000);
+    Sbix.testing.write(u32, &collection, 8, 1);
+    Sbix.testing.write(u32, &collection, 12, 16);
+    @memcpy(collection[16..], &sfnt);
+    for (0..6) |i| {
+        const at = 16 + 20 + i * 16;
+        const offset = std.mem.readInt(u32, collection[at..][0..4], .big);
+        Sbix.testing.write(u32, &collection, at, offset + 16);
+    }
+    for ([_][]const u8{ &sfnt, &collection }) |bytes| {
+        const font = try Font.openIndex(bytes, 0);
+        try std.testing.expect(!font.outline and font.sbix != null);
+        const gid = (try font.glyphIndex(0x1f600)).?;
+        try std.testing.expect(font.hasDrawable(gid));
+        try std.testing.expect(!font.hasDrawable(0));
+        try std.testing.expectEqual(@as(u16, 600), try font.advanceWidth(gid));
+        const metrics_value = try font.metrics(16);
+        try std.testing.expectEqual(@as(u16, 1000), metrics_value.units_per_em);
+        try std.testing.expectApproxEqAbs(@as(f32, 12.8), metrics_value.ascender, 0.001);
+        const bmp = try font.rasterize(std.testing.allocator, gid, 16);
+        defer std.testing.allocator.free(bmp.pixels);
+        try std.testing.expect(bmp.color);
+        try std.testing.expectEqual(@as(u16, 2), bmp.width);
+        try std.testing.expectEqualSlices(u8, &.{ 200, 20, 10, 128 }, bmp.pixels[0..4]);
+    }
+}
+
+test "sbix placement uses actual contours rather than an empty glyph bbox" {
+    const fixture = Sbix.testing.font();
+    var data: [1024]u8 = @splat(0);
+    Sbix.testing.write(u32, &data, 0, 0x00010000);
+    Sbix.testing.write(u16, &data, 4, 8);
+    const tags = [_]*const [4]u8{ "sbix", "cmap", "head", "hhea", "hmtx", "maxp", "glyf", "loca" };
+    var at: usize = 12 + tags.len * 16;
+    var glyf_at: usize = 0;
+    for (tags, 0..) |tag, i| {
+        const source = Cbdt.findTable(&fixture, tag);
+        const len: usize = if (std.mem.eql(u8, tag, "head")) 54 else if (source) |table| table.len else if (std.mem.eql(u8, tag, "glyf")) 30 else 10;
+        @memcpy(data[12 + i * 16 ..][0..4], tag);
+        Sbix.testing.write(u32, &data, 20 + i * 16, @intCast(at));
+        Sbix.testing.write(u32, &data, 24 + i * 16, @intCast(len));
+        if (source) |table| @memcpy(data[at..][0..table.len], table);
+        if (std.mem.eql(u8, tag, "glyf")) {
+            glyf_at = at;
+            // A triangle with bounds (100,200)..(300,400), in font units.
+            Sbix.testing.write(i16, &data, at, 1);
+            Sbix.testing.write(i16, &data, at + 2, 100);
+            Sbix.testing.write(i16, &data, at + 4, 200);
+            Sbix.testing.write(i16, &data, at + 6, 300);
+            Sbix.testing.write(i16, &data, at + 8, 400);
+            Sbix.testing.write(u16, &data, at + 10, 2);
+            @memset(data[at + 14 ..][0..3], 1);
+            for ([_]i16{ 100, 200, -200, 200, 0, 200 }, 0..) |coordinate, j| Sbix.testing.write(i16, &data, at + 17 + j * 2, coordinate);
+        }
+        if (std.mem.eql(u8, tag, "loca")) {
+            for (2..5) |j| Sbix.testing.write(u16, &data, at + j * 2, 15);
+        }
+        at = std.mem.alignForward(usize, at + len, 4);
+    }
+    for ([_]bool{ true, false }) |contours| {
+        Sbix.testing.write(i16, &data, glyf_at, if (contours) 1 else 0);
+        const font = try Font.open(data[0..at]);
+        try std.testing.expect(font.outline and font.sbix != null);
+        const bmp = try font.rasterize(std.testing.allocator, 1, 16);
+        defer std.testing.allocator.free(bmp.pixels);
+        try std.testing.expect(bmp.color);
+        try std.testing.expectEqual(@as(i16, if (contours) 0 else -2), bmp.bearing_x);
+        try std.testing.expectEqual(@as(i16, if (contours) 4 else 1), bmp.bearing_y);
+    }
 }
 
 /// Tiny bitmap-only sfnts, with distinct metrics and absolute table offsets,

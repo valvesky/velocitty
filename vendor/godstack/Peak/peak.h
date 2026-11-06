@@ -110,6 +110,7 @@
  * 0.11.4 - @vasco - pty spawn keeps OPOST|ONLCR; child COLUMNS and LINES
  * 0.11.5 - @vasco - Delete is treated as a key
  * 0.11.6 - @vasco - aligned_alloc and aligned_free are now macros
+ * 0.11.7 - @vasco - peak_window_set_text_input_rect; IME candidate window at the cursor (macos, win32)
  */
 
 #include <assert.h>
@@ -315,6 +316,7 @@ PEAK void       peak_window_present(PeakWindow *win);
 PEAK void       peak_window_present_rect(PeakWindow *win, uint32_t y, uint32_t h);
 PEAK void       peak_window_set_title(PeakWindow *win, const char *name);
 PEAK void       peak_window_set_class(PeakWindow *win, const char *name); /* WM_CLASS / app_id */
+PEAK void       peak_window_set_text_input_rect(PeakWindow *win, int x, int y, int w, int h); /* IME cursor cell, buffer pixels, top-left origin; no-op if unsupported */
 PEAK void       peak_window_set_opacity(PeakWindow *win, uint8_t alpha); /* 0..255; no-op if the OS has none */
 PEAK void       peak_window_set_size(PeakWindow *win, uint32_t width, uint32_t height);
 PEAK void       peak_window_fullscreen(PeakWindow *win, int on);
@@ -323,6 +325,7 @@ PEAK void       peak_window_cursor(PeakWindow *win, int on); /* 1 show, 0 hide *
 PEAK void       peak_window_cursor_shape(PeakWindow *win, int shape);
 PEAK void       peak_window_pointer_relative(PeakWindow *win, int on); /* 1 deltas, 0 absolute */
 PEAK float      peak_window_scale(PeakWindow *win); /* framebuffer / window; 1.0 if unknown */
+PEAK unsigned   peak_window_refresh_rate(PeakWindow *win); /* Hz, or 0 if unknown */
 
 //           █ █
 //           █

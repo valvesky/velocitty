@@ -1,0 +1,685 @@
+{
+  "binaries": [
+    {
+      "path": "/tmp/velocitty-ring-audit/bin/velocitty-bench",
+      "sha256": "c183c2e23994f713e05340ff5547b7cd9a1b991323a11b1285679a7c09f1550e",
+      "mtime_ns": 1793585745286711349
+    },
+    {
+      "path": "/tmp/velocitty-axiom-final/bin/velocitty-bench",
+      "sha256": "e1ceaafdab44d95a6868138df9a21d2937b54c35bb31cbb9111a6e80b2d8ee30",
+      "mtime_ns": 1793624620514055990
+    }
+  ],
+  "fixtures": {
+    "ascii": {
+      "path": "/tmp/velocitty-terra/fixtures/ascii-8x.bin",
+      "bytes": 8388672,
+      "sha256": "3e2178f0f9ffbf8304a45057da0552ae6b3569c6279746f94b70dfd6ef8fbf05"
+    },
+    "unicode": {
+      "path": "/tmp/velocitty-terra/fixtures/unicode-8x.bin",
+      "bytes": 8388792,
+      "sha256": "b32fb384c197b9cf9d7f99e79f7fb168c2e269534f0772a7738599b923f45461"
+    },
+    "csi-short": {
+      "path": "/tmp/velocitty-terra/fixtures/csi-short-8x.bin",
+      "bytes": 8388952,
+      "sha256": "21ae02fb38532350b4ddce956c2434572e38a075b9afd471f7f76a2137e83d44"
+    },
+    "progress": {
+      "path": "/tmp/velocitty-axiom-final/fixtures/progress.bin",
+      "bytes": 16777312,
+      "sha256": "cc201bbbbd0397531ae8d475b0bb1e9091047101018fd0b2310446f15178062d"
+    },
+    "progress-long": {
+      "path": "/tmp/velocitty-terra/progress-long.bin",
+      "bytes": 17170000,
+      "sha256": "2538dada217ad473e0cba82dbd12a57b2b50099d2ecfd9fe380319784cd732c5"
+    },
+    "progress-short": {
+      "path": "/tmp/velocitty-terra/progress.bin",
+      "bytes": 17820000,
+      "sha256": "ad294627a55b061ac4b1bafeeb23df86b5bd8812d69ae9f425f0c2e0603cb0c8"
+    }
+  },
+  "samples": [
+    {
+      "workload": "ascii",
+      "round": 0,
+      "binary": 0,
+      "instructions": 100584819,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-ring-audit/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-terra/fixtures/ascii-8x.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "ascii",
+      "round": 0,
+      "binary": 1,
+      "instructions": 99274024,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-axiom-final/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-terra/fixtures/ascii-8x.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "ascii",
+      "round": 1,
+      "binary": 1,
+      "instructions": 99274063,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-axiom-final/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-terra/fixtures/ascii-8x.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "ascii",
+      "round": 1,
+      "binary": 0,
+      "instructions": 100584840,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-ring-audit/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-terra/fixtures/ascii-8x.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "ascii",
+      "round": 2,
+      "binary": 0,
+      "instructions": 100584842,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-ring-audit/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-terra/fixtures/ascii-8x.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "ascii",
+      "round": 2,
+      "binary": 1,
+      "instructions": 99274062,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-axiom-final/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-terra/fixtures/ascii-8x.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "unicode",
+      "round": 0,
+      "binary": 0,
+      "instructions": 298151782,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-ring-audit/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-terra/fixtures/unicode-8x.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "unicode",
+      "round": 0,
+      "binary": 1,
+      "instructions": 296549933,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-axiom-final/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-terra/fixtures/unicode-8x.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "unicode",
+      "round": 1,
+      "binary": 1,
+      "instructions": 296549935,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-axiom-final/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-terra/fixtures/unicode-8x.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "unicode",
+      "round": 1,
+      "binary": 0,
+      "instructions": 298151715,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-ring-audit/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-terra/fixtures/unicode-8x.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "unicode",
+      "round": 2,
+      "binary": 0,
+      "instructions": 298151675,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-ring-audit/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-terra/fixtures/unicode-8x.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "unicode",
+      "round": 2,
+      "binary": 1,
+      "instructions": 296549944,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-axiom-final/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-terra/fixtures/unicode-8x.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "csi-short",
+      "round": 0,
+      "binary": 0,
+      "instructions": 746355401,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-ring-audit/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-terra/fixtures/csi-short-8x.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "csi-short",
+      "round": 0,
+      "binary": 1,
+      "instructions": 740895033,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-axiom-final/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-terra/fixtures/csi-short-8x.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "csi-short",
+      "round": 1,
+      "binary": 1,
+      "instructions": 740895033,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-axiom-final/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-terra/fixtures/csi-short-8x.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "csi-short",
+      "round": 1,
+      "binary": 0,
+      "instructions": 746355380,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-ring-audit/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-terra/fixtures/csi-short-8x.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "csi-short",
+      "round": 2,
+      "binary": 0,
+      "instructions": 746355353,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-ring-audit/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-terra/fixtures/csi-short-8x.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "csi-short",
+      "round": 2,
+      "binary": 1,
+      "instructions": 740895033,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-axiom-final/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-terra/fixtures/csi-short-8x.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "progress",
+      "round": 0,
+      "binary": 0,
+      "instructions": 137911273,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-ring-audit/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-axiom-final/fixtures/progress.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "progress",
+      "round": 0,
+      "binary": 1,
+      "instructions": 48477297,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-axiom-final/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-axiom-final/fixtures/progress.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "progress",
+      "round": 1,
+      "binary": 1,
+      "instructions": 48477295,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-axiom-final/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-axiom-final/fixtures/progress.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "progress",
+      "round": 1,
+      "binary": 0,
+      "instructions": 137911288,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-ring-audit/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-axiom-final/fixtures/progress.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "progress",
+      "round": 2,
+      "binary": 0,
+      "instructions": 137911296,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-ring-audit/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-axiom-final/fixtures/progress.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "progress",
+      "round": 2,
+      "binary": 1,
+      "instructions": 48477301,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-axiom-final/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-axiom-final/fixtures/progress.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "progress-long",
+      "round": 0,
+      "binary": 0,
+      "instructions": 141134717,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-ring-audit/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-terra/progress-long.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "progress-long",
+      "round": 0,
+      "binary": 1,
+      "instructions": 47023072,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-axiom-final/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-terra/progress-long.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "progress-long",
+      "round": 1,
+      "binary": 1,
+      "instructions": 47023078,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-axiom-final/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-terra/progress-long.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "progress-long",
+      "round": 1,
+      "binary": 0,
+      "instructions": 141134721,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-ring-audit/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-terra/progress-long.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "progress-long",
+      "round": 2,
+      "binary": 0,
+      "instructions": 141134683,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-ring-audit/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-terra/progress-long.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "progress-long",
+      "round": 2,
+      "binary": 1,
+      "instructions": 47023037,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-axiom-final/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-terra/progress-long.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "progress-short",
+      "round": 0,
+      "binary": 0,
+      "instructions": 255120707,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-ring-audit/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-terra/progress.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "progress-short",
+      "round": 0,
+      "binary": 1,
+      "instructions": 251166461,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-axiom-final/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-terra/progress.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "progress-short",
+      "round": 1,
+      "binary": 1,
+      "instructions": 251166426,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-axiom-final/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-terra/progress.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "progress-short",
+      "round": 1,
+      "binary": 0,
+      "instructions": 255120632,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-ring-audit/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-terra/progress.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "progress-short",
+      "round": 2,
+      "binary": 0,
+      "instructions": 255120663,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-ring-audit/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-terra/progress.bin",
+        "--drop"
+      ]
+    },
+    {
+      "workload": "progress-short",
+      "round": 2,
+      "binary": 1,
+      "instructions": 251166429,
+      "command": [
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions:u",
+        "/tmp/velocitty-axiom-final/bin/velocitty-bench",
+        "+terminal-stream",
+        "--data=/tmp/velocitty-terra/progress.bin",
+        "--drop"
+      ]
+    }
+  ],
+  "experiment": {
+    "date": "2026-11-02",
+    "metric": "instructions:u",
+    "statistic": "median of three interleaved runs per binary and workload",
+    "baseline_label": "Velocitty 1.3 before",
+    "candidate_label": "Velocitty 1.3.1 progress proof",
+    "baseline_git": "f9eb471e906c",
+    "candidate_state": "working tree with the guarded ASCII/CR overwrite proof and predicate hot-path separation",
+    "build": "Zig 0.17.0, ReleaseFast, x86_64-linux-musl",
+    "cpu": "Intel Core i7-10610U",
+    "grid": {
+      "cols": 120,
+      "rows": 80
+    },
+    "ring_bytes": 1048576,
+    "pressure_occupancy_percent": 75,
+    "mode": "+terminal-stream --drop",
+    "scope": "Headless parser instruction counts; no font loading, rendering, presentation, or input-latency measurement",
+    "generation": {
+      "progress": "velocitty-bench --only progress --mib 16 --dump DIR; progress.bin",
+      "ascii_unicode_csi": "velocitty-bench --only ascii,unicode,csi-short --mib 1 --dump DIR; concatenate eight copies of each generated file",
+      "progress-short": "Repeat 220000 times: building: 0123456789abcdef\\rbuilding: 123456789abcdef0\\rbuilding: 23456789abcdef01\\r",
+      "progress-long": "Repeat 85000 times: 100 x characters, CR, 100 y characters, CR"
+    }
+  }
+}

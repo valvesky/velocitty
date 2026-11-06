@@ -4,8 +4,9 @@ const std = @import("std");
 const Sixel = @import("sixel.zig");
 
 const c = struct {
-    extern fn zt_stbi_load_rgba(data: [*]const u8, len: c_int, w: *c_int, h: *c_int, out: *?[*]u8) callconv(.c) c_int;
-    extern fn zt_stbi_free(p: [*]u8) callconv(.c) void;
+    extern fn zt_image_load_rgba(data: [*]const u8, len: c_int, w: *c_int, h: *c_int, out: *?[*]u8) callconv(.c) c_int;
+    extern fn zt_image_free(p: [*]u8) callconv(.c) void;
+    extern fn zt_image_info(data: [*]const u8, len: usize, closed: c_int, w: *c_int, h: *c_int) callconv(.c) c_int;
 };
 
 /// Largest image side and payload/pixel size of one image (kitty's limits).
@@ -29,6 +30,9 @@ pub const Command = struct {
     action: u8 = 't',
     format: u32 = 32,
     transmission: u8 = 'd',
+    compression: u8 = 0,
+    /// Uncompressed encoded-image byte size (`S`, required with `f=100,o=z`).
+    data_size: u32 = 0,
     id: u32 = 0,
     place_id: u32 = 0,
     more: bool = false,
@@ -71,21 +75,82 @@ pub const Image = struct {
     /// Stable quota charge: max(encoded payload, decoded RGBA), unchanged by
     /// lazy decode so parse/paint scheduling cannot change cache eviction.
     cache_cost: usize = 0,
+    /// Unique per stored pixel content (`Store.next_serial`): the renderer
+    /// treats an unchanged serial as unchanged pixels, even if ids or buffer
+    /// addresses are reused.
+    serial: u64 = 0,
 };
 
 pub const Pending = struct {
     /// Base64 text (direct transmission), file bytes, or a sixel body.
+    /// Compressed PNGs are inflated to file bytes to read their dimensions.
     data: []u8,
     /// The whole allocation `data` lies in when it was handed over with its
     /// stream buffer (empty: `data` is the allocation).
     owned: []u8 = &.{},
     b64: bool = false,
     format: u32 = 0,
+    compression: u8 = 0,
+    /// Inflated size (`S=`) of a still-compressed encoded image.
+    data_size: u32 = 0,
     /// Set for a sixel body (decoded with the default palette).
     sixel: ?SixelParams = null,
 
     pub fn free(self: Pending, allocator: std.mem.Allocator) void {
         allocator.free(if (self.owned.len != 0) self.owned else self.data);
+    }
+};
+
+/// Decodes a pending payload (base64 → inflate → pixels, or sixel) and frees
+/// it. Pure apart from the allocator, so it can run on a worker thread.
+fn decodePending(allocator: std.mem.Allocator, pend: Pending, width: u32, height: u32) error{InvalidImage}!Bitmap {
+    defer pend.free(allocator);
+    if (pend.sixel) |sp| {
+        var pal = Sixel.defaultPalette();
+        const b = Sixel.decode(allocator, pend.data, .{
+            .transparent = sp.transparent,
+            .max_w = sp.max_w,
+            .max_h = sp.max_h,
+            .palette = &pal,
+            .registers = sp.registers,
+        }) catch return error.InvalidImage;
+        return .{ .width = b.width, .height = b.height, .rgba = b.rgba };
+    }
+    const raw = if (pend.b64)
+        try decodeB64(allocator, pend.data)
+    else
+        allocator.dupe(u8, pend.data) catch return error.InvalidImage;
+    return decodeLoaded(allocator, raw, .{ .format = pend.format, .width = width, .height = height, .compression = pend.compression, .data_size = pend.data_size });
+}
+
+/// One background decode: the thread owns `pend` and fills `result`, then
+/// sets `done`; the store joins it from `collectDecoded`.
+const DecodeJob = struct {
+    id: u32,
+    /// `Image.serial` when started; a different serial at install time means
+    /// the image was replaced or deleted and the result is discarded.
+    serial: u64,
+    pend: Pending,
+    width: u32,
+    height: u32,
+    allocator: std.mem.Allocator,
+    result: error{InvalidImage}!Bitmap = error.InvalidImage,
+    done: std.atomic.Value(bool) = .init(false),
+    thread: std.Thread = undefined,
+
+    fn start(allocator: std.mem.Allocator, id: u32, serial: u64, pend: Pending, width: u32, height: u32) !*DecodeJob {
+        const job = try allocator.create(DecodeJob);
+        job.* = .{ .id = id, .serial = serial, .pend = pend, .width = width, .height = height, .allocator = allocator };
+        job.thread = std.Thread.spawn(.{}, run, .{job}) catch |err| {
+            allocator.destroy(job);
+            return err;
+        };
+        return job;
+    }
+
+    fn run(job: *DecodeJob) void {
+        job.result = decodePending(job.allocator, job.pend, job.width, job.height);
+        job.done.store(true, .release);
     }
 };
 
@@ -174,6 +239,10 @@ pub fn parse(bytes: []const u8) ?Command {
             't' => if (v.len == 1) {
                 cmd.transmission = v[0];
             },
+            'o' => if (v.len == 1) {
+                cmd.compression = v[0];
+            },
+            'S' => cmd.data_size = std.fmt.parseUnsigned(u32, v, 10) catch 0,
             'i' => cmd.id = std.fmt.parseUnsigned(u32, v, 10) catch 0,
             'p' => cmd.place_id = std.fmt.parseUnsigned(u32, v, 10) catch 0,
             'm' => cmd.more = v.len == 1 and v[0] == '1',
@@ -217,17 +286,30 @@ pub const Store = struct {
     reply: [128]u8 = undefined,
     reply_len: usize = 0,
     dirty: bool = false,
+    next_serial: u64 = 1,
     /// Lower bound of `Placement.end()` per screen: history scrolls only
     /// scan placements once the oldest kept line reaches it.
     min_end: [2]i64 = @splat(std.math.maxInt(i64)),
     cell_w: u32 = 1,
     cell_h: u32 = 1,
+    /// Decode visible images on worker threads (the app) instead of inside
+    /// `decodeVisible` (tests, benchmarks). Undecoded images draw nothing.
+    async_decode: bool = false,
+    jobs: std.ArrayList(*DecodeJob) = .empty,
+
+    const max_jobs = 4;
 
     pub fn init(allocator: std.mem.Allocator) Store {
         return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *Store) void {
+        for (self.jobs.items) |job| {
+            job.thread.join();
+            if (job.result) |bmp| self.allocator.free(bmp.rgba) else |_| {}
+            self.allocator.destroy(job);
+        }
+        self.jobs.deinit(self.allocator);
         self.clear();
         self.header.deinit(self.allocator);
         self.chunks.deinit(self.allocator);
@@ -362,7 +444,7 @@ pub const Store = struct {
     }
 
     /// Returns an updated cursor when the command moves it.
-    /// Reply for icat/query is in `reply`/`reply_len` (APC `i=…;OK`).
+    /// Reply for icat/query is in `reply`/`reply_len` (APC `i=…[,p=…];OK`).
     pub fn feed(self: *Store, bytes: []const u8, cursor: Cursor, cols: u16, rows: u16, which: u1) ?Cursor {
         return self.feedPlace(bytes, cursor, cols, rows, which, true);
     }
@@ -386,8 +468,8 @@ pub const Store = struct {
             return null;
         }
         if (cmd.action == 'd') {
+            // `delete` marks the store dirty only if it removed something.
             self.delete(cmd, cursor, which, cols, rows);
-            self.dirty = true;
             return null;
         }
         if (cmd.action == 'p') {
@@ -455,6 +537,10 @@ pub const Store = struct {
     }
 
     fn query(self: *Store, cmd: Command) void {
+        if (cmd.compression != 0 and cmd.compression != 'z') {
+            self.fail(cmd, "EINVAL:unsupported compression");
+            return;
+        }
         switch (cmd.transmission) {
             'd' => self.ok(cmd),
             'f', 't' => {
@@ -475,7 +561,10 @@ pub const Store = struct {
     fn replyStatus(self: *Store, cmd: Command, msg: []const u8, is_error: bool) void {
         if (cmd.quiet >= 2) return;
         if (cmd.quiet == 1 and !is_error) return;
-        const out = if (cmd.id != 0)
+        // Clients use both ids to match placement acknowledgements.
+        const out = if (cmd.id != 0 and cmd.place_id != 0)
+            std.fmt.bufPrint(&self.reply, "\x1b_Gi={d},p={d};{s}\x1b\\", .{ cmd.id, cmd.place_id, msg })
+        else if (cmd.id != 0)
             std.fmt.bufPrint(&self.reply, "\x1b_Gi={d};{s}\x1b\\", .{ cmd.id, msg })
         else
             std.fmt.bufPrint(&self.reply, "\x1b_G;{s}\x1b\\", .{msg});
@@ -519,13 +608,16 @@ pub const Store = struct {
     }
 
     /// Image dimensions and its payload, without decoding pixels: raw formats
-    /// take `s`/`v`, PNG its IHDR. Other encoded formats decode now. A
-    /// direct transfer's base64 moves out of `chunks` instead of being copied.
+    /// take `s`/`v`, encoded formats their header (base64-decoding and
+    /// inflating only as much as it needs), so pixels are decoded off the
+    /// main thread when first visible. A direct transfer's base64 moves out
+    /// of `chunks` instead of being copied.
     fn load(self: *Store, cmd: Command, owned: ?[]u8) error{InvalidImage}!Image {
         const allocator = self.allocator;
-        // A handed-over buffer is freed on every failure (and kept on success).
-        errdefer if (owned) |o| allocator.free(o);
-        if (cmd.payload.len == 0) return error.InvalidImage;
+        if (cmd.payload.len == 0 or (cmd.compression != 0 and cmd.compression != 'z')) {
+            if (owned) |o| allocator.free(o);
+            return error.InvalidImage;
+        }
         const b64 = cmd.transmission == 'd';
         const data: []u8 = if (owned) |o|
             o[@intFromPtr(cmd.payload.ptr) - @intFromPtr(o.ptr) ..][0..cmd.payload.len]
@@ -533,21 +625,35 @@ pub const Store = struct {
             self.chunks.toOwnedSlice(allocator) catch return error.InvalidImage
         else
             loadPayload(allocator, cmd) catch return error.InvalidImage;
-        errdefer if (owned == null) allocator.free(data);
+        var pend: Pending = .{ .data = data, .owned = owned orelse &.{}, .b64 = b64, .format = cmd.format, .compression = cmd.compression };
+        errdefer pend.free(allocator);
+        const encoded_size = data.len;
         if (!b64) self.chunks.clearAndFree(allocator);
         var w = cmd.width;
         var h = cmd.height;
-        switch (cmd.format) {
-            24, 32 => if (!pngSize(data, b64, &w, &h) and (w == 0 or h == 0 or w > max_dim or h > max_dim)) return error.InvalidImage,
-            else => if (!pngSize(data, b64, &w, &h)) {
-                // JPEG, GIF, ...: no cheap header parse; decode now.
-                const raw = if (b64) try decodeB64(allocator, data) else allocator.dupe(u8, data) catch return error.InvalidImage;
-                const bmp = try decodeLoaded(allocator, raw, cmd.format, w, h);
-                allocator.free(owned orelse data);
-                return .{ .id = 0, .width = bmp.width, .height = bmp.height, .rgba = bmp.rgba };
-            },
+        var sized = false;
+        if (cmd.compression != 0) {
+            _ = try compressionSize(cmd);
+            if (cmd.format != 24 and cmd.format != 32) {
+                // Encoded images need their header for placement geometry:
+                // a compressed PNG inflates only up to its IHDR now.
+                if (inflatedPngSize(allocator, pend.data, pend.b64, &w, &h)) {
+                    sized = true;
+                    pend.data_size = cmd.data_size;
+                } else {
+                    // Another format inside zlib: inflate it whole.
+                    const compressed = if (b64) try decodeB64(allocator, data) else allocator.dupe(u8, data) catch return error.InvalidImage;
+                    const raw = try inflatePayload(allocator, compressed, cmd);
+                    pend.free(allocator);
+                    pend = .{ .data = raw, .format = cmd.format };
+                }
+            }
         }
-        return .{ .id = 0, .width = w, .height = h, .rgba = &.{}, .pending = .{ .data = data, .owned = owned orelse &.{}, .b64 = b64, .format = cmd.format } };
+        switch (cmd.format) {
+            24, 32 => if (pend.compression == 0 and !pngSize(pend.data, pend.b64, &w, &h) and (w == 0 or h == 0 or w > max_dim or h > max_dim)) return error.InvalidImage,
+            else => if (!sized and !pngSize(pend.data, pend.b64, &w, &h) and !encodedSize(allocator, pend.data, pend.b64, &w, &h)) return error.InvalidImage,
+        }
+        return .{ .id = 0, .width = w, .height = h, .rgba = &.{}, .pending = pend, .cache_cost = @max(encoded_size, pend.data.len) };
     }
 
     /// Decode the images of placements visible on `which`'s view: rows
@@ -567,54 +673,94 @@ pub const Store = struct {
             ids[n] = p.image_id;
             n += 1;
         }
+        var installed = false;
         for (ids[0..n]) |id| {
             const img = self.findMut(id) orelse continue;
             const pend = img.pending orelse continue;
+            if (self.async_decode and self.jobs.items.len < max_jobs) {
+                if (DecodeJob.start(self.allocator, id, img.serial, pend, img.width, img.height)) |job| {
+                    self.jobs.append(self.allocator, job) catch {
+                        // Keep the store consistent: finish this one inline.
+                        job.thread.join();
+                        img.pending = null;
+                        installed = self.install(id, img.serial, job.result) or installed;
+                        self.allocator.destroy(job);
+                        continue;
+                    };
+                    // Draws nothing until `collectDecoded` installs it.
+                    img.pending = null;
+                    continue;
+                } else |_| {}
+            } else if (self.async_decode) continue; // Busy: retry next frame.
             img.pending = null;
-            defer pend.free(self.allocator);
-            const bmp = if (pend.sixel) |sp| blk: {
-                var pal = Sixel.defaultPalette();
-                const b = Sixel.decode(self.allocator, pend.data, .{
-                    .transparent = sp.transparent,
-                    .max_w = sp.max_w,
-                    .max_h = sp.max_h,
-                    .palette = &pal,
-                    .registers = sp.registers,
-                }) catch {
-                    self.removeImage(id);
-                    continue;
-                };
-                break :blk Bitmap{ .width = b.width, .height = b.height, .rgba = b.rgba };
-            } else blk: {
-                const raw = if (pend.b64) decodeB64(self.allocator, pend.data) catch {
-                    self.removeImage(id);
-                    continue;
-                } else self.allocator.dupe(u8, pend.data) catch {
-                    self.removeImage(id);
-                    continue;
-                };
-                break :blk decodeLoaded(self.allocator, raw, pend.format, img.width, img.height) catch {
-                    self.removeImage(id);
-                    continue;
-                };
-            };
-            const cost = @max(img.cache_cost, bmp.rgba.len);
-            if (!self.makeRoom(cost, id, false)) {
-                self.allocator.free(bmp.rgba);
-                self.removeImage(id);
+            installed = self.install(id, img.serial, decodePending(self.allocator, pend, img.width, img.height)) or installed;
+        }
+        if (installed) self.placementsChanged(self.cell_w, cell_h);
+    }
+
+    /// Installs finished background decodes. True when any job finished:
+    /// an image changed, or a slot freed up for an image `decodeVisible`
+    /// had to leave pending, so the caller must prepare and draw again.
+    pub fn collectDecoded(self: *Store) bool {
+        var installed = false;
+        var collected = false;
+        var i: usize = 0;
+        while (i < self.jobs.items.len) {
+            const job = self.jobs.items[i];
+            if (!job.done.load(.acquire)) {
+                i += 1;
                 continue;
             }
-            const now = self.findMut(id) orelse {
-                self.allocator.free(bmp.rgba);
-                continue;
-            };
-            now.rgba = bmp.rgba;
-            now.cache_cost = cost;
-            now.width = bmp.width;
-            now.height = bmp.height;
-            self.dirty = true;
+            job.thread.join();
+            _ = self.jobs.swapRemove(i);
+            collected = true;
+            installed = self.install(job.id, job.serial, job.result) or installed;
+            self.allocator.destroy(job);
         }
-        if (n != 0) self.placementsChanged(self.cell_w, cell_h);
+        if (installed) self.placementsChanged(self.cell_w, self.cell_h);
+        return collected;
+    }
+
+    /// Waits for every background decode, then installs them.
+    pub fn finishDecodes(self: *Store) bool {
+        for (self.jobs.items) |job| {
+            while (!job.done.load(.acquire)) std.Thread.yield() catch {};
+        }
+        return self.collectDecoded();
+    }
+
+    /// Stores decoded pixels for image `id` if it still holds the content
+    /// (`serial`) the decode started from; otherwise discards them. A failed
+    /// decode removes the image. True when the store changed.
+    fn install(self: *Store, id: u32, serial: u64, result: error{InvalidImage}!Bitmap) bool {
+        const img = self.find(id);
+        const current = img != null and img.?.serial == serial;
+        const bmp = result catch {
+            if (!current) return false;
+            self.removeImage(id);
+            return true;
+        };
+        if (!current) {
+            self.allocator.free(bmp.rgba);
+            return false;
+        }
+        const cost = @max(img.?.cache_cost, bmp.rgba.len);
+        if (!self.makeRoom(cost, id, false)) {
+            self.allocator.free(bmp.rgba);
+            self.removeImage(id);
+            return true;
+        }
+        const now = self.findMut(id) orelse {
+            self.allocator.free(bmp.rgba);
+            return true;
+        };
+        now.rgba = bmp.rgba;
+        now.cache_cost = cost;
+        now.width = bmp.width;
+        now.height = bmp.height;
+        now.serial = self.newSerial();
+        self.dirty = true;
+        return true;
     }
 
     fn findMut(self: *Store, id: u32) ?*Image {
@@ -657,9 +803,16 @@ pub const Store = struct {
         }
     }
 
+    fn newSerial(self: *Store) u64 {
+        const s = self.next_serial;
+        self.next_serial += 1;
+        return s;
+    }
+
     fn upsertImage(self: *Store, img: Image) std.mem.Allocator.Error!void {
         var cached = img;
         cached.cache_cost = imageBytes(img);
+        cached.serial = self.newSerial();
         const inserting = self.find(img.id) == null;
         if (inserting and self.images.items.len < max_images) try self.images.ensureUnusedCapacity(self.allocator, 1);
         if (!self.makeRoom(imageBytes(img), img.id, inserting)) return error.OutOfMemory;
@@ -725,6 +878,8 @@ pub const Store = struct {
         self.stream = .idle;
         self.chunks.clearAndFree(self.allocator);
         self.header.clearRetainingCapacity();
+        const placements_before = self.placements.items.len;
+        const images_before = self.images.items.len;
         var affected: [max_placements]u32 = undefined;
         var n: usize = 0;
         for (self.placements.items) |p| {
@@ -752,6 +907,7 @@ pub const Store = struct {
             if (kind == 'i' and !self.hasPlacement(cmd.id)) self.removeImage(cmd.id);
         }
         self.gcUnplaced();
+        if (self.placements.items.len == placements_before and self.images.items.len == images_before) return;
         self.placementsChanged(cursor.cell_w, cursor.cell_h);
     }
 
@@ -889,7 +1045,91 @@ pub const Store = struct {
 pub fn decode(allocator: std.mem.Allocator, cmd: Command) error{InvalidImage}!Bitmap {
     if (cmd.payload.len == 0) return error.InvalidImage;
     const raw = loadPayload(allocator, cmd) catch return error.InvalidImage;
-    return decodeLoaded(allocator, raw, cmd.format, cmd.width, cmd.height);
+    return decodeLoaded(allocator, raw, cmd);
+}
+
+/// Bound decompression by the declared pixel dimensions or encoded data size.
+fn compressionSize(cmd: Command) error{InvalidImage}!usize {
+    if (cmd.compression != 'z') return error.InvalidImage;
+    const size: usize = switch (cmd.format) {
+        24, 32 => blk: {
+            if (cmd.width == 0 or cmd.height == 0 or cmd.width > max_dim or cmd.height > max_dim) return error.InvalidImage;
+            break :blk @as(usize, cmd.width) * cmd.height * (cmd.format / 8);
+        },
+        else => cmd.data_size,
+    };
+    if (size == 0 or size > max_bytes) return error.InvalidImage;
+    return size;
+}
+
+/// Takes ownership of `raw`, including on malformed or oversized zlib streams.
+fn inflatePayload(allocator: std.mem.Allocator, raw: []u8, cmd: Command) error{InvalidImage}![]u8 {
+    if (cmd.compression == 0) return raw;
+    defer allocator.free(raw);
+    const size = try compressionSize(cmd);
+    // The std decoder reads container metadata; validate RFC 1950's header
+    // check bits/dictionary flag and Adler-32 checksum here.
+    if (raw.len < 6 or raw.len > max_bytes or std.mem.readInt(u16, raw[0..2], .big) % 31 != 0 or raw[1] & 0x20 != 0) return error.InvalidImage;
+    const out = allocator.alloc(u8, size) catch return error.InvalidImage;
+    errdefer allocator.free(out);
+    var input: std.Io.Reader = .fixed(raw);
+    var output: std.Io.Writer = .fixed(out);
+    var decompressor: std.compress.flate.Decompress = .init(&input, .zlib, &.{});
+    _ = decompressor.reader.streamRemaining(&output) catch return error.InvalidImage;
+    if (output.end != size or input.seek != raw.len or
+        std.hash.Adler32.hash(out) != decompressor.container_metadata.zlib.adler) return error.InvalidImage;
+    return out;
+}
+
+/// Calls `probe(bytes, whole, w, h)` (1 ok, 0 invalid, -1 needs more) on
+/// growing base64-decoded prefixes of `data`, so a header near the start
+/// never costs decoding the whole payload.
+fn probeB64Prefix(allocator: std.mem.Allocator, data: []const u8, w: *u32, h: *u32, comptime probe: fn ([]const u8, bool, *u32, *u32) i32) bool {
+    var limit: usize = 4096; // Multiples of 4: whole base64 quanta.
+    while (true) {
+        // Whitespace shifts quanta; just decode everything then.
+        const whole = data.len <= limit or std.mem.indexOfAny(u8, data[0..limit], " \n\r\t") != null;
+        const bytes = decodeB64(allocator, if (whole) data else data[0..limit]) catch return false;
+        defer allocator.free(bytes);
+        const r = probe(bytes, whole, w, h);
+        if (r != -1 or whole) return r == 1;
+        limit *|= 16;
+    }
+}
+
+fn infoProbe(bytes: []const u8, whole: bool, w: *u32, h: *u32) i32 {
+    var cw: c_int = 0;
+    var ch: c_int = 0;
+    const r = c.zt_image_info(bytes.ptr, bytes.len, @intFromBool(whole), &cw, &ch);
+    if (r == 1) {
+        w.* = @intCast(cw);
+        h.* = @intCast(ch);
+    }
+    return r;
+}
+
+/// Width and height of an encoded image (PNG incl. Apple CgBI, JPEG, GIF)
+/// from its header alone.
+fn encodedSize(allocator: std.mem.Allocator, data: []const u8, b64: bool, w: *u32, h: *u32) bool {
+    if (!b64) return infoProbe(data, true, w, h) == 1;
+    return probeB64Prefix(allocator, data, w, h, infoProbe);
+}
+
+fn inflatedPngProbe(bytes: []const u8, whole: bool, w: *u32, h: *u32) i32 {
+    if (bytes.len < 2) return if (whole) 0 else -1;
+    if (std.mem.readInt(u16, bytes[0..2], .big) % 31 != 0 or bytes[1] & 0x20 != 0) return 0;
+    var input: std.Io.Reader = .fixed(bytes);
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var decompressor: std.compress.flate.Decompress = .init(&input, .zlib, &window);
+    var head: [33]u8 = undefined;
+    decompressor.reader.readSliceAll(&head) catch return if (whole) 0 else -1;
+    return if (pngSize(&head, false, w, h)) 1 else 0;
+}
+
+/// Width and height of a zlib-compressed PNG, inflating only its IHDR.
+fn inflatedPngSize(allocator: std.mem.Allocator, data: []const u8, b64: bool, w: *u32, h: *u32) bool {
+    if (!b64) return inflatedPngProbe(data, true, w, h) == 1;
+    return probeB64Prefix(allocator, data, w, h, inflatedPngProbe);
 }
 
 /// Width and height from a PNG IHDR at the start of `data`.
@@ -909,19 +1149,20 @@ fn pngSize(data: []const u8, b64: bool, w: *u32, h: *u32) bool {
     return true;
 }
 
-/// Pixels from a loaded payload (takes ownership of `raw`).
-fn decodeLoaded(allocator: std.mem.Allocator, raw: []u8, format: u32, width: u32, height: u32) error{InvalidImage}!Bitmap {
+/// Pixels from a loaded payload (takes ownership, inflating when requested).
+fn decodeLoaded(allocator: std.mem.Allocator, payload: []u8, cmd: Command) error{InvalidImage}!Bitmap {
+    const raw = try inflatePayload(allocator, payload, cmd);
     errdefer allocator.free(raw);
     if (raw.len == 0 or raw.len > max_bytes) return error.InvalidImage;
-    if (isEncodedImage(raw) or format == 100) {
+    if (isEncodedImage(raw) or cmd.format == 100) {
         const bmp = decodeEncoded(allocator, raw) catch return error.InvalidImage;
         allocator.free(raw);
         return bmp;
     }
-    switch (format) {
+    switch (cmd.format) {
         24 => {
-            const w = width;
-            const h = height;
+            const w = cmd.width;
+            const h = cmd.height;
             if (w == 0 or h == 0 or w > max_dim or h > max_dim) return error.InvalidImage;
             if (raw.len < @as(usize, w) * @as(usize, h) * 3) return error.InvalidImage;
             const rgba = rgbToRgba(allocator, raw, w, h) catch return error.InvalidImage;
@@ -929,8 +1170,8 @@ fn decodeLoaded(allocator: std.mem.Allocator, raw: []u8, format: u32, width: u32
             return .{ .width = w, .height = h, .rgba = rgba };
         },
         32 => {
-            const w = width;
-            const h = height;
+            const w = cmd.width;
+            const h = cmd.height;
             if (w == 0 or h == 0 or w > max_dim or h > max_dim) return error.InvalidImage;
             if (raw.len < @as(usize, w) * @as(usize, h) * 4) return error.InvalidImage;
             const n = @as(usize, w) * @as(usize, h) * 4;
@@ -1141,9 +1382,9 @@ fn decodeEncoded(allocator: std.mem.Allocator, data: []const u8) error{InvalidIm
     var w: c_int = 0;
     var h: c_int = 0;
     var ptr: ?[*]u8 = null;
-    if (c.zt_stbi_load_rgba(data.ptr, @intCast(data.len), &w, &h, &ptr) == 0) return error.InvalidImage;
+    if (c.zt_image_load_rgba(data.ptr, @intCast(data.len), &w, &h, &ptr) == 0) return error.InvalidImage;
     const src = ptr orelse return error.InvalidImage;
-    defer c.zt_stbi_free(src);
+    defer c.zt_image_free(src);
     if (w <= 0 or h <= 0) return error.InvalidImage;
     const uw: u32 = @intCast(w);
     const uh: u32 = @intCast(h);
@@ -1154,10 +1395,12 @@ fn decodeEncoded(allocator: std.mem.Allocator, data: []const u8) error{InvalidIm
 }
 
 test "parse transmit" {
-    const cmd = parse("\x1b_Ga=T,f=24,i=3;QQ\x1b\\").?;
+    const cmd = parse("\x1b_Ga=T,f=24,i=3,o=z,S=69;QQ\x1b\\").?;
     try std.testing.expectEqual(@as(u8, 'T'), cmd.action);
     try std.testing.expectEqual(@as(u32, 3), cmd.id);
     try std.testing.expectEqual(@as(u32, 24), cmd.format);
+    try std.testing.expectEqual(@as(u8, 'z'), cmd.compression);
+    try std.testing.expectEqual(@as(u32, 69), cmd.data_size);
     try std.testing.expectEqualStrings("QQ", cmd.payload);
     try std.testing.expect(!cmd.more);
 }
@@ -1176,6 +1419,340 @@ test "decode rgb 1x1" {
 }
 
 const png_1x1_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+
+// ImageMagick 2x1 fixtures: red JPEG (q100, 4:4:4) and green GIF.
+const jpeg_2x1_b64 = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/2wBDAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/wAARCAABAAIDAREAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/xAAVAQEBAAAAAAAAAAAAAAAAAAAJCv/EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAMAwEAAhEDEQA/ABfFOv4f/9k=";
+const gif_2x1_b64 = "R0lGODlhAgABAPAAAAD/AAAAACH5BAAAAAAALAAAAAACAAEAAAICBAoAOw==";
+// Apple CgBI 2x1 (raw DEFLATE split over two IDATs, BGRA premultiplied):
+// opaque red, then green at alpha 128.
+const cgbi_2x1_b64 = "iVBORw0KGgoAAAAEQ2dCSVAAIAYsuHdmAAAADUlIRFIAAAACAAAAAQgGAAAA9CJ/igAAAANJREFUY2BgmxQxJAAAAAhJREFU+P+foYGhAQBlw92wAAAAAElFTkSuQmCC";
+
+test "wuffs decodes png jpeg and gif to rgba" {
+    const gpa = std.testing.allocator;
+    const cases = [_]struct { b64: []const u8, w: u32, rgb: [3]u8 }{
+        .{ .b64 = png_1x1_b64, .w = 1, .rgb = .{ 255, 0, 0 } },
+        .{ .b64 = jpeg_2x1_b64, .w = 2, .rgb = .{ 254, 0, 0 } },
+        .{ .b64 = gif_2x1_b64, .w = 2, .rgb = .{ 0, 255, 0 } },
+        // A bad IDAT CRC is accepted, as stb_image did.
+        .{ .b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQA2/pLvAAAAAElFTkSuQmCC", .w = 1, .rgb = .{ 255, 0, 0 } },
+    };
+    for (cases) |case| {
+        const raw = try decodeB64(gpa, case.b64);
+        defer gpa.free(raw);
+        const bmp = try decodeEncoded(gpa, raw);
+        defer gpa.free(bmp.rgba);
+        try std.testing.expectEqual(case.w, bmp.width);
+        try std.testing.expectEqual(@as(u32, 1), bmp.height);
+        var i: usize = 0;
+        while (i < bmp.rgba.len) : (i += 4) {
+            for (0..3) |ch| try std.testing.expect(@abs(@as(i16, bmp.rgba[i + ch]) - case.rgb[ch]) <= 2);
+            try std.testing.expectEqual(@as(u8, 255), bmp.rgba[i + 3]);
+        }
+    }
+    try std.testing.expectError(error.InvalidImage, decodeEncoded(gpa, "not an image"));
+    // 2x1 GIF whose 1x1 red frame leaves the green background showing.
+    const raw = try decodeB64(gpa, "R0lGODlhAgABAIABAP8AAAD/ACwAAAAAAQABAAACAkQBADs=");
+    defer gpa.free(raw);
+    const bmp = try decodeEncoded(gpa, raw);
+    defer gpa.free(bmp.rgba);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255, 0, 255, 0, 255 }, bmp.rgba);
+}
+
+test "wuffs decodes apple cgbi pngs and jpegs missing their end marker" {
+    const gpa = std.testing.allocator;
+    const cgbi = try decodeB64(gpa, cgbi_2x1_b64);
+    defer gpa.free(cgbi);
+    const a = try decodeEncoded(gpa, cgbi);
+    defer gpa.free(a.rgba);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255, 0, 255, 0, 128 }, a.rgba);
+    const jpeg = try decodeB64(gpa, jpeg_2x1_b64);
+    defer gpa.free(jpeg);
+    try std.testing.expect(std.mem.endsWith(u8, jpeg, "\xff\xd9"));
+    const b = try decodeEncoded(gpa, jpeg[0 .. jpeg.len - 2]);
+    defer gpa.free(b.rgba);
+    try std.testing.expectEqual(@as(u32, 2), b.width);
+    try std.testing.expect(b.rgba[0] > 250 and b.rgba[1] < 5 and b.rgba[3] == 255);
+}
+
+test "encoded uploads read only their header; pixels wait for the first draw" {
+    const gpa = std.testing.allocator;
+    // A JPEG whose SOF sits past the first base64 probe (big COM segment).
+    const jpeg = try decodeB64(gpa, jpeg_2x1_b64);
+    defer gpa.free(jpeg);
+    const padded = try gpa.alloc(u8, jpeg.len + 4 + 12000);
+    defer gpa.free(padded);
+    @memcpy(padded[0..2], jpeg[0..2]);
+    @memcpy(padded[2..4], "\xff\xfe");
+    std.mem.writeInt(u16, padded[4..6], 12002, .big);
+    @memset(padded[6 .. 6 + 12000], 'x');
+    @memcpy(padded[6 + 12000 ..], jpeg[2..]);
+    const enc = std.base64.standard.Encoder;
+    const big_b64 = try gpa.alloc(u8, enc.calcSize(padded.len));
+    defer gpa.free(big_b64);
+    _ = enc.encode(big_b64, padded);
+    const big_seq = try std.mem.concat(gpa, u8, &.{ "\x1b_Ga=T,f=100,i=4,q=2;", big_b64, "\x1b\\" });
+    defer gpa.free(big_seq);
+
+    var store = Store.init(gpa);
+    defer store.deinit();
+    const seqs = [_][]const u8{
+        "\x1b_Ga=T,f=100,i=1,q=2;" ++ jpeg_2x1_b64 ++ "\x1b\\",
+        "\x1b_Ga=T,f=100,i=2,q=2;" ++ gif_2x1_b64 ++ "\x1b\\",
+        "\x1b_Ga=T,f=100,i=3,q=2;" ++ cgbi_2x1_b64 ++ "\x1b\\",
+        big_seq,
+        "\x1b_Ga=T,f=100,o=z,S=69,i=5,q=2;" ++ zlib_png_b64 ++ "\x1b\\",
+    };
+    for (seqs, 0..) |seq, k| _ = store.feed(seq, .{ .row = @intCast(k) }, 8, 8, 0);
+    for (1..6) |id| {
+        const img = store.find(@intCast(id)).?;
+        // Dimensions known, nothing decoded or inflated yet.
+        try std.testing.expect(img.pending != null);
+        try std.testing.expectEqual(@as(usize, 0), img.rgba.len);
+        try std.testing.expect(img.width > 0 and img.height > 0);
+    }
+    try std.testing.expectEqual(@as(u8, 'z'), store.find(5).?.pending.?.compression);
+    try std.testing.expectEqual(@as(u32, 2), store.find(4).?.width);
+    store.decodeVisible(0, 0, 8, 1);
+    for (1..6) |id| {
+        const img = store.find(@intCast(id)).?;
+        try std.testing.expect(img.pending == null);
+        try std.testing.expectEqual(@as(usize, @as(usize, img.width) * img.height * 4), img.rgba.len);
+    }
+}
+// Python zlib.compress fixtures, independent of the decoder under test.
+const zlib_rgb_b64 = "eJz7z8AAAAMAAQA=";
+const zlib_rgba_b64 = "eJz7z8DQAAAEgAGA";
+const zlib_png_b64 = "eJzrDPBz5+WS4mJgYOD19HAJAtKMIMzBBCQnlAffA1I8ni6OIRVzkn+cP8DAwMzIyHDy36T3QHEGT1c/l3VOCU0Azm0QjQ==";
+
+test "decode zlib compressed RGB RGBA and PNG" {
+    const gpa = std.testing.allocator;
+    for ([_][]const u8{
+        "f=24,s=1,v=1,o=z;" ++ zlib_rgb_b64,
+        "f=32,s=1,v=1,o=z;" ++ zlib_rgba_b64,
+        "f=100,o=z,S=69;" ++ zlib_png_b64,
+        // Stored DEFLATE blocks and alternative zlib compression levels.
+        "f=32,s=1,v=1,o=z;eAEBBAD7//8AAIAEgAGA",
+        "f=32,s=1,v=1,o=z;eAH7z8DQAAAEgAGA",
+        "f=32,s=1,v=1,o=z;eNr7z8DQAAAEgAGA",
+    }) |seq| {
+        const cmd = parse(seq).?;
+        const bmp = try decode(gpa, cmd);
+        defer gpa.free(bmp.rgba);
+        try std.testing.expectEqual(@as(u32, 1), bmp.width);
+        try std.testing.expectEqual(@as(u32, 1), bmp.height);
+        try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, if (cmd.format == 32) 128 else 255 }, bmp.rgba);
+    }
+}
+
+test "zlib dynamic blocks decode beyond the DEFLATE history window" {
+    // 128x256 repetitions of RGBA (255, 0, 0, 128), compressed by Python zlib.
+    const payload = "eJztwwENAAAMAiCjv7k+CGw0uaqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqr+ATOmizI=";
+    const bmp = try decode(std.testing.allocator, parse("f=32,s=128,v=256,o=z;" ++ payload).?);
+    defer std.testing.allocator.free(bmp.rgba);
+    try std.testing.expectEqual(@as(usize, 128 * 256 * 4), bmp.rgba.len);
+    var i: usize = 0;
+    while (i < bmp.rgba.len) : (i += 4) try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 128 }, bmp.rgba[i..][0..4]);
+}
+
+test "zlib compression rejects corrupt truncated oversized and unsupported data" {
+    const gpa = std.testing.allocator;
+    const valid = try decodeB64(gpa, zlib_rgba_b64);
+    defer gpa.free(valid);
+    const cmd: Command = .{ .compression = 'z', .width = 1, .height = 1 };
+    for (0..valid.len) |len| {
+        try std.testing.expectError(error.InvalidImage, inflatePayload(gpa, try gpa.dupe(u8, valid[0..len]), cmd));
+    }
+    // The zlib header check bits, deflate method/window, dictionary flag,
+    // block encoding and Adler-32 footer must all be validated.
+    for ([_]usize{ 0, 1, 2, valid.len - 1 }) |at| {
+        const bad = try gpa.dupe(u8, valid);
+        bad[at] ^= 1;
+        try std.testing.expectError(error.InvalidImage, inflatePayload(gpa, bad, cmd));
+    }
+    const dictionary = try gpa.dupe(u8, valid);
+    dictionary[1] = 0xbb; // Valid check bits with FDICT set.
+    try std.testing.expectError(error.InvalidImage, inflatePayload(gpa, dictionary, cmd));
+    const trailing = try gpa.alloc(u8, valid.len + 1);
+    @memcpy(trailing[0..valid.len], valid);
+    trailing[valid.len] = 0;
+    try std.testing.expectError(error.InvalidImage, inflatePayload(gpa, trailing, cmd));
+    for ([_][]const u8{
+        "f=24,s=1,v=1,o=z;" ++ zlib_rgba_b64, // Expands beyond declared pixels.
+        "f=32,s=2,v=1,o=z;" ++ zlib_rgba_b64, // Too few pixels.
+        "f=32,s=10000,v=10000,o=z;" ++ zlib_rgba_b64,
+        "f=32,s=10001,v=1,o=z;" ++ zlib_rgba_b64,
+        "f=32,o=z;" ++ zlib_rgba_b64,
+        "f=32,s=1,v=1,o=x;" ++ zlib_rgba_b64,
+        "f=100,o=z;" ++ zlib_png_b64,
+        "f=100,o=z,S=68;" ++ zlib_png_b64,
+        "f=100,o=z,S=70;" ++ zlib_png_b64,
+        "f=100,o=z,S=335544321;" ++ zlib_png_b64,
+    }) |seq| try std.testing.expectError(error.InvalidImage, decode(gpa, parse(seq).?));
+}
+
+test "async decode installs the same pixels as sync decode" {
+    const gpa = std.testing.allocator;
+    const seqs = [_][]const u8{
+        "\x1b_Ga=T,f=100,i=1,q=2;" ++ png_1x1_b64 ++ "\x1b\\",
+        "\x1b_Ga=T,f=32,s=1,v=1,o=z,i=2,q=2;" ++ zlib_rgba_b64 ++ "\x1b\\",
+        "\x1b_Ga=T,f=24,s=1,v=1,i=3,q=2;/wAA\x1b\\",
+    };
+    var sync = Store.init(gpa);
+    defer sync.deinit();
+    var async_store = Store.init(gpa);
+    defer async_store.deinit();
+    async_store.async_decode = true;
+    for (seqs, 0..) |seq, row| {
+        _ = sync.feed(seq, .{ .row = @intCast(row) }, 8, 4, 0);
+        _ = async_store.feed(seq, .{ .row = @intCast(row) }, 8, 4, 0);
+    }
+    sync.decodeVisible(0, 0, 4, 1);
+    async_store.decodeVisible(0, 0, 4, 1);
+    for (async_store.images.items) |img| {
+        // Nothing drawable until collected; never decoded twice.
+        try std.testing.expect(img.pending == null);
+    }
+    try std.testing.expect(async_store.finishDecodes());
+    try std.testing.expectEqual(@as(usize, 0), async_store.jobs.items.len);
+    try std.testing.expectEqual(sync.images.items.len, async_store.images.items.len);
+    for (sync.images.items) |want| {
+        const got = async_store.find(want.id).?;
+        try std.testing.expectEqual(want.width, got.width);
+        try std.testing.expectEqual(want.height, got.height);
+        try std.testing.expectEqualSlices(u8, want.rgba, got.rgba);
+    }
+}
+
+test "async decode results for deleted or replaced images are discarded" {
+    const gpa = std.testing.allocator;
+    var store = Store.init(gpa);
+    defer store.deinit();
+    store.async_decode = true;
+    // Deleted while decoding: the result is dropped (and freed).
+    _ = store.feed("\x1b_Ga=T,f=100,i=5,q=2;" ++ png_1x1_b64 ++ "\x1b\\", .{}, 8, 4, 0);
+    store.decodeVisible(0, 0, 4, 1);
+    _ = store.feed("\x1b_Ga=d,d=I,i=5,q=2;\x1b\\", .{}, 8, 4, 0);
+    try std.testing.expect(store.find(5) == null);
+    // Still reports the finished job: its slot is free for pending images.
+    try std.testing.expect(store.finishDecodes());
+    try std.testing.expect(store.find(5) == null);
+    // Replaced while decoding: the old pixels never land on the new image.
+    _ = store.feed("\x1b_Ga=T,f=24,s=1,v=1,i=6,q=2;/wAA\x1b\\", .{}, 8, 4, 0);
+    store.decodeVisible(0, 0, 4, 1);
+    _ = store.feed("\x1b_Ga=T,f=24,s=1,v=1,i=6,q=2;AP8A\x1b\\", .{}, 8, 4, 0);
+    _ = store.finishDecodes();
+    store.decodeVisible(0, 0, 4, 1);
+    _ = store.finishDecodes();
+    const img = store.find(6).?;
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255 }, img.rgba);
+    // Undecodable data removes the image once its decode finishes.
+    _ = store.feed("\x1b_Ga=T,f=100,i=7,q=2;" ++ png_1x1_b64[0..40] ++ "\x1b\\", .{}, 8, 4, 0);
+    store.decodeVisible(0, 0, 4, 1);
+    _ = store.finishDecodes();
+    try std.testing.expect(store.find(7) == null);
+    // All slots busy with images that are then deleted: the image left
+    // pending still gets a redraw request, and decodes on the next pass.
+    _ = store.feed("\x1b_Ga=d,d=A,q=2;\x1b\\", .{}, 8, 4, 0);
+    for (0..Store.max_jobs + 1) |k| {
+        var seq_buf: [96]u8 = undefined;
+        const seq = try std.fmt.bufPrint(&seq_buf, "\x1b_Ga=T,f=24,s=1,v=1,i={d},q=2;/wAA\x1b\\", .{20 + k});
+        _ = store.feed(seq, .{ .row = @intCast(k % 4) }, 8, 4, 0);
+    }
+    store.decodeVisible(0, 0, 4, 1);
+    const last: u32 = 20 + Store.max_jobs;
+    try std.testing.expect(store.find(last).?.pending != null);
+    for (0..Store.max_jobs) |k| {
+        var seq_buf: [64]u8 = undefined;
+        _ = store.feed(try std.fmt.bufPrint(&seq_buf, "\x1b_Ga=d,d=I,i={d},q=2;\x1b\\", .{20 + k}), .{}, 8, 4, 0);
+    }
+    try std.testing.expect(store.finishDecodes());
+    store.decodeVisible(0, 0, 4, 1);
+    _ = store.finishDecodes();
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, store.find(last).?.rgba);
+}
+
+test "chunked zlib transfers retain compression and defer pixel decoding" {
+    const gpa = std.testing.allocator;
+    for ([_]struct { header: []const u8, payload: []const u8 }{
+        .{ .header = "f=24,s=1,v=1", .payload = zlib_rgb_b64 },
+        .{ .header = "f=32,s=1,v=1", .payload = zlib_rgba_b64 },
+        .{ .header = "f=100,S=69", .payload = zlib_png_b64 },
+    }) |fixture| {
+        for (0..fixture.payload.len) |split| {
+            var store = Store.init(gpa);
+            defer store.deinit();
+            var buf: [256]u8 = undefined;
+            const first = try std.fmt.bufPrint(&buf, "a=T,{s},o=z,i=7,p=3,m=1;{s}", .{ fixture.header, fixture.payload[0..split] });
+            _ = store.feed(first, .{}, 8, 8, 0);
+            try std.testing.expect(store.assembling);
+            const last = try std.fmt.bufPrint(&buf, "m=0;{s}", .{fixture.payload[split..]});
+            _ = store.feed(last, .{}, 8, 8, 0);
+            try std.testing.expect(!store.assembling);
+            try std.testing.expectEqualStrings("\x1b_Gi=7,p=3;OK\x1b\\", store.reply[0..store.reply_len]);
+            const img = store.find(7).?;
+            try std.testing.expectEqual(@as(u32, 1), img.width);
+            try std.testing.expectEqual(@as(u32, 1), img.height);
+            try std.testing.expect(img.pending != null and img.rgba.len == 0);
+            const cost = store.cacheBytes();
+            store.decodeVisible(0, -10, 4, 1);
+            try std.testing.expect(store.find(7).?.pending != null);
+            store.decodeVisible(0, 0, 4, 1);
+            try std.testing.expect(store.find(7).?.pending == null);
+            try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, if (std.mem.startsWith(u8, fixture.header, "f=32")) 128 else 255 }, store.find(7).?.rgba);
+            try std.testing.expectEqual(cost, store.cacheBytes());
+        }
+    }
+}
+
+test "invalid zlib uploads release owned buffers and recover" {
+    const gpa = std.testing.allocator;
+    var store = Store.init(gpa);
+    defer store.deinit();
+    // Exercise handed-over buffers, where the payload is an interior slice.
+    for ([_][]const u8{
+        "f=100,o=z,S=69;AAAA",
+        "f=100,o=z;" ++ zlib_png_b64,
+        "f=32,o=z;" ++ zlib_rgba_b64,
+        "f=32,s=1,v=1,o=x;" ++ zlib_rgba_b64,
+    }) |seq| {
+        const owned = try gpa.dupe(u8, seq);
+        try std.testing.expectError(error.InvalidImage, store.load(parse(owned).?, owned));
+    }
+    _ = store.feed("a=T,f=32,s=1,v=1,o=z,i=7;AAAA", .{}, 8, 8, 0);
+    store.decodeVisible(0, 0, 4, 1);
+    try std.testing.expect(store.find(7) == null);
+    try std.testing.expectEqual(@as(usize, 0), store.placements.items.len);
+    _ = store.feed("a=T,f=32,s=1,v=1,o=z,i=7;" ++ zlib_rgba_b64, .{}, 8, 8, 0);
+    store.decodeVisible(0, 0, 4, 1);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 128 }, store.find(7).?.rgba);
+    _ = store.feed("a=q,o=x,i=8;", .{}, 8, 8, 0);
+    try std.testing.expectEqualStrings("\x1b_Gi=8;EINVAL:unsupported compression\x1b\\", store.reply[0..store.reply_len]);
+}
+
+test "zlib allocation failures release decoded and handed-over buffers" {
+    const Checks = struct {
+        fn decoding(allocator: std.mem.Allocator, seq: []const u8) !void {
+            const bmp = decode(allocator, parse(seq).?) catch return error.OutOfMemory;
+            defer allocator.free(bmp.rgba);
+        }
+
+        fn loading(allocator: std.mem.Allocator, seq: []const u8) !void {
+            var store = Store.init(allocator);
+            defer store.deinit();
+            const owned = try allocator.dupe(u8, seq);
+            const img = store.load(parse(owned).?, owned) catch return error.OutOfMemory;
+            defer store.release(img);
+        }
+    };
+    for ([_][]const u8{
+        "f=24,s=1,v=1,o=z;" ++ zlib_rgb_b64,
+        "f=32,s=1,v=1,o=z;" ++ zlib_rgba_b64,
+        "f=100,S=69,o=z;" ++ zlib_png_b64,
+    }) |seq| {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, Checks.decoding, .{seq});
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, Checks.loading, .{seq});
+    }
+}
 
 test "decode png 1x1" {
     const gpa = std.testing.allocator;
@@ -1447,6 +2024,48 @@ test "query unknown medium errors" {
     try std.testing.expect(std.mem.indexOf(u8, store.reply[0..store.reply_len], "EINVAL") != null);
 }
 
+test "placement replies include the requested image and placement ids" {
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+
+    // tdf/kittage checks both ids for transmit-and-display and cached display.
+    _ = store.feed("\x1b_Ga=T,f=32,s=1,v=1,i=7,p=1,C=1;/wAA/w==\x1b\\", .{}, 8, 8, 0);
+    try std.testing.expectEqualStrings("\x1b_Gi=7,p=1;OK\x1b\\", store.reply[0..store.reply_len]);
+    _ = store.feed("\x1b_Ga=p,i=7,p=2,C=1\x1b\\", .{}, 8, 8, 0);
+    try std.testing.expectEqualStrings("\x1b_Gi=7,p=2;OK\x1b\\", store.reply[0..store.reply_len]);
+    try std.testing.expectEqual(@as(usize, 2), store.placements.items.len);
+
+    // Both success and error replies must retain the placement id.
+    _ = store.feed("\x1b_Ga=p,i=8,p=4294967295\x1b\\", .{}, 8, 8, 0);
+    try std.testing.expectEqualStrings("\x1b_Gi=8,p=4294967295;ENOENT:image not found\x1b\\", store.reply[0..store.reply_len]);
+    _ = store.feed("\x1b_Ga=T,f=32,s=1,v=1,i=9,p=3;\x1b\\", .{}, 8, 8, 0);
+    try std.testing.expectEqualStrings("\x1b_Gi=9,p=3;EINVAL:could not load image\x1b\\", store.reply[0..store.reply_len]);
+
+    // Omitting p (or using p=0) keeps the image-only acknowledgement.
+    for ([_][]const u8{ "a=p,i=7,C=1", "a=p,i=7,p=0,C=1" }) |seq| {
+        _ = store.feed(seq, .{}, 8, 8, 0);
+        try std.testing.expectEqualStrings("\x1b_Gi=7;OK\x1b\\", store.reply[0..store.reply_len]);
+    }
+}
+
+test "chunked placement replies retain ids and respect quiet mode" {
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+    _ = store.feed("a=T,f=32,s=1,v=1,i=7,p=3,C=1,m=1;/wAA", .{}, 8, 8, 0);
+    try std.testing.expectEqual(@as(usize, 0), store.reply_len);
+    _ = store.feed("m=0;/w==", .{}, 8, 8, 0);
+    try std.testing.expectEqualStrings("\x1b_Gi=7,p=3;OK\x1b\\", store.reply[0..store.reply_len]);
+
+    _ = store.feed("a=p,i=7,p=3,C=1,q=1", .{}, 8, 8, 0);
+    try std.testing.expectEqual(@as(usize, 0), store.reply_len);
+    _ = store.feed("a=p,i=8,p=3,q=1", .{}, 8, 8, 0);
+    try std.testing.expectEqualStrings("\x1b_Gi=8,p=3;ENOENT:image not found\x1b\\", store.reply[0..store.reply_len]);
+    for ([_][]const u8{ "a=p,i=7,p=3,C=1,q=2", "a=p,i=8,p=3,q=2" }) |seq| {
+        _ = store.feed(seq, .{}, 8, 8, 0);
+        try std.testing.expectEqual(@as(usize, 0), store.reply_len);
+    }
+}
+
 test "file transmit places png" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     const gpa = std.testing.allocator;
@@ -1476,6 +2095,43 @@ test "file transmit places png" {
     try std.testing.expectEqual(@as(usize, 1), store.images.items.len);
     try std.testing.expectEqual(@as(usize, 1), store.placements.items.len);
     try std.testing.expectEqualStrings("\x1b_Gi=9;OK\x1b\\", store.reply[0..store.reply_len]);
+}
+
+test "zlib file and temporary-file transfers decode image bytes rather than paths" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const path = "/tmp/velocitty-tty-graphics-protocol-zlib-test";
+    defer _ = std.os.linux.unlink(path);
+    var path_b64: [std.base64.standard.Encoder.calcSize(path.len)]u8 = undefined;
+    _ = std.base64.standard.Encoder.encode(&path_b64, path);
+    for ([_]struct { header: []const u8, payload: []const u8, alpha: u8 }{
+        .{ .header = "f=24,s=1,v=1", .payload = zlib_rgb_b64, .alpha = 255 },
+        .{ .header = "f=32,s=1,v=1", .payload = zlib_rgba_b64, .alpha = 128 },
+        .{ .header = "f=100,S=69", .payload = zlib_png_b64, .alpha = 255 },
+    }) |fixture| {
+        const raw = try decodeB64(gpa, fixture.payload);
+        defer gpa.free(raw);
+        for ([_]u8{ 'f', 't' }) |medium| {
+            const rc = std.os.linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
+            try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(rc));
+            const fd: i32 = @intCast(rc);
+            const written = std.os.linux.write(fd, raw.ptr, raw.len);
+            _ = std.os.linux.close(fd);
+            try std.testing.expectEqual(raw.len, written);
+
+            var store = Store.init(gpa);
+            defer store.deinit();
+            var buf: [256]u8 = undefined;
+            const seq = try std.fmt.bufPrint(&buf, "a=T,{s},o=z,t={c},i=9;{s}", .{ fixture.header, medium, path_b64 });
+            _ = store.feed(seq, .{}, 8, 8, 0);
+            try std.testing.expectEqualStrings("\x1b_Gi=9;OK\x1b\\", store.reply[0..store.reply_len]);
+            try std.testing.expect(store.find(9).?.pending != null);
+            store.decodeVisible(0, 0, 4, 1);
+            try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, fixture.alpha }, store.find(9).?.rgba);
+            const exists = payloadPathExists(gpa, &path_b64);
+            try std.testing.expectEqual(medium == 'f', exists);
+        }
+    }
 }
 
 test "multipart transfer cap discards through final chunk and recovers" {

@@ -3,8 +3,8 @@
 const std = @import("std");
 
 const c = struct {
-    extern fn zt_stbi_load_rgba(data: [*]const u8, len: c_int, w: *c_int, h: *c_int, out: *?[*]u8) callconv(.c) c_int;
-    extern fn zt_stbi_free(p: [*]u8) callconv(.c) void;
+    extern fn zt_image_load_rgba(data: [*]const u8, len: c_int, w: *c_int, h: *c_int, out: *?[*]u8) callconv(.c) c_int;
+    extern fn zt_image_free(p: [*]u8) callconv(.c) void;
 };
 
 pub const Error = error{
@@ -136,9 +136,9 @@ pub const ColorFont = struct {
         var w: c_int = 0;
         var h: c_int = 0;
         var ptr: ?[*]u8 = null;
-        if (c.zt_stbi_load_rgba(png.ptr, @intCast(png.len), &w, &h, &ptr) == 0) return null;
+        if (c.zt_image_load_rgba(png.ptr, @intCast(png.len), &w, &h, &ptr) == 0) return null;
         const src = ptr orelse return null;
-        defer c.zt_stbi_free(src);
+        defer c.zt_image_free(src);
         if (w <= 0 or h <= 0) return null;
         const sw: u32 = @intCast(w);
         const sh: u32 = @intCast(h);
@@ -211,7 +211,7 @@ pub const ColorFont = struct {
     }
 };
 
-fn downsampleRgba(src: []const u8, sw: u32, sh: u32, dst: []u8, dw: u32, dh: u32) void {
+pub fn downsampleRgba(src: []const u8, sw: u32, sh: u32, dst: []u8, dw: u32, dh: u32) void {
     if (dw == sw and dh == sh) {
         @memcpy(dst, src);
         return;
@@ -261,7 +261,7 @@ pub fn findTable(bytes: []const u8, tag: *const [4]u8) ?[]const u8 {
     return findTableAt(bytes, 0, tag);
 }
 
-fn findTableAt(bytes: []const u8, offset: usize, tag: *const [4]u8) ?[]const u8 {
+pub fn findTableAt(bytes: []const u8, offset: usize, tag: *const [4]u8) ?[]const u8 {
     if (offset > bytes.len or bytes.len - offset < 12) return null;
     const n = readU16(bytes, offset + 4) orelse return null;
     var i: u16 = 0;
@@ -279,7 +279,7 @@ fn findTableAt(bytes: []const u8, offset: usize, tag: *const [4]u8) ?[]const u8 
     return null;
 }
 
-fn cmapLookup(cmap: []const u8, cp: u21) ?u16 {
+pub fn cmapLookup(cmap: []const u8, cp: u21) ?u16 {
     if (cmap.len < 4) return null;
     const nsub = readU16(cmap, 2) orelse return null;
     var i: u16 = 0;
@@ -340,7 +340,7 @@ fn cmapFmt4(t: []const u8, cp: u21) ?u16 {
 fn cmapFmt12(t: []const u8, cp: u21) ?u16 {
     if (t.len < 16) return null;
     const ngroups = readU32(t, 12) orelse return null;
-    if (16 + ngroups * 12 > t.len) return null;
+    if (ngroups > (t.len - 16) / 12) return null;
     var lo: u32 = 0;
     var hi = ngroups;
     while (lo < hi) {
@@ -354,8 +354,8 @@ fn cmapFmt12(t: []const u8, cp: u21) ?u16 {
             lo = mid + 1;
         } else {
             const start_gid = readU32(t, rec + 8) orelse return null;
+            if (start_gid > 0xFFFF or cp - start > 0xFFFF - start_gid) return null;
             const gid = start_gid + (cp - start);
-            if (gid > 0xFFFF) return null;
             return @intCast(gid);
         }
     }

@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Velocitty 1.3.1 - Proving Progress Redraws Obsolete</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="icon" href="favicon.ico" sizes="16x16 32x32">
+</head>
+<body>
+    <nav class="site-nav" aria-label="Main navigation">
+        <div class="nav-inner">
+            <a class="brand" href="index.html"><img src="icon.svg" alt=""><span>Velocitty</span></a>
+            <a href="index.html">Documentation</a>
+        </div>
+    </nav>
+    <div class="docs-layout">
+        <nav class="docs-sidebar" aria-label="On this page">
+            <a href="#change">What's new!</a>
+            <a href="#cr">CR Skip</a>
+            <a href="#timing">But is it cheap?</a>
+            <a href="#results">Performance gains</a>
+            <a href="#method">How we measured</a>
+            <a href="#limits">When it applies</a>
+            <a href="#archive">1.3 archive</a>
+            <a href="#changelog">Changelog</a>
+        </nav>
+        <main class="axioms">
+            <h1 class="title title-progress">Velocitty 1.3.1 - Proving Progress Redraws Obsolete</h1>
+
+            <h2 id="change">What's new!</h2>
+
+            <p>Previously, on <a href="design-1.3.html">Velocitty 1.3.0</a>, we only looked
+            at how floods of text would scroll off rows and how that can be programatically checked
+            and skip painting while still preverving correct VT parsing. Now, we'll look at how text
+            can be made obsolete within the same row.</p>
+
+            <p>Because this is an extremely common pattern in a lot of small workloads, it is
+            applied for updates of at least 64 bytes. And it worked!</p>
+
+            <p><b>The number of instructions on progress-bar workloads is down by 65%!</b></p>
+
+
+            <p>Given that a large amount of people currently user terminals for agent CLIs
+            and updating packagage managers, this is basically preventing the ice caps from melting.</p>
+
+            <h2 id="cr">CR Skip</h2>
+
+            <p>Carriage return (CR) --- depicted as <code>'\r'</code> in most programming languages
+            --- is one of many ways a cursor can be sent to the start of a line. It returns the
+            cursor to the beginning of a column. This means that if, for example, we
+            recieve a few dozen progress bar updates between frames, we are just rewritting the same
+            row over and over again. We can just write the final result.</p>
+
+            <figure>
+                <a href="obsolete3.svg"><img src="obsolete3.svg" width="1220" height="580" alt="A forward overwrite proof within one text run ghosts the first 33 bytes of three progress-line redraws and executes only the final CR and 17-byte replacement, producing the same cells, cursor and last character."></a>
+                <figcaption>A covering update makes the first 33 bytes obsolete.</figcaption>
+            </figure>
+
+            <h2 id="timing">But is it cheap?</h2>
+            <p>Checking whether a redraw can be skipped is cheap. In a 4 MiB test it skipped
+            about 4 MB of input, and all the checks together took under 0.4 ms. To measure it
+            yourself:</p>
+
+            <pre><code>zig build bench -Dbench-profile=true -- --only drain,progress --mib 1 --ring 1024 --profile-obsolete</code></pre>
+
+            <h2 id="limits">When it applies</h2>
+
+            <p>The current implementation only attempts this optimization for updates of at least 64 bytes. </p>
+            <p>The skip only kicks in when Velocitty is behind on input, and only for plain
+            text that stays on one row. Anything else, like wrapping, insert mode or combining
+            characters, is parsed normally.</p>
+
+            <p>A shorter update doesn't erase the rest of the row, so the end of the old
+            text is still visible:</p>
+
+            <pre><code>Input:   ABCDE\rxy
+Display: xyCDE</code></pre>
+
+            <p>Every one of these cases is tested with and without the skip, and the screen
+            ends up identical.</p>
+
+            <h2 id="results">Performance gains</h2>
+
+            <p>Long progress updates (106 bytes) use 65% fewer instructions. Short ones
+            (26 bytes) are under the 64-byte cutoff, so they barely change. Everything else
+            stays within 2% of 1.3.</p>
+
+            <!-- <figure> -->
+            <!--     <a href="velocitty-1.3.1-performance.png"><img src="velocitty-1.3.1-performance.png" alt="Instruction comparison of 1.3 and 1.3.1: long progress redraws use about 65 percent fewer instructions; the other workloads stay close to 1.3."></a> -->
+            <!--     <figcaption>Same input on both versions, with 1.3 as 100%. Lower is better.</figcaption> -->
+            <!-- </figure> -->
+
+            <table class="performance-results">
+                <caption>Median instructions, in millions</caption>
+                <thead>
+                    <tr><th scope="col">Workload</th><th scope="col">1.3</th><th scope="col">1.3.1</th><th scope="col">Change</th></tr>
+                </thead>
+                <tbody>
+                    <tr><th scope="row">Progress, 106-byte updates</th><td>137.91</td><td>48.48</td><td>−64.85%</td></tr>
+                    <tr><th scope="row">Short redraws, 26-byte updates</th><td>255.12</td><td>251.17</td><td>−1.55%</td></tr>
+                    <tr><th scope="row">Scrolling ASCII</th><td>100.58</td><td>99.27</td><td>−1.30%</td></tr>
+                    <tr><th scope="row">Unicode</th><td>298.15</td><td>296.55</td><td>−0.54%</td></tr>
+                    <tr><th scope="row">CSI redraws</th><td>746.36</td><td>740.90</td><td>−0.73%</td></tr>
+                </tbody>
+            </table>
+
+            <h2 id="method">How we measured</h2>
+            <ul>
+                <li>Intel Core i7-10610U, Zig 0.17.0, ReleaseFast, Linux.</li>
+                <li>Parsing only: no fonts, rendering or window (<code>+terminal-stream --drop</code>).</li>
+                <li>Median of three runs of <code>perf stat -e instructions:u</code>.</li>
+            </ul>
+
+            <p>We count instructions rather than time because a laptop's clock speed varies.
+            65% fewer instructions does not mean 65% faster frames or lower latency.</p>
+
+
+            <h2 id="archive">1.3 archive</h2>
+            <p>For how Velocitty compares with Ghostty, see the
+            <a href="design-1.3.html#benchmarks">1.3 benchmarks</a>.</p>
+
+            <h2 id="changelog">Changelog</h2>
+            <ul>
+                <li>Progress-bar redraws of 64 bytes or more are skipped when a later update
+                covers them.</li>
+                <li>Scrolling moves rows instead of copying cells.</li>
+                <li>Escape sequences with more than 32 parameters no longer corrupt the last one.</li>
+                <li>Kitty graphics supports zlib-compressed images (<code>o=z</code>), and replies
+                include both the image and placement ID.</li>
+                <li>Images are decoded with wuffs instead of stb_image: about twice as fast for PNG,
+                and Apple CgBI PNGs and JPEGs missing their end marker now load.</li>
+                <li>Images decode on worker threads when they first become visible; uploads read
+                only the header, so a large image no longer stalls a frame.</li>
+                <li>Images on screen are redrawn only when they change: typing next to a full-window
+                image costs 0.05 ms per frame instead of 2.6 ms.</li>
+                <li>Kitty commands that leave images unchanged no longer mark every line dirty.</li>
+            </ul>
+        </main>
+    </div>
+</body>
+</html>

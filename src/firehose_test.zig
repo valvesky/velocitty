@@ -2,7 +2,7 @@
 //! end with the same visible state as a VT fed every byte (`exact = true`).
 //! Scrollback history is allowed to differ and is never compared.
 //!
-//!   zig test src/firehose_test.zig src/stb_image.c -Ilib -lc -target x86_64-linux-musl
+//!   zig test src/firehose_test.zig src/image.c -Ilib -lc -target x86_64-linux-musl
 
 const std = @import("std");
 const Ring = @import("circbuffer.zig");
@@ -767,6 +767,17 @@ test "split at every byte: kitty APC" {
     try sweep("split-kitty", 8, 3, "\x1b_Ga=T,f=32,s=1,v=1,i=3;AAAAAA==\x1b\\\x1b[H\x1b[2J\x1b_Ga=T,f=32,s=1,v=1,i=4;/wAA/w==\x1b\\");
 }
 
+test "split at every byte: zlib kitty APC and multipart transfer" {
+    try sweep(
+        "split-kitty-zlib",
+        8,
+        3,
+        "\x1b_Ga=T,f=32,s=1,v=1,o=z,i=3;eJz7z8DQAAAEgAGA\x1b\\" ++
+            "\x1b[H\x1b[2J\x1b_Ga=T,f=24,s=1,v=1,o=z,i=4,m=1;eJz7z8AA\x1b\\" ++
+            "\x1b_Gm=0;AAMAAQA=\x1b\\",
+    );
+}
+
 test "split at every byte: sixel" {
     try sweep("split-sixel", 8, 3, "\x1bPq#0;2;100;0;0#0~~~\x1b\\\x1b[H\x1b[2J\x1bPq#0~\x1b\\X");
 }
@@ -798,51 +809,50 @@ test "text longer than the ring with scrolling" {
 // ---------------------------------------------------------------------- fuzz
 
 const text_pieces = [_][]const u8{
-    "hello",  " world", "A",  "X",   "0123456789012345678901234567890", "wörld", "旦海", "😀", "e\u{301}",
-    "\r\n",   "\n",     "\r", "\n",  "\r\n",                            "\x08",   "\t",   "\x0b", "\x0c",
+    "hello",    " world",                     "A",                "X",                  "0123456789012345678901234567890",
+    "wörld",
+    "旦海",
+    "😀",
+    "e\u{301}", "\r\n",                       "\n",               "\r",                 "\n",
+    "\r\n",     "\x08",                       "\t",               "\x0b",               "\x0c",
     // grapheme clusters: a lone mark joins whatever came before
-    "\u{302}", "\u{1f468}\u{200d}\u{1f469}", "\u{2764}\u{fe0f}", "\u{1f1fa}\u{1f1f8}", "\u{1100}\u{1161}\u{11a8}",
+    "\u{302}",  "\u{1f468}\u{200d}\u{1f469}", "\u{2764}\u{fe0f}", "\u{1f1fa}\u{1f1f8}", "\u{1100}\u{1161}\u{11a8}",
 };
 
 const ctl_pieces = [_][]const u8{
     // motion and erase
-    "\x1b[H",       "\x1b[2;3H",   "\x1b[5;9H",    "\x1b[1;1H",  "\x1b[3A",           "\x1b[2B",          "\x1b[4C",           "\x1b[3D",    "\x1b[2E",
-    "\x1b[F",       "\x1b[5G",     "\x1b[3d",      "\x1b[J",     "\x1b[0J",           "\x1b[1J",          "\x1b[2J",           "\x1b[2J",    "\x1b[3J",
-    "\x1b[K",       "\x1b[1K",     "\x1b[2K",      "\x1b[2L",    "\x1b[M",            "\x1b[3@",          "\x1b[2P",           "\x1b[4X",    "\x1b[S",
-    "\x1b[T",       "\x1b[3b",     "\x1b[b",       "\x1b[3I",    "\x1b[2Z",           "\x1b[g",           "\x1b[3g",           "\x1bH",
+    "\x1b[H",              "\x1b[2;3H",            "\x1b[5;9H",            "\x1b[1;1H",                                 "\x1b[3A",              "\x1b[2B",                             "\x1b[4C",                               "\x1b[3D",                                           "\x1b[2E",
+    "\x1b[F",              "\x1b[5G",              "\x1b[3d",              "\x1b[J",                                    "\x1b[0J",              "\x1b[1J",                             "\x1b[2J",                               "\x1b[2J",                                           "\x1b[3J",
+    "\x1b[K",              "\x1b[1K",              "\x1b[2K",              "\x1b[2L",                                   "\x1b[M",               "\x1b[3@",                             "\x1b[2P",                               "\x1b[4X",                                           "\x1b[S",
+    "\x1b[T",              "\x1b[3b",              "\x1b[b",               "\x1b[3I",                                   "\x1b[2Z",              "\x1b[g",                              "\x1b[3g",                               "\x1bH",
     // regions
-    "\x1b[2;3r",    "\x1b[r",      "\x1b[2;4r",
+                                                "\x1b[2;3r",
+    "\x1b[r",              "\x1b[2;4r",
     // SGR
-    "\x1b[1m",      "\x1b[31m",    "\x1b[0m",      "\x1b[m",     "\x1b[38;2;1;2;3m",  "\x1b[48;5;100m",   "\x1b[4:3m",         "\x1b[7m",
+               "\x1b[1m",              "\x1b[31m",                                  "\x1b[0m",              "\x1b[m",                              "\x1b[38;2;1;2;3m",                      "\x1b[48;5;100m",                                    "\x1b[4:3m",
+    "\x1b[7m",
     // modes
-    "\x1b[?2027h", "\x1b[?2027l",
-    "\x1b[?7l",     "\x1b[?7h",    "\x1b[?6h",     "\x1b[?6l",   "\x1b[?25l",         "\x1b[?25h",        "\x1b[?1h",          "\x1b[?1l",   "\x1b[4h",
-    "\x1b[4l",      "\x1b[?1s",    "\x1b[?1r",     "\x1b[?2004h", "\x1b[?5h",         "\x1b[?5l",         "\x1b[?47h",         "\x1b[?47l",  "\x1b[?1047h",
-    "\x1b[?1047l",  "\x1b[?1049h", "\x1b[?1049l",  "\x1b[?1049h", "\x1b[?1049l",      "\x1b[?1070l",      "\x1b[?1070h",       "\x1b[3 q",   "\x1b[?1000h",
+                "\x1b[?2027h",          "\x1b[?2027l",          "\x1b[?7l",                                  "\x1b[?7h",             "\x1b[?6h",                            "\x1b[?6l",                              "\x1b[?25l",                                         "\x1b[?25h",
+    "\x1b[?1h",            "\x1b[?1l",             "\x1b[4h",              "\x1b[4l",                                   "\x1b[?1s",             "\x1b[?1r",                            "\x1b[?2004h",                           "\x1b[?5h",                                          "\x1b[?5l",
+    "\x1b[?47h",           "\x1b[?47l",            "\x1b[?1047h",          "\x1b[?1047l",                               "\x1b[?1049h",          "\x1b[?1049l",                         "\x1b[?1049h",                           "\x1b[?1049l",                                       "\x1b[?1070l",
+    "\x1b[?1070h",         "\x1b[3 q",             "\x1b[?1000h",
     // queries
-    "\x1b[6n",      "\x1b[5n",     "\x1b[c",       "\x1b[>c",    "\x1b[?1$p",         "\x1b[?6$p",        "\x1bP$qr\x1b\\",    "\x1bP$qm\x1b\\", "\x1b[?u",
-    "\x1b[14t",     "\x1b[18t",    "\x1b[22;0t",   "\x1b[23;0t", "\x1b[?996n",
+             "\x1b[6n",                                   "\x1b[5n",              "\x1b[c",                              "\x1b[>c",                               "\x1b[?1$p",                                         "\x1b[?6$p",
+    "\x1bP$qr\x1b\\",      "\x1bP$qm\x1b\\",       "\x1b[?u",              "\x1b[14t",                                  "\x1b[18t",             "\x1b[22;0t",                          "\x1b[23;0t",                            "\x1b[?996n",
     // ESC and C1
-    "\x1b7",        "\x1b8",       "\x1bM",        "\x1bD",      "\x1bE",             "\x1b(0",           "\x1b(B",            "\x1b)0",     "\x0e",
-    "\x0f",         "\x1b#8",      "\x8d",         "\x84",       "\x85",              "\x1bc",
+                                           "\x1b7",
+    "\x1b8",               "\x1bM",                "\x1bD",                "\x1bE",                                     "\x1b(0",               "\x1b(B",                              "\x1b)0",                                "\x0e",                                              "\x0f",
+    "\x1b#8",              "\x8d",                 "\x84",                 "\x85",                                      "\x1bc",
     // OSC
-    "\x1b]0;title\x07", "\x1b]2;t2\x1b\\", "\x1b]8;;http://x\x07", "\x1b]8;;\x07", "\x1b]11;#102030\x07", "\x1b]4;1;#ff0000\x07", "\x1b]104\x07",
-    "\x1b]7;file:///tmp\x07", "\x1b]133;A\x07", "\x1b]52;c;aGk=\x07",
+                   "\x1b]0;title\x07",                    "\x1b]2;t2\x1b\\",                       "\x1b]8;;http://x\x07",                              "\x1b]8;;\x07",
+    "\x1b]11;#102030\x07", "\x1b]4;1;#ff0000\x07", "\x1b]104\x07",         "\x1b]7;file:///tmp\x07",                    "\x1b]133;A\x07",       "\x1b]52;c;aGk=\x07",
     // kitty
-    "\x1b_Ga=T,f=32,s=1,v=1;AAAAAA==\x1b\\",
-    "\x1b_Ga=T,f=32,s=1,v=1,i=5,c=2,r=1;/wAA/w==\x1b\\",
-    "\x1b_Ga=t,f=32,s=1,v=1,i=7;AAAAAA==\x1b\\",
-    "\x1b_Ga=p,i=7\x1b\\",
-    "\x1b_Ga=d\x1b\\",
-    "\x1b_Ga=q,i=9;\x1b\\",
-    "\x1b_Ga=t,f=32,s=1,v=1,i=8,m=1;/wAA\x1b\\",
-    "\x1b_Gm=0;/w==\x1b\\",
+                     "\x1b_Ga=T,f=32,s=1,v=1;AAAAAA==\x1b\\", "\x1b_Ga=T,f=32,s=1,v=1,i=5,c=2,r=1;/wAA/w==\x1b\\", "\x1b_Ga=t,f=32,s=1,v=1,i=7;AAAAAA==\x1b\\",
+    "\x1b_Ga=p,i=7\x1b\\", "\x1b_Ga=d\x1b\\",      "\x1b_Ga=q,i=9;\x1b\\", "\x1b_Ga=t,f=32,s=1,v=1,i=8,m=1;/wAA\x1b\\", "\x1b_Gm=0;/w==\x1b\\",
     // sixel
-    "\x1bPq#0;2;100;0;0#0~~~~-#0~~\x1b\\",
-    "\x1bPq#1;2;0;100;0~\x1b\\",
-    "\x1bPq#1~~\x1b\\",
+    "\x1bPq#0;2;100;0;0#0~~~~-#0~~\x1b\\", "\x1bPq#1;2;0;100;0~\x1b\\",             "\x1bPq#1~~\x1b\\",
     // long string
-    "\x1b]2;" ++ rep("t", 2000) ++ "\x07",
+                                     "\x1b]2;" ++ rep("t", 2000) ++ "\x07",
 };
 
 const FuzzCase = struct {
@@ -1047,4 +1057,139 @@ test "one MiB lookahead preserves graphemes replies modes and chunked graphics a
         try std.testing.expectEqual(ring.head, ring.tail);
         try std.testing.expect(ring.preparser.metadataCapacityBytes() <= @import("preparser.zig").Preparser.max_metadata_bytes);
     }
+}
+
+test "covered progress redraws are omitted only under pressure" {
+    const p = try Pair.create("progress overwrite", 120, 3, 4096);
+    defer p.destroy();
+    const unit = "old progress 012345678901234567890123456789012345678901234567890123456789\rnew progress 012345678901234567890123456789012345678901234567890123456789\r";
+    var bytes: [3900]u8 = undefined;
+    for (0..bytes.len / unit.len) |i| @memcpy(bytes[i * unit.len ..][0..unit.len], unit);
+    const used = bytes.len / unit.len * unit.len;
+    p.put(0, bytes[0..used]);
+    p.put(1, bytes[0..used]);
+    p.ring[0].drain(p.vt[0].sink(), true);
+    p.ring[1].drain(p.vt[1].sink(), true);
+    try std.testing.expect(p.ring[1].preparser.test_overwrite_proofs > 0);
+    try std.testing.expectEqual(@as(usize, 0), p.ring[0].preparser.test_overwrite_proofs);
+    p.ring[0].drain(p.vt[0].sink(), false);
+    p.ring[1].drain(p.vt[1].sink(), false);
+    try std.testing.expect(p.compare());
+    try std.testing.expectEqual(p.vt[0].last_cp, p.vt[1].last_cp);
+}
+
+test "short redraw and intervening observers retain old effects" {
+    try runCase("short progress", 20, 3, &.{"ABCDE\rxy\x1b[6n"});
+    try runCase("progress REP", 20, 3, &.{"A\x1b[2b\rB"});
+    try runCase("progress query", 20, 3, &.{"A\x1b[6n\rB"});
+    try runCase("progress copy", 20, 3, &.{"A\xcc\x81\x1b[1;1;1;1;1;2;1;1$v\rB"});
+}
+
+test "progress overwrite fails closed for cursor and mode guards" {
+    const unit = "old progress 012345678901234567890123456789012345678901234567890123456789\rnew progress 012345678901234567890123456789012345678901234567890123456789\r";
+    const prefixes = [_][]const u8{
+        "\x1b[1;11H", // A CR returns to column zero; it cannot cover a shifted old tail.
+        "\x1b[4h", // insert mode
+        "\x1b[?2027h", // grapheme shaping
+        "\x1b(0", // DEC special graphics
+        "\x1bN", // single shift
+        "\x1b[1;120HX", // pending wrap
+    };
+    for (prefixes, 0..) |prefix, mode| {
+        const p = try Pair.create("progress guards", 120, 3, 4096);
+        defer p.destroy();
+        try p.write(0, prefix);
+        try p.write(1, prefix);
+        var bytes: [3900]u8 = undefined;
+        for (0..bytes.len / unit.len) |i| @memcpy(bytes[i * unit.len ..][0..unit.len], unit);
+        const used = bytes.len / unit.len * unit.len;
+        p.put(0, bytes[0..used]);
+        p.put(1, bytes[0..used]);
+        p.ring[0].drain(p.vt[0].sink(), true);
+        p.ring[1].drain(p.vt[1].sink(), true);
+        if (mode != 0) try std.testing.expectEqual(@as(usize, 0), p.ring[1].preparser.test_overwrite_proofs);
+        p.ring[0].drain(p.vt[0].sink(), false);
+        p.ring[1].drain(p.vt[1].sink(), false);
+        try std.testing.expect(p.compare());
+    }
+}
+
+test "progress overwrite retains shrinking tails under pressure" {
+    const unit = "12345678901234567890123456789012345678901234567890123456789012345678901234567890\r1234567890123456789012345678901234567890123456789012345678901234\r";
+    const p = try Pair.create("shrinking progress", 120, 3, 4096);
+    defer p.destroy();
+    var bytes: [3900]u8 = undefined;
+    for (0..bytes.len / unit.len) |i| @memcpy(bytes[i * unit.len ..][0..unit.len], unit);
+    const used = bytes.len / unit.len * unit.len;
+    p.put(0, bytes[0..used]);
+    p.put(1, bytes[0..used]);
+    p.ring[0].drain(p.vt[0].sink(), true);
+    p.ring[1].drain(p.vt[1].sink(), true);
+    p.ring[0].drain(p.vt[0].sink(), false);
+    p.ring[1].drain(p.vt[1].sink(), false);
+    try std.testing.expect(p.compare());
+}
+
+test "progress overwrite resumes after partial update across ring refills" {
+    const p = try Pair.create("refill progress", 120, 3, 4096);
+    defer p.destroy();
+    const unit = "01234567890123456789012345678901234567890123456789012345678901234567890123456789\r";
+    var bytes: [unit.len * 400]u8 = undefined;
+    for (0..400) |i| @memcpy(bytes[i * unit.len ..][0..unit.len], unit);
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const n = @min(1024, bytes.len - offset);
+        p.put(0, bytes[offset..][0..n]);
+        p.put(1, bytes[offset..][0..n]);
+        offset += n;
+        for (0..2) |i| if (p.ring[i].capacity - (p.ring[i].head - p.ring[i].tail) < p.ring[i].capacity / 4) p.ring[i].drain(p.vt[i].sink(), true);
+    }
+    try std.testing.expect(p.ring[1].preparser.test_overwrite_proofs > 2);
+    p.ring[0].drain(p.vt[0].sink(), false);
+    p.ring[1].drain(p.vt[1].sink(), false);
+    try std.testing.expect(p.compare());
+    try std.testing.expectEqual(p.vt[0].last_cp, p.vt[1].last_cp);
+}
+
+test "progress overwrite does not assume a CR inside malformed UTF-8 was consumed" {
+    const p = try Pair.create("malformed progress", 120, 3, 4096);
+    defer p.destroy();
+    const unit = "01234567890123456789012345678901234567890123456789012345678901234567890123456789\r";
+    var bytes: [3900]u8 = undefined;
+    bytes[0] = 0xc2;
+    bytes[1] = '\r';
+    for (0..(bytes.len - 2) / unit.len) |i| @memcpy(bytes[2 + i * unit.len ..][0..unit.len], unit);
+    const used = 2 + (bytes.len - 2) / unit.len * unit.len;
+    p.put(0, bytes[0..used]);
+    p.put(1, bytes[0..used]);
+    p.ring[0].drain(p.vt[0].sink(), true);
+    p.ring[1].drain(p.vt[1].sink(), true);
+    try std.testing.expectEqual(@as(usize, 0), p.ring[1].preparser.test_overwrite_proofs);
+    p.ring[0].drain(p.vt[0].sink(), false);
+    p.ring[1].drain(p.vt[1].sink(), false);
+    try std.testing.expect(p.compare());
+}
+
+test "progress proof preserves intervening replies, REP and screen switches under pressure" {
+    const p = try Pair.create("progress observed", 120, 3, 4096);
+    defer p.destroy();
+    const a = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const b = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+    const unit = a ++ "\x1b[6n\r" ++ b ++ "\r";
+    var bytes: [3900]u8 = undefined;
+    for (0..bytes.len / unit.len) |i| @memcpy(bytes[i * unit.len ..][0..unit.len], unit);
+    const used = bytes.len / unit.len * unit.len;
+    try p.write(0, "\x1b[?1049h");
+    try p.write(1, "\x1b[?1049h");
+    p.put(0, bytes[0..used]);
+    p.put(1, bytes[0..used]);
+    p.ring[0].drain(p.vt[0].sink(), true);
+    p.ring[1].drain(p.vt[1].sink(), true);
+    try std.testing.expect(p.ring[1].preparser.test_overwrite_proofs > 0);
+    p.ring[0].drain(p.vt[0].sink(), false);
+    p.ring[1].drain(p.vt[1].sink(), false);
+    try p.write(0, "\x1b[3b\x1b[?1049l\x1b[6n");
+    try p.write(1, "\x1b[3b\x1b[?1049l\x1b[6n");
+    try std.testing.expect(p.compare());
+    try std.testing.expectEqual(p.vt[0].last_cp, p.vt[1].last_cp);
 }

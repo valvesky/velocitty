@@ -28,6 +28,7 @@ const Scheme = @import("scheme.zig");
 const Options = struct {
     quick: bool = false,
     spin: bool = true,
+    profile_obsolete: bool = false,
     mib: u32 = 4,
     ring_kib: u32 = default_ring_cap / 1024,
     burst_kib: u32 = 16,
@@ -50,12 +51,13 @@ const usage =
     \\  --grid COLSxROWS  pipeline/render grid (default 120x40)
     \\  --samples N       render frames / glyph batches per row (10..10000; default 200)
     \\  --font PATH       primary font override (default: application font configuration)
-    \\  --only A,B        sections: ascii unicode grapheme csi-short long-escape
+    \\  --only A,B        sections: ascii progress unicode grapheme csi-short long-escape
     \\                    kitty-image sixel pi drain firehose kitten image glyph render
     \\                    (drain/firehose plus workload names: only those workloads)
     \\  --dump DIR        write each workload (--mib, --only) to DIR/<name>.bin and exit;
     \\                    for timing other terminals with `cat`
     \\  --image PATH      PNG for the image section (default: generated 1920x1080 noise)
+    \\  --profile-obsolete  time drain predicate; requires -Dbench-profile=true
     \\  --no-spin         skip the 500 ms spin-up (for perf stat instruction counts)
     \\  --help
     \\
@@ -81,6 +83,11 @@ fn parseOptions(args: []const [*:0]const u8) !Options {
         const arg = std.mem.span(args[i]);
         const eq = std.mem.indexOfScalar(u8, arg, '=');
         const name = arg[0 .. eq orelse arg.len];
+        if (std.mem.eql(u8, name, "--profile-obsolete")) {
+            if (eq != null) return error.UnexpectedValue;
+            opt.profile_obsolete = true;
+            continue;
+        }
         if (std.mem.eql(u8, name, "--no-spin")) {
             if (eq != null) return error.UnexpectedValue;
             opt.spin = false;
@@ -172,6 +179,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
         std.debug.print("bench: invalid arguments: {s}\n{s}", .{ @errorName(err), usage });
         return err;
     };
+    if (opt.profile_obsolete and !@hasDecl(@import("root"), "obsolescenceSpanSample")) {
+        std.debug.print("bench: --profile-obsolete requires a build with -Dbench-profile=true\n", .{});
+        return error.ProfileNotBuilt;
+    }
+    profile_obsolete = opt.profile_obsolete;
     if (opt.help) {
         std.debug.print("{s}", .{usage});
         return;
@@ -357,6 +369,46 @@ fn nowNs() u64 {
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
+const Preparser = @import("preparser.zig").Preparser;
+var profile_obsolete = false;
+const ObsoleteStats = struct { calls: u64 = 0, cold: u64 = 0, cold_ns: u64 = 0, prefix_samples: u64 = 0, prefix_ns: u64 = 0, warm_samples: u64 = 0, warm_ns: u64 = 0, prefix_proofs: u64 = 0, omitted: u64 = 0 };
+var obsolete_stats: ObsoleteStats = .{};
+/// Benchmark-only hook: the application root has no declaration of this name.
+pub inline fn benchSpanSample(parser: *Preparser, index: usize) bool {
+    if (!profile_obsolete) return parser.isSpanObsoleteImpl(index);
+    return obsolescenceSample(parser, index, null);
+}
+pub inline fn benchPrefixSample(parser: *Preparser, index: usize, query: Preparser.Overwrite) bool {
+    if (!profile_obsolete) return parser.isOverwriteObsoleteImpl(index, query);
+    return obsolescenceSample(parser, index, query);
+}
+fn obsolescenceSample(parser: *Preparser, index: usize, query: ?Preparser.Overwrite) bool {
+    obsolete_stats.calls += 1;
+    const run = parser.runs.items[index];
+    const cold = query == null and !parser.exact and !parser.blind and !parser.visibility_ready and (run.kind == .text or run.role == .lf) and !run.flags.ghost;
+    const sample = cold or query != null or obsolete_stats.calls % 64 == 0;
+    const t0 = if (sample) nowNs() else 0;
+    const result = if (query) |q| parser.isOverwriteObsoleteImpl(index, q) else parser.isSpanObsoleteImpl(index);
+    if (sample) {
+        const elapsed = nowNs() - t0;
+        if (cold) {
+            obsolete_stats.cold += 1;
+            obsolete_stats.cold_ns += elapsed;
+        } else if (query != null) {
+            obsolete_stats.prefix_samples += 1;
+            obsolete_stats.prefix_ns += elapsed;
+        } else {
+            obsolete_stats.warm_samples += 1;
+            obsolete_stats.warm_ns += elapsed;
+        }
+    }
+    if (query) |q| if (result) {
+        obsolete_stats.prefix_proofs += 1;
+        obsolete_stats.omitted += q.cut.*;
+    };
+    return result;
+}
+
 // ---------------------------------------------------------------- workloads
 
 const Workload = struct {
@@ -367,6 +419,7 @@ const Workload = struct {
 
 const workloads = [_]Workload{
     .{ .name = "ascii", .about = "printable lines 10..120 cols, CRLF", .unit = genAscii },
+    .{ .name = "progress", .about = "repeated same-line ASCII progress redraws", .unit = genProgress },
     .{ .name = "unicode", .about = "single-codepoint non-ASCII: Latin/Greek/Cyrillic/box/CJK/Hangul/emoji", .unit = genUnicode },
     .{ .name = "grapheme", .about = "multi-codepoint clusters: combining, ZWJ, flags, skin tones, VS16, Indic, jamo", .unit = genGrapheme },
     .{ .name = "csi-short", .about = "TUI redraw: CUP/EL/CUF + short SGR around 1..8 chars", .unit = genCsiShort },
@@ -414,6 +467,10 @@ fn generate(gpa: std.mem.Allocator, wl: Workload, target: usize) ![]u8 {
     try g.out.ensureTotalCapacity(gpa, target + 64 * 1024);
     while (g.out.items.len < target) : (g.n += 1) try wl.unit(&g);
     return g.out.toOwnedSlice(gpa);
+}
+
+fn genProgress(g: *Gen) !void {
+    try g.put("building: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789\r");
 }
 
 fn genAscii(g: *Gen) !void {
@@ -906,6 +963,7 @@ const TimedSink = struct {
 /// space, drain at a quarter free) from memory. No PTY, no render.
 fn runDrain(log: *Log, env: *Env, wl: Workload, bytes: []const u8) !void {
     const gpa = env.gpa;
+    obsolete_stats = .{};
     var ring = try CircBuffer.create(gpa, ring_cap);
     defer ring.destroy();
     var term = try VtState.init(gpa, env.opt.cols, env.opt.rows, scrollback, ring.storage);
@@ -939,6 +997,7 @@ fn runDrain(log: *Log, env: *Env, wl: Workload, bytes: []const u8) !void {
         @as(f64, @floatFromInt(timed.ns)) / nb,
         @as(f64, @floatFromInt(timed.bytes)) / nb * 100,
     });
+    if (profile_obsolete) try log.print("    isSpanObsolete: calls={d} cold={d} cold-ns={d} prefix-samples={d} prefix-ns={d} warm-samples={d} warm-ns={d} prefix-proofs={d} omitted-prefix-bytes={d} (sampled, includes clock overhead)\n", .{ obsolete_stats.calls, obsolete_stats.cold, obsolete_stats.cold_ns, obsolete_stats.prefix_samples, obsolete_stats.prefix_ns, obsolete_stats.warm_samples, obsolete_stats.warm_ns, obsolete_stats.prefix_proofs, obsolete_stats.omitted });
 }
 
 // ---------------------------------------------------------------- +terminal-stream
@@ -1845,6 +1904,32 @@ test "benchmark options validate and quick defaults respect explicit values" {
     try std.testing.expectError(error.UnknownOption, parseOptions(&.{ "bench", "--typo=1" }));
     try std.testing.expectError(error.MissingValue, parseOptions(&.{ "bench", "--font" }));
     try std.testing.expectError(error.UnexpectedValue, parseOptions(&.{ "bench", "--help=1" }));
+    try std.testing.expect((try parseOptions(&.{ "bench", "--profile-obsolete" })).profile_obsolete);
+    try std.testing.expectError(error.UnexpectedValue, parseOptions(&.{ "bench", "--profile-obsolete=1" }));
+}
+
+test "benchmark obsolescence profile records cold and prefix evaluations" {
+    profile_obsolete = true;
+    obsolete_stats = .{};
+    defer {
+        profile_obsolete = false;
+        obsolete_stats = .{};
+    }
+    var parser = try Preparser.init(std.testing.allocator);
+    defer parser.deinit();
+    const update = "01234567890123456789012345678901234567890123456789012345678901234567890123456789";
+    const bytes = update ++ "\r" ++ update;
+    _ = parser.prepare(bytes, 0, .{ .rows = 3, .alt = false }, false, null);
+    try std.testing.expect(!benchSpanSample(&parser, 0));
+    var cut: usize = 0;
+    try std.testing.expect(benchPrefixSample(&parser, 0, .{ .bytes = bytes, .cut = &cut, .col = 0, .cols = 120 }));
+    for (0..64) |_| _ = benchSpanSample(&parser, 0);
+    try std.testing.expectEqual(@as(u64, 66), obsolete_stats.calls);
+    try std.testing.expectEqual(@as(u64, 1), obsolete_stats.cold);
+    try std.testing.expectEqual(@as(u64, 1), obsolete_stats.prefix_samples);
+    try std.testing.expectEqual(@as(u64, 1), obsolete_stats.warm_samples);
+    try std.testing.expectEqual(@as(u64, 1), obsolete_stats.prefix_proofs);
+    try std.testing.expectEqual(@as(u64, update.len), obsolete_stats.omitted);
 }
 
 test "benchmark percentiles are nearest-rank" {

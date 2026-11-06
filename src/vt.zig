@@ -364,6 +364,21 @@ pub const VtState = struct {
     /// the runs, so a kitty image whose payload is the last string in it can
     /// keep the buffer instead of copying out of it.
     pub fn feedOwned(self: *VtState, runs: []const Run, stream: []const u8, owner: ?*Ring.CircBuffer) usize {
+        if (owner) |o| {
+            if (o.retain_live and runs.len != 0) {
+                const first = runs[0];
+                const last = runs[runs.len - 1];
+                // A cost gate, not a visibility proof: keep short-run batches
+                // on the original loop. All actual omission is proved below.
+                if (!first.flags.stream and !last.flags.stream and
+                    @as(usize, last.off) + last.len - first.off >= runs.len * 64)
+                    return self.feedOwnedImpl(true, runs, stream, owner);
+            }
+        }
+        return self.feedOwnedImpl(false, runs, stream, owner);
+    }
+
+    fn feedOwnedImpl(self: *VtState, comptime overwrite: bool, runs: []const Run, stream: []const u8, owner: ?*Ring.CircBuffer) usize {
         defer self.ghost = false;
         // The drain's scanner parsed every CSI: its k-th result is the k-th
         // CSI run's (`owner.preparser.csis`). Without it, parse here.
@@ -375,12 +390,14 @@ pub const VtState = struct {
         for (runs, 0..) |run, run_index| {
             const src = if (run.flags.stream) stream else self.storage;
             const slice = src[run.off .. run.off + run.len];
-            self.ghost = if (owner) |o| o.preparser.isSpanObsolete(run_index) else run.flags.ghost;
+            self.ghost = if (owner) |o| o.preparser.isSpanObsolete(run_index, null) else run.flags.ghost;
             if (owner) |o| {
                 if (o.retain_live) {
                     if (!self.ghost and (run.kind == .text or run.role == .lf) and
                         (obsolete_prefix or o.canPauseBefore(run))) return run_index;
                     obsolete_prefix = obsolete_prefix or self.ghost;
+                    if (overwrite and !self.ghost and run.kind == .text and slice.len >= 129 and
+                        self.feedOverwrittenText(o, run_index, slice)) continue;
                 }
             }
             // Only text and SGR keep a grapheme cluster open.
@@ -419,6 +436,32 @@ pub const VtState = struct {
         }
         if (parsed) |o| assert(next_csi == o.csis.items.len);
         return runs.len;
+    }
+
+    // Called only for a pressure-mode text run large enough for two updates.
+    noinline fn feedOverwrittenText(self: *VtState, owner: *Ring.CircBuffer, run_index: usize, slice: []const u8) bool {
+        if (self.flags.insert_mode or self.flags.grapheme_shaping or self.ss_active or self.grid().wrap_pending) return false;
+        const set = switch (self.gl) {
+            0 => self.g0,
+            1 => self.g1,
+            2 => self.g2,
+            3 => self.g3,
+        };
+        if (set != .ascii) return false;
+        var cut: usize = 0;
+        var start: usize = 0;
+        var proven = owner.preparser.isSpanObsolete(run_index, .{ .bytes = slice, .cut = &cut, .col = self.grid().cursor.col, .cols = self.cols });
+        if (!proven) if (std.mem.indexOfScalar(u8, slice, '\r')) |cr| {
+            // A malformed UTF-8 sequence may consume a CR as part of decoding.
+            if (SIMD.skipOutRange(slice[0..cr], 0x20, 0x7e) != cr) return false;
+            start = cr + 1;
+            proven = owner.preparser.isSpanObsolete(run_index, .{ .bytes = slice[start..], .cut = &cut, .col = 0, .cols = self.cols });
+        };
+        if (!proven) return false;
+        if (start != 0) self.feedText(slice[0..start]);
+        C0.dispatch(self, '\r');
+        self.feedText(slice[start + cut + 1 ..]);
+        return true;
     }
 
     /// Dead text ending in CR whose wraps cannot move the cursor's row (it
@@ -2284,7 +2327,12 @@ pub const VtState = struct {
             g.cursor.col = c.col;
             g.wrap_pending = false;
         }
-        if (self.kitty.dirty) self.markDirtyAll();
+        // Consume the change: later commands that leave images alone (queries,
+        // chunks of a transfer) must not mark every line dirty again.
+        if (self.kitty.dirty) {
+            self.kitty.dirty = false;
+            self.markDirtyAll();
+        }
     }
 
     pub fn dumpAlloc(self: *const VtState, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
@@ -2819,6 +2867,22 @@ test "sgr underline color on cell" {
     try std.testing.expectEqual(@as(u8, 3), vt.styleOf(c).ul.b);
 }
 
+test "sgr with more than 16 parameters keeps its trailing underline color" {
+    // kitty's long-escape benchmark SGR: 18 parameters, underline color last.
+    var dummy: [1]u8 = .{0};
+    var vt = try VtState.init(std.testing.allocator, 8, 1, 2, &dummy);
+    defer vt.deinit();
+    applyCsi(&vt, "\x1b[38;2;10;20;30;48;2;40;50;60;1;3;4:3;58;2;7;8;9m");
+    vt.printCodepoint('X');
+    const s = vt.styleOf(vt.grid().cellAt(0, 0));
+    try std.testing.expect(s.attrs.bold and s.attrs.italic and s.attrs.underline);
+    try std.testing.expectEqual(@as(u8, 10), s.fg.r);
+    try std.testing.expectEqual(@as(u8, 60), s.bg.b);
+    try std.testing.expect(s.attrs.ul_color);
+    try std.testing.expectEqual(@as(u8, 7), s.ul.r);
+    try std.testing.expectEqual(@as(u8, 8), s.ul.g);
+    try std.testing.expectEqual(@as(u8, 9), s.ul.b);
+}
 
 test "xtsmgraphics color registers" {
     var dummy: [1]u8 = .{0};
@@ -3126,6 +3190,31 @@ test "kitty placement advances the cursor and clears pending text wrap" {
     try std.testing.expect(!vt.grid().wrap_pending);
     vt.printPlain("Z");
     try std.testing.expectEqual(@as(u21, 'Z'), vt.grid().cellAt(2, 7).codepoint);
+}
+
+test "only kitty commands that change images mark every line dirty" {
+    const gpa = std.testing.allocator;
+    var storage: [4096]u8 = undefined;
+    var vt = try VtState.init(gpa, 8, 8, 20, &storage);
+    defer vt.deinit();
+    vt.cell_px_w = 4;
+    vt.cell_px_h = 4;
+    const any = struct {
+        fn go(t: *const VtState) bool {
+            for (0..t.rows) |r| if (t.lineDirty(@intCast(r))) return true;
+            return false;
+        }
+    }.go;
+    vt.feedKitty("\x1b_Ga=T,f=32,s=1,v=1,i=8,q=2;/wAA/w==\x1b\\", true, null);
+    try std.testing.expect(vt.lineDirty(0) and vt.lineDirty(7));
+    vt.clearDirty();
+    // A query and a no-op delete after the change leave lines clean.
+    vt.feedKitty("\x1b_Ga=q,t=d,i=31,q=2;AAAA\x1b\\", true, null);
+    vt.feedKitty("\x1b_Ga=d,d=i,i=99,q=2;\x1b\\", true, null);
+    try std.testing.expect(!any(&vt));
+    // Deleting the image is a change again.
+    vt.feedKitty("\x1b_Ga=d,d=I,i=8,q=2;\x1b\\", true, null);
+    try std.testing.expect(vt.lineDirty(0) and vt.lineDirty(7));
 }
 
 test "image cursor insertion point survives reflow through blank cells" {

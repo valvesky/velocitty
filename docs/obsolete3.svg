@@ -1,0 +1,427 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1220" height="580" viewBox="0 0 1220 580" role="img" aria-labelledby="title desc">
+  <title id="title">Proving a CR redraw prefix obsolete with isSpanObsolete</title>
+  <desc id="desc">One prepared text run holds three same-row progress redraws starting at column 1 of a 32-column, 8-row terminal: "copy 12% [#    ]", CR, "copy 57% [###  ]", CR, "copy 100% [#####]". A forward scan proves each update is printable ASCII, does not wrap and covers the previous one (16 ≤ 16 ≤ 17 &lt; 32), so isSpanObsolete(index, overwrite) returns true with cut 33, the final CR. The first 33 bytes are ghosted and never executed. The VT executes the retained CR and prints the replacement cell by cell, reaching the same cells, cursor and last character after running 18 of 51 bytes. The example is shortened for legibility; the implementation only attempts the proof for updates of at least 64 bytes.</desc>
+  <defs><clipPath id="grid-clip"><rect x="88" y="370" width="704" height="192"/></clipPath></defs>
+  <style>
+  :root {color-scheme:dark}
+  text {font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}
+  .section{fill:#d79921;font-size:15px;font-weight:700;letter-spacing:.5px}
+  .copy{fill:#ebdbb2}.muted{fill:#a89984}
+  .card-label{fill:#ebdbb2;font-size:15px;font-weight:700}
+  .card-body{fill:#ebdbb2;font-size:17px;font-weight:600;white-space:pre}
+  .card-bytes{fill:#a89984;font-size:13px}
+  .look-highlight{fill:none;stroke:#83a598;stroke-width:3;filter:drop-shadow(0 0 3px #458588);opacity:0}
+  .parse-highlight{fill:none;stroke:#d79921;stroke-width:2.5;filter:drop-shadow(0 0 3px #d79921);opacity:0}
+  .caption{opacity:0}
+  .caption-label{font-size:15px;font-weight:700;letter-spacing:.3px}
+  .caption-copy{fill:#ebdbb2;font-size:17px;font-weight:500;white-space:pre}
+  .scan-section{opacity:0;animation:scan-section 20s linear infinite}
+  @keyframes scan-section{0%,11%{opacity:0}12%,38%{opacity:1}40%,100%{opacity:0}}
+  .terminal-stage{opacity:.48;animation:terminal-enter 20s linear infinite}
+  @keyframes terminal-enter{0%,39%{opacity:.48}40%,98%{opacity:1}100%{opacity:.48}}
+  .vt-grid-line{stroke:#665c54;stroke-opacity:.43;stroke-width:.75;shape-rendering:crispEdges}
+  .vt-caret{fill:#ebdbb2;fill-opacity:.70;stroke:#ebdbb2;stroke-width:.7;animation:vt-caret 20s steps(1,end) infinite}
+  .vt-glyph{fill:#83a598;font-size:17px;font-weight:600}
+  .prior-text{fill:#bdae93;font-size:14px;opacity:.77}
+  .state-text{fill:#ebdbb2;font-size:14px;white-space:pre}
+  .state-teal{fill:#83a598;font-size:14px}
+  .state-amber{fill:#d79921;font-size:14px}
+  .look-0{opacity:0;animation:look-0 20s linear infinite}
+  @keyframes look-0{0%,11.97%{opacity:0} 12%,15.97%{opacity:1} 16%,100%{opacity:0}}
+  .look-1{opacity:0;animation:look-1 20s linear infinite}
+  @keyframes look-1{0%,15.97%{opacity:0} 16%,18.47%{opacity:1} 18.5%,100%{opacity:0}}
+  .look-2{opacity:0;animation:look-2 20s linear infinite}
+  @keyframes look-2{0%,18.47%{opacity:0} 18.5%,22.47%{opacity:1} 22.5%,100%{opacity:0}}
+  .look-3{opacity:0;animation:look-3 20s linear infinite}
+  @keyframes look-3{0%,22.47%{opacity:0} 22.5%,24.97%{opacity:1} 25%,100%{opacity:0}}
+  .look-4{opacity:0;animation:look-4 20s linear infinite}
+  @keyframes look-4{0%,24.97%{opacity:0} 25%,27.97%{opacity:1} 28%,100%{opacity:0}}
+  .parse-3{opacity:0;animation:parse-3 20s linear infinite}
+  @keyframes parse-3{0%,45.97%{opacity:0} 46%,51.97%{opacity:1} 52%,100%{opacity:0}}
+  .parse-4{opacity:0;animation:parse-4 20s linear infinite}
+  @keyframes parse-4{0%,51.97%{opacity:0} 52%,82.97%{opacity:1} 83%,100%{opacity:0}}
+  .caption-0{animation:caption-0 20s ease-in-out infinite}
+  @keyframes caption-0{0%,0%{opacity:0;transform:translateY(3px)} 0.6%,11.4%{opacity:1;transform:translateY(0)} 12%,100%{opacity:0;transform:translateY(-3px)}}
+  .caption-1{animation:caption-1 20s ease-in-out infinite}
+  @keyframes caption-1{0%,11.65%{opacity:0;transform:translateY(3px)} 12.6%,27.4%{opacity:1;transform:translateY(0)} 28%,100%{opacity:0;transform:translateY(-3px)}}
+  .caption-2{animation:caption-2 20s ease-in-out infinite}
+  @keyframes caption-2{0%,27.65%{opacity:0;transform:translateY(3px)} 28.6%,39.4%{opacity:1;transform:translateY(0)} 40%,100%{opacity:0;transform:translateY(-3px)}}
+  .caption-3{animation:caption-3 20s ease-in-out infinite}
+  @keyframes caption-3{0%,39.65%{opacity:0;transform:translateY(3px)} 40.6%,45.4%{opacity:1;transform:translateY(0)} 46%,100%{opacity:0;transform:translateY(-3px)}}
+  .caption-4{animation:caption-4 20s ease-in-out infinite}
+  @keyframes caption-4{0%,45.65%{opacity:0;transform:translateY(3px)} 46.6%,51.4%{opacity:1;transform:translateY(0)} 52%,100%{opacity:0;transform:translateY(-3px)}}
+  .caption-5{animation:caption-5 20s ease-in-out infinite}
+  @keyframes caption-5{0%,51.65%{opacity:0;transform:translateY(3px)} 52.6%,82.4%{opacity:1;transform:translateY(0)} 83%,100%{opacity:0;transform:translateY(-3px)}}
+  .caption-6{animation:caption-6 20s ease-in-out infinite}
+  @keyframes caption-6{0%,82.65%{opacity:0;transform:translateY(3px)} 83.6%,98.4%{opacity:1;transform:translateY(0)} 99%,100%{opacity:0;transform:translateY(-3px)}}
+  .ghost{opacity:0;animation:ghost 20s linear infinite}
+  @keyframes ghost{0%,27.97%{opacity:0} 28%,97.97%{opacity:1} 98%,100%{opacity:0}}
+  .cut-pending{opacity:0;animation:cut-pending 20s linear infinite}
+  @keyframes cut-pending{0%,27.97%{opacity:1} 28%,100%{opacity:0}}
+  .cut-done{opacity:0;animation:cut-done 20s linear infinite}
+  @keyframes cut-done{0%,27.97%{opacity:0} 28%,99.95%{opacity:1} 99.98%,100%{opacity:0}}
+  .col-0{opacity:0;animation:col-0 20s linear infinite}
+  @keyframes col-0{0%,51.97%{opacity:1} 52%,100%{opacity:0}}
+  .col-1{opacity:0;animation:col-1 20s linear infinite}
+  @keyframes col-1{0%,51.97%{opacity:0} 52%,53.7347%{opacity:1} 53.7647%,100%{opacity:0}}
+  .col-2{opacity:0;animation:col-2 20s linear infinite}
+  @keyframes col-2{0%,53.7347%{opacity:0} 53.7647%,55.4994%{opacity:1} 55.5294%,100%{opacity:0}}
+  .col-3{opacity:0;animation:col-3 20s linear infinite}
+  @keyframes col-3{0%,55.4994%{opacity:0} 55.5294%,57.2641%{opacity:1} 57.2941%,100%{opacity:0}}
+  .col-4{opacity:0;animation:col-4 20s linear infinite}
+  @keyframes col-4{0%,57.2641%{opacity:0} 57.2941%,59.0288%{opacity:1} 59.0588%,100%{opacity:0}}
+  .col-5{opacity:0;animation:col-5 20s linear infinite}
+  @keyframes col-5{0%,59.0288%{opacity:0} 59.0588%,60.7935%{opacity:1} 60.8235%,100%{opacity:0}}
+  .col-6{opacity:0;animation:col-6 20s linear infinite}
+  @keyframes col-6{0%,60.7935%{opacity:0} 60.8235%,62.5582%{opacity:1} 62.5882%,100%{opacity:0}}
+  .col-7{opacity:0;animation:col-7 20s linear infinite}
+  @keyframes col-7{0%,62.5582%{opacity:0} 62.5882%,64.3229%{opacity:1} 64.3529%,100%{opacity:0}}
+  .col-8{opacity:0;animation:col-8 20s linear infinite}
+  @keyframes col-8{0%,64.3229%{opacity:0} 64.3529%,66.0876%{opacity:1} 66.1176%,100%{opacity:0}}
+  .col-9{opacity:0;animation:col-9 20s linear infinite}
+  @keyframes col-9{0%,66.0876%{opacity:0} 66.1176%,67.8524%{opacity:1} 67.8824%,100%{opacity:0}}
+  .col-10{opacity:0;animation:col-10 20s linear infinite}
+  @keyframes col-10{0%,67.8524%{opacity:0} 67.8824%,69.6171%{opacity:1} 69.6471%,100%{opacity:0}}
+  .col-11{opacity:0;animation:col-11 20s linear infinite}
+  @keyframes col-11{0%,69.6171%{opacity:0} 69.6471%,71.3818%{opacity:1} 71.4118%,100%{opacity:0}}
+  .col-12{opacity:0;animation:col-12 20s linear infinite}
+  @keyframes col-12{0%,71.3818%{opacity:0} 71.4118%,73.1465%{opacity:1} 73.1765%,100%{opacity:0}}
+  .col-13{opacity:0;animation:col-13 20s linear infinite}
+  @keyframes col-13{0%,73.1465%{opacity:0} 73.1765%,74.9112%{opacity:1} 74.9412%,100%{opacity:0}}
+  .col-14{opacity:0;animation:col-14 20s linear infinite}
+  @keyframes col-14{0%,74.9112%{opacity:0} 74.9412%,76.6759%{opacity:1} 76.7059%,100%{opacity:0}}
+  .col-15{opacity:0;animation:col-15 20s linear infinite}
+  @keyframes col-15{0%,76.6759%{opacity:0} 76.7059%,78.4406%{opacity:1} 78.4706%,100%{opacity:0}}
+  .col-16{opacity:0;animation:col-16 20s linear infinite}
+  @keyframes col-16{0%,78.4406%{opacity:0} 78.4706%,80.2053%{opacity:1} 80.2353%,100%{opacity:0}}
+  .col-17{opacity:0;animation:col-17 20s linear infinite}
+  @keyframes col-17{0%,80.2053%{opacity:0} 80.2353%,99.95%{opacity:1} 99.98%,100%{opacity:0}}
+  .last-0{opacity:0;animation:last-0 20s linear infinite}
+  @keyframes last-0{0%,51.97%{opacity:1} 52%,100%{opacity:0}}
+  .last-1{opacity:0;animation:last-1 20s linear infinite}
+  @keyframes last-1{0%,51.97%{opacity:0} 52%,53.7347%{opacity:1} 53.7647%,100%{opacity:0}}
+  .last-2{opacity:0;animation:last-2 20s linear infinite}
+  @keyframes last-2{0%,53.7347%{opacity:0} 53.7647%,55.4994%{opacity:1} 55.5294%,100%{opacity:0}}
+  .last-3{opacity:0;animation:last-3 20s linear infinite}
+  @keyframes last-3{0%,55.4994%{opacity:0} 55.5294%,57.2641%{opacity:1} 57.2941%,100%{opacity:0}}
+  .last-4{opacity:0;animation:last-4 20s linear infinite}
+  @keyframes last-4{0%,57.2641%{opacity:0} 57.2941%,59.0288%{opacity:1} 59.0588%,100%{opacity:0}}
+  .last-5{opacity:0;animation:last-5 20s linear infinite}
+  @keyframes last-5{0%,59.0288%{opacity:0} 59.0588%,60.7935%{opacity:1} 60.8235%,100%{opacity:0}}
+  .last-6{opacity:0;animation:last-6 20s linear infinite}
+  @keyframes last-6{0%,60.7935%{opacity:0} 60.8235%,62.5582%{opacity:1} 62.5882%,100%{opacity:0}}
+  .last-7{opacity:0;animation:last-7 20s linear infinite}
+  @keyframes last-7{0%,62.5582%{opacity:0} 62.5882%,64.3229%{opacity:1} 64.3529%,100%{opacity:0}}
+  .last-8{opacity:0;animation:last-8 20s linear infinite}
+  @keyframes last-8{0%,64.3229%{opacity:0} 64.3529%,66.0876%{opacity:1} 66.1176%,100%{opacity:0}}
+  .last-9{opacity:0;animation:last-9 20s linear infinite}
+  @keyframes last-9{0%,66.0876%{opacity:0} 66.1176%,67.8524%{opacity:1} 67.8824%,100%{opacity:0}}
+  .last-10{opacity:0;animation:last-10 20s linear infinite}
+  @keyframes last-10{0%,67.8524%{opacity:0} 67.8824%,69.6171%{opacity:1} 69.6471%,100%{opacity:0}}
+  .last-11{opacity:0;animation:last-11 20s linear infinite}
+  @keyframes last-11{0%,69.6171%{opacity:0} 69.6471%,71.3818%{opacity:1} 71.4118%,100%{opacity:0}}
+  .last-12{opacity:0;animation:last-12 20s linear infinite}
+  @keyframes last-12{0%,71.3818%{opacity:0} 71.4118%,73.1465%{opacity:1} 73.1765%,100%{opacity:0}}
+  .last-13{opacity:0;animation:last-13 20s linear infinite}
+  @keyframes last-13{0%,73.1465%{opacity:0} 73.1765%,74.9112%{opacity:1} 74.9412%,100%{opacity:0}}
+  .last-14{opacity:0;animation:last-14 20s linear infinite}
+  @keyframes last-14{0%,74.9112%{opacity:0} 74.9412%,76.6759%{opacity:1} 76.7059%,100%{opacity:0}}
+  .last-15{opacity:0;animation:last-15 20s linear infinite}
+  @keyframes last-15{0%,76.6759%{opacity:0} 76.7059%,78.4406%{opacity:1} 78.4706%,100%{opacity:0}}
+  .last-16{opacity:0;animation:last-16 20s linear infinite}
+  @keyframes last-16{0%,78.4406%{opacity:0} 78.4706%,80.2053%{opacity:1} 80.2353%,100%{opacity:0}}
+  .last-17{opacity:0;animation:last-17 20s linear infinite}
+  @keyframes last-17{0%,80.2053%{opacity:0} 80.2353%,99.95%{opacity:1} 99.98%,100%{opacity:0}}
+  .run-0{opacity:0;animation:run-0 20s linear infinite}
+  @keyframes run-0{0%,45.97%{opacity:1} 46%,100%{opacity:0}}
+  .run-1{opacity:0;animation:run-1 20s linear infinite}
+  @keyframes run-1{0%,45.97%{opacity:0} 46%,51.97%{opacity:1} 52%,100%{opacity:0}}
+  .run-2{opacity:0;animation:run-2 20s linear infinite}
+  @keyframes run-2{0%,51.97%{opacity:0} 52%,53.7347%{opacity:1} 53.7647%,100%{opacity:0}}
+  .run-3{opacity:0;animation:run-3 20s linear infinite}
+  @keyframes run-3{0%,53.7347%{opacity:0} 53.7647%,55.4994%{opacity:1} 55.5294%,100%{opacity:0}}
+  .run-4{opacity:0;animation:run-4 20s linear infinite}
+  @keyframes run-4{0%,55.4994%{opacity:0} 55.5294%,57.2641%{opacity:1} 57.2941%,100%{opacity:0}}
+  .run-5{opacity:0;animation:run-5 20s linear infinite}
+  @keyframes run-5{0%,57.2641%{opacity:0} 57.2941%,59.0288%{opacity:1} 59.0588%,100%{opacity:0}}
+  .run-6{opacity:0;animation:run-6 20s linear infinite}
+  @keyframes run-6{0%,59.0288%{opacity:0} 59.0588%,60.7935%{opacity:1} 60.8235%,100%{opacity:0}}
+  .run-7{opacity:0;animation:run-7 20s linear infinite}
+  @keyframes run-7{0%,60.7935%{opacity:0} 60.8235%,62.5582%{opacity:1} 62.5882%,100%{opacity:0}}
+  .run-8{opacity:0;animation:run-8 20s linear infinite}
+  @keyframes run-8{0%,62.5582%{opacity:0} 62.5882%,64.3229%{opacity:1} 64.3529%,100%{opacity:0}}
+  .run-9{opacity:0;animation:run-9 20s linear infinite}
+  @keyframes run-9{0%,64.3229%{opacity:0} 64.3529%,66.0876%{opacity:1} 66.1176%,100%{opacity:0}}
+  .run-10{opacity:0;animation:run-10 20s linear infinite}
+  @keyframes run-10{0%,66.0876%{opacity:0} 66.1176%,67.8524%{opacity:1} 67.8824%,100%{opacity:0}}
+  .run-11{opacity:0;animation:run-11 20s linear infinite}
+  @keyframes run-11{0%,67.8524%{opacity:0} 67.8824%,69.6171%{opacity:1} 69.6471%,100%{opacity:0}}
+  .run-12{opacity:0;animation:run-12 20s linear infinite}
+  @keyframes run-12{0%,69.6171%{opacity:0} 69.6471%,71.3818%{opacity:1} 71.4118%,100%{opacity:0}}
+  .run-13{opacity:0;animation:run-13 20s linear infinite}
+  @keyframes run-13{0%,71.3818%{opacity:0} 71.4118%,73.1465%{opacity:1} 73.1765%,100%{opacity:0}}
+  .run-14{opacity:0;animation:run-14 20s linear infinite}
+  @keyframes run-14{0%,73.1465%{opacity:0} 73.1765%,74.9112%{opacity:1} 74.9412%,100%{opacity:0}}
+  .run-15{opacity:0;animation:run-15 20s linear infinite}
+  @keyframes run-15{0%,74.9112%{opacity:0} 74.9412%,76.6759%{opacity:1} 76.7059%,100%{opacity:0}}
+  .run-16{opacity:0;animation:run-16 20s linear infinite}
+  @keyframes run-16{0%,76.6759%{opacity:0} 76.7059%,78.4406%{opacity:1} 78.4706%,100%{opacity:0}}
+  .run-17{opacity:0;animation:run-17 20s linear infinite}
+  @keyframes run-17{0%,78.4406%{opacity:0} 78.4706%,80.2053%{opacity:1} 80.2353%,100%{opacity:0}}
+  .run-18{opacity:0;animation:run-18 20s linear infinite}
+  @keyframes run-18{0%,80.2053%{opacity:0} 80.2353%,99.95%{opacity:1} 99.98%,100%{opacity:0}}
+  .vt-paint-0{opacity:0;animation:vt-paint-0 20s linear infinite}
+  @keyframes vt-paint-0{0%,51.97%{opacity:0} 52%,99.95%{opacity:1} 99.98%,100%{opacity:0}}
+  .vt-paint-1{opacity:0;animation:vt-paint-1 20s linear infinite}
+  @keyframes vt-paint-1{0%,53.7347%{opacity:0} 53.7647%,99.95%{opacity:1} 99.98%,100%{opacity:0}}
+  .vt-paint-2{opacity:0;animation:vt-paint-2 20s linear infinite}
+  @keyframes vt-paint-2{0%,55.4994%{opacity:0} 55.5294%,99.95%{opacity:1} 99.98%,100%{opacity:0}}
+  .vt-paint-3{opacity:0;animation:vt-paint-3 20s linear infinite}
+  @keyframes vt-paint-3{0%,57.2641%{opacity:0} 57.2941%,99.95%{opacity:1} 99.98%,100%{opacity:0}}
+  .vt-paint-4{opacity:0;animation:vt-paint-4 20s linear infinite}
+  @keyframes vt-paint-4{0%,59.0288%{opacity:0} 59.0588%,99.95%{opacity:1} 99.98%,100%{opacity:0}}
+  .vt-paint-5{opacity:0;animation:vt-paint-5 20s linear infinite}
+  @keyframes vt-paint-5{0%,60.7935%{opacity:0} 60.8235%,99.95%{opacity:1} 99.98%,100%{opacity:0}}
+  .vt-paint-6{opacity:0;animation:vt-paint-6 20s linear infinite}
+  @keyframes vt-paint-6{0%,62.5582%{opacity:0} 62.5882%,99.95%{opacity:1} 99.98%,100%{opacity:0}}
+  .vt-paint-7{opacity:0;animation:vt-paint-7 20s linear infinite}
+  @keyframes vt-paint-7{0%,64.3229%{opacity:0} 64.3529%,99.95%{opacity:1} 99.98%,100%{opacity:0}}
+  .vt-paint-8{opacity:0;animation:vt-paint-8 20s linear infinite}
+  @keyframes vt-paint-8{0%,66.0876%{opacity:0} 66.1176%,99.95%{opacity:1} 99.98%,100%{opacity:0}}
+  .vt-paint-9{opacity:0;animation:vt-paint-9 20s linear infinite}
+  @keyframes vt-paint-9{0%,67.8524%{opacity:0} 67.8824%,99.95%{opacity:1} 99.98%,100%{opacity:0}}
+  .vt-paint-10{opacity:0;animation:vt-paint-10 20s linear infinite}
+  @keyframes vt-paint-10{0%,69.6171%{opacity:0} 69.6471%,99.95%{opacity:1} 99.98%,100%{opacity:0}}
+  .vt-paint-11{opacity:0;animation:vt-paint-11 20s linear infinite}
+  @keyframes vt-paint-11{0%,71.3818%{opacity:0} 71.4118%,99.95%{opacity:1} 99.98%,100%{opacity:0}}
+  .vt-paint-12{opacity:0;animation:vt-paint-12 20s linear infinite}
+  @keyframes vt-paint-12{0%,73.1465%{opacity:0} 73.1765%,99.95%{opacity:1} 99.98%,100%{opacity:0}}
+  .vt-paint-13{opacity:0;animation:vt-paint-13 20s linear infinite}
+  @keyframes vt-paint-13{0%,74.9112%{opacity:0} 74.9412%,99.95%{opacity:1} 99.98%,100%{opacity:0}}
+  .vt-paint-14{opacity:0;animation:vt-paint-14 20s linear infinite}
+  @keyframes vt-paint-14{0%,76.6759%{opacity:0} 76.7059%,99.95%{opacity:1} 99.98%,100%{opacity:0}}
+  .vt-paint-15{opacity:0;animation:vt-paint-15 20s linear infinite}
+  @keyframes vt-paint-15{0%,78.4406%{opacity:0} 78.4706%,99.95%{opacity:1} 99.98%,100%{opacity:0}}
+  .vt-paint-16{opacity:0;animation:vt-paint-16 20s linear infinite}
+  @keyframes vt-paint-16{0%,80.2053%{opacity:0} 80.2353%,99.95%{opacity:1} 99.98%,100%{opacity:0}}
+  @keyframes vt-caret{
+    0%{transform:translateX(0px)}
+    52%{transform:translateX(22px)}
+    53.7647%{transform:translateX(44px)}
+    55.5294%{transform:translateX(66px)}
+    57.2941%{transform:translateX(88px)}
+    59.0588%{transform:translateX(110px)}
+    60.8235%{transform:translateX(132px)}
+    62.5882%{transform:translateX(154px)}
+    64.3529%{transform:translateX(176px)}
+    66.1176%{transform:translateX(198px)}
+    67.8824%{transform:translateX(220px)}
+    69.6471%{transform:translateX(242px)}
+    71.4118%{transform:translateX(264px)}
+    73.1765%{transform:translateX(286px)}
+    74.9412%{transform:translateX(308px)}
+    76.7059%{transform:translateX(330px)}
+    78.4706%{transform:translateX(352px)}
+    80.2353%{transform:translateX(374px)}
+    100%{transform:translateX(374px)}
+  }
+  @media(prefers-reduced-motion:reduce){
+    *{animation:none!important}
+    .caption,.look-highlight,.parse-highlight,.scan-section{opacity:0!important}
+    .caption-6,.terminal-stage,.ghost,.cut-done,.col-17,.last-17,.run-18,.vt-glyph{opacity:1!important;transform:none!important}
+    .cut-pending{opacity:0!important}
+    .vt-caret{transform:translateX(374px)!important}
+  }
+  </style>
+  <g id="run-1" role="group" aria-label="TEXT: copy 12% [#    ]">
+    <rect x="56" y="91" width="208" height="103" rx="3" fill="#458588" fill-opacity=".2" stroke="#458588" stroke-width="1.5"/>
+    <text x="70" y="124" class="card-label">TEXT</text>
+    <text x="70" y="157" class="card-body" xml:space="preserve">copy 12% [#    ]</text>
+    <text x="70" y="182" class="card-bytes">bytes 0–15</text>
+    <rect x="57" y="92" width="206" height="101" rx="3" class="look-highlight look-0"/>
+  </g>
+  <g class="ghost">
+    <rect x="185" y="106" width="67" height="23" rx="2" fill="#282828" stroke="#bdae93" stroke-dasharray="4 3"/>
+    <text x="218.5" y="121.5" text-anchor="middle" font-size="11" font-weight="700" fill="#ebdbb2">GHOST</text>
+    <rect x="59" y="94" width="202" height="97" rx="2" stroke="#bdae93" stroke-width="1.6" stroke-dasharray="6 7" fill="none" opacity=".7"/>
+  </g>
+  <g id="run-2" role="group" aria-label="C0 / CR: CR">
+    <rect x="284" y="91" width="208" height="103" rx="3" fill="#a89984" fill-opacity=".2" stroke="#a89984" stroke-width="1.5"/>
+    <text x="298" y="124" class="card-label">C0 / CR</text>
+    <text x="298" y="157" class="card-body" xml:space="preserve">CR</text>
+    <text x="298" y="182" class="card-bytes">byte 16</text>
+    <rect x="285" y="92" width="206" height="101" rx="3" class="look-highlight look-1"/>
+  </g>
+  <g class="ghost">
+    <rect x="413" y="106" width="67" height="23" rx="2" fill="#282828" stroke="#bdae93" stroke-dasharray="4 3"/>
+    <text x="446.5" y="121.5" text-anchor="middle" font-size="11" font-weight="700" fill="#ebdbb2">GHOST</text>
+    <rect x="287" y="94" width="202" height="97" rx="2" stroke="#bdae93" stroke-width="1.6" stroke-dasharray="6 7" fill="none" opacity=".7"/>
+  </g>
+  <g id="run-3" role="group" aria-label="TEXT: copy 57% [###  ]">
+    <rect x="512" y="91" width="208" height="103" rx="3" fill="#458588" fill-opacity=".2" stroke="#458588" stroke-width="1.5"/>
+    <text x="526" y="124" class="card-label">TEXT</text>
+    <text x="526" y="157" class="card-body" xml:space="preserve">copy 57% [###  ]</text>
+    <text x="526" y="182" class="card-bytes">bytes 17–32</text>
+    <rect x="513" y="92" width="206" height="101" rx="3" class="look-highlight look-2"/>
+  </g>
+  <g class="ghost">
+    <rect x="641" y="106" width="67" height="23" rx="2" fill="#282828" stroke="#bdae93" stroke-dasharray="4 3"/>
+    <text x="674.5" y="121.5" text-anchor="middle" font-size="11" font-weight="700" fill="#ebdbb2">GHOST</text>
+    <rect x="515" y="94" width="202" height="97" rx="2" stroke="#bdae93" stroke-width="1.6" stroke-dasharray="6 7" fill="none" opacity=".7"/>
+  </g>
+  <g id="run-4" role="group" aria-label="C0 / CR: CR">
+    <rect x="740" y="91" width="208" height="103" rx="3" fill="#a89984" fill-opacity=".2" stroke="#a89984" stroke-width="1.5"/>
+    <text x="754" y="124" class="card-label">C0 / CR</text>
+    <text x="754" y="157" class="card-body" xml:space="preserve">CR</text>
+    <text x="754" y="182" class="card-bytes">byte 33 · cut</text>
+    <rect x="742" y="93" width="204" height="99" rx="2" class="parse-highlight parse-3"/>
+    <rect x="741" y="92" width="206" height="101" rx="3" class="look-highlight look-3"/>
+  </g>
+  <g id="run-5" role="group" aria-label="TEXT: copy 100% [#####]">
+    <rect x="968" y="91" width="208" height="103" rx="3" fill="#458588" fill-opacity=".2" stroke="#458588" stroke-width="1.5"/>
+    <text x="982" y="124" class="card-label">TEXT</text>
+    <text x="982" y="157" class="card-body" xml:space="preserve">copy 100% [#####]</text>
+    <text x="982" y="182" class="card-bytes">bytes 34–50</text>
+    <rect x="970" y="93" width="204" height="99" rx="2" class="parse-highlight parse-4"/>
+    <rect x="969" y="92" width="206" height="101" rx="3" class="look-highlight look-4"/>
+  </g>
+  <g class="scan-section"><text x="56" y="229" class="section">FORWARD PROOF →</text><text x="1176" y="229" text-anchor="end" class="section">isSpanObsolete(index, overwrite) · cut = 33</text></g>
+  <g class="caption caption-0"><text x="56" y="307" class="caption-label" fill="#d79921">QUEUED</text><text x="232" y="307" class="caption-copy" xml:space="preserve">Three same-row redraws of a progress line arrive in one text run.</text></g>
+  <g class="caption caption-1"><text x="56" y="307" class="caption-label" fill="#458588">PROVE →</text><text x="232" y="307" class="caption-copy" xml:space="preserve">Scan forward: printable ASCII from column 1, each covers the last, none wraps.</text></g>
+  <g class="caption caption-2"><text x="56" y="307" class="caption-label" fill="#458588">GHOST PREFIX</text><text x="232" y="307" class="caption-copy" xml:space="preserve">16 ≤ 16 ≤ 17 &lt; 32 columns: bytes 0–32 are obsolete. Cut = 33, the final CR.</text></g>
+  <g class="caption caption-3"><text x="56" y="307" class="caption-label" fill="#a89984">SKIP</text><text x="232" y="307" class="caption-copy" xml:space="preserve">Two updates and their CR are never executed. No cells are written.</text></g>
+  <g class="caption caption-4"><text x="56" y="307" class="caption-label" fill="#a89984">C0 / CR</text><text x="232" y="307" class="caption-copy" xml:space="preserve">The retained CR returns to column 1 and closes the prior grapheme.</text></g>
+  <g class="caption caption-5"><text x="56" y="307" class="caption-label" fill="#458588">TEXT</text><text x="232" y="307" class="caption-copy" xml:space="preserve">copy 100% [#####] is printed normally, cell by cell.</text></g>
+  <g class="caption caption-6"><text x="56" y="307" class="caption-label" fill="#d79921">RESULT</text><text x="232" y="307" class="caption-copy" xml:space="preserve">Same cells, cursor and last char as full execution. 18 of 51 bytes run.</text></g>
+  <path d="M56 330 H1176" stroke="#665c54" stroke-width="1.5"/>
+  <g class="terminal-stage">
+    <rect x="88" y="370" width="704" height="192" fill="#171717" stroke="#665c54" stroke-width="1"/>
+    <path class="vt-grid-line" d="M110 370 V562"/>
+    <path class="vt-grid-line" d="M132 370 V562"/>
+    <path class="vt-grid-line" d="M154 370 V562"/>
+    <path class="vt-grid-line" d="M176 370 V562"/>
+    <path class="vt-grid-line" d="M198 370 V562"/>
+    <path class="vt-grid-line" d="M220 370 V562"/>
+    <path class="vt-grid-line" d="M242 370 V562"/>
+    <path class="vt-grid-line" d="M264 370 V562"/>
+    <path class="vt-grid-line" d="M286 370 V562"/>
+    <path class="vt-grid-line" d="M308 370 V562"/>
+    <path class="vt-grid-line" d="M330 370 V562"/>
+    <path class="vt-grid-line" d="M352 370 V562"/>
+    <path class="vt-grid-line" d="M374 370 V562"/>
+    <path class="vt-grid-line" d="M396 370 V562"/>
+    <path class="vt-grid-line" d="M418 370 V562"/>
+    <path class="vt-grid-line" d="M440 370 V562"/>
+    <path class="vt-grid-line" d="M462 370 V562"/>
+    <path class="vt-grid-line" d="M484 370 V562"/>
+    <path class="vt-grid-line" d="M506 370 V562"/>
+    <path class="vt-grid-line" d="M528 370 V562"/>
+    <path class="vt-grid-line" d="M550 370 V562"/>
+    <path class="vt-grid-line" d="M572 370 V562"/>
+    <path class="vt-grid-line" d="M594 370 V562"/>
+    <path class="vt-grid-line" d="M616 370 V562"/>
+    <path class="vt-grid-line" d="M638 370 V562"/>
+    <path class="vt-grid-line" d="M660 370 V562"/>
+    <path class="vt-grid-line" d="M682 370 V562"/>
+    <path class="vt-grid-line" d="M704 370 V562"/>
+    <path class="vt-grid-line" d="M726 370 V562"/>
+    <path class="vt-grid-line" d="M748 370 V562"/>
+    <path class="vt-grid-line" d="M770 370 V562"/>
+    <path class="vt-grid-line" d="M88 394 H792"/>
+    <path class="vt-grid-line" d="M88 418 H792"/>
+    <path class="vt-grid-line" d="M88 442 H792"/>
+    <path class="vt-grid-line" d="M88 466 H792"/>
+    <path class="vt-grid-line" d="M88 490 H792"/>
+    <path class="vt-grid-line" d="M88 514 H792"/>
+    <path class="vt-grid-line" d="M88 538 H792"/>
+    <g clip-path="url(#grid-clip)">
+      <text x="95" y="388" class="prior-text" xml:space="preserve">$ make dist</text>
+      <text x="95" y="412" class="prior-text" xml:space="preserve">packing velocitty-1.3.1</text>
+      <text x="95" y="436" class="prior-text" xml:space="preserve">  bin/velocitty</text>
+      <text x="95" y="460" class="prior-text" xml:space="preserve">  share/ 18 files</text>
+      <text x="95" y="484" class="prior-text" xml:space="preserve">compressing ...</text>
+      <text x="95" y="508" class="prior-text" xml:space="preserve">dist.tar.zst ready</text>
+      <text x="95" y="532" class="prior-text" xml:space="preserve">$ cp dist.tar.zst /mnt/usb</text>
+    </g>
+    <text x="93" y="556" class="vt-glyph vt-paint-0">c</text>
+    <text x="115" y="556" class="vt-glyph vt-paint-1">o</text>
+    <text x="137" y="556" class="vt-glyph vt-paint-2">p</text>
+    <text x="159" y="556" class="vt-glyph vt-paint-3">y</text>
+    <text x="203" y="556" class="vt-glyph vt-paint-5">1</text>
+    <text x="225" y="556" class="vt-glyph vt-paint-6">0</text>
+    <text x="247" y="556" class="vt-glyph vt-paint-7">0</text>
+    <text x="269" y="556" class="vt-glyph vt-paint-8">%</text>
+    <text x="313" y="556" class="vt-glyph vt-paint-10">[</text>
+    <text x="335" y="556" class="vt-glyph vt-paint-11">#</text>
+    <text x="357" y="556" class="vt-glyph vt-paint-12">#</text>
+    <text x="379" y="556" class="vt-glyph vt-paint-13">#</text>
+    <text x="401" y="556" class="vt-glyph vt-paint-14">#</text>
+    <text x="423" y="556" class="vt-glyph vt-paint-15">#</text>
+    <text x="445" y="556" class="vt-glyph vt-paint-16">]</text>
+    <rect class="vt-caret" x="88.5" y="538.5" width="21" height="23" rx="1"/>
+    <rect x="860" y="370" width="316" height="192" rx="3" stroke="#665c54" stroke-width="1.5" fill="none"/>
+    <text x="882" y="400" class="section">VT PARSER STATE</text>
+    <path d="M878 413 H1158" stroke="#665c54" stroke-width="1"/>
+    <text x="882" y="443" class="muted" font-size="14">obsolete prefix</text>
+    <text x="1153" y="443" text-anchor="end" class="state-text cut-pending" xml:space="preserve">unproven</text>
+    <text x="1153" y="443" text-anchor="end" class="state-teal cut-done" xml:space="preserve">bytes 0–32</text>
+    <text x="882" y="475" class="muted" font-size="14">cursor</text>
+    <text x="1153" y="475" text-anchor="end" class="state-text col-0" xml:space="preserve">row 8, col 1</text>
+    <text x="1153" y="475" text-anchor="end" class="state-text col-1" xml:space="preserve">row 8, col 2</text>
+    <text x="1153" y="475" text-anchor="end" class="state-text col-2" xml:space="preserve">row 8, col 3</text>
+    <text x="1153" y="475" text-anchor="end" class="state-text col-3" xml:space="preserve">row 8, col 4</text>
+    <text x="1153" y="475" text-anchor="end" class="state-text col-4" xml:space="preserve">row 8, col 5</text>
+    <text x="1153" y="475" text-anchor="end" class="state-text col-5" xml:space="preserve">row 8, col 6</text>
+    <text x="1153" y="475" text-anchor="end" class="state-text col-6" xml:space="preserve">row 8, col 7</text>
+    <text x="1153" y="475" text-anchor="end" class="state-text col-7" xml:space="preserve">row 8, col 8</text>
+    <text x="1153" y="475" text-anchor="end" class="state-text col-8" xml:space="preserve">row 8, col 9</text>
+    <text x="1153" y="475" text-anchor="end" class="state-text col-9" xml:space="preserve">row 8, col 10</text>
+    <text x="1153" y="475" text-anchor="end" class="state-text col-10" xml:space="preserve">row 8, col 11</text>
+    <text x="1153" y="475" text-anchor="end" class="state-text col-11" xml:space="preserve">row 8, col 12</text>
+    <text x="1153" y="475" text-anchor="end" class="state-text col-12" xml:space="preserve">row 8, col 13</text>
+    <text x="1153" y="475" text-anchor="end" class="state-text col-13" xml:space="preserve">row 8, col 14</text>
+    <text x="1153" y="475" text-anchor="end" class="state-text col-14" xml:space="preserve">row 8, col 15</text>
+    <text x="1153" y="475" text-anchor="end" class="state-text col-15" xml:space="preserve">row 8, col 16</text>
+    <text x="1153" y="475" text-anchor="end" class="state-text col-16" xml:space="preserve">row 8, col 17</text>
+    <text x="1153" y="475" text-anchor="end" class="state-text col-17" xml:space="preserve">row 8, col 18</text>
+    <text x="882" y="507" class="muted" font-size="14">last char</text>
+    <text x="1153" y="507" text-anchor="end" class="state-text last-0" xml:space="preserve">prior</text>
+    <text x="1153" y="507" text-anchor="end" class="state-text last-1" xml:space="preserve">'c'</text>
+    <text x="1153" y="507" text-anchor="end" class="state-text last-2" xml:space="preserve">'o'</text>
+    <text x="1153" y="507" text-anchor="end" class="state-text last-3" xml:space="preserve">'p'</text>
+    <text x="1153" y="507" text-anchor="end" class="state-text last-4" xml:space="preserve">'y'</text>
+    <text x="1153" y="507" text-anchor="end" class="state-text last-5" xml:space="preserve">' '</text>
+    <text x="1153" y="507" text-anchor="end" class="state-text last-6" xml:space="preserve">'1'</text>
+    <text x="1153" y="507" text-anchor="end" class="state-text last-7" xml:space="preserve">'0'</text>
+    <text x="1153" y="507" text-anchor="end" class="state-text last-8" xml:space="preserve">'0'</text>
+    <text x="1153" y="507" text-anchor="end" class="state-text last-9" xml:space="preserve">'%'</text>
+    <text x="1153" y="507" text-anchor="end" class="state-text last-10" xml:space="preserve">' '</text>
+    <text x="1153" y="507" text-anchor="end" class="state-text last-11" xml:space="preserve">'['</text>
+    <text x="1153" y="507" text-anchor="end" class="state-text last-12" xml:space="preserve">'#'</text>
+    <text x="1153" y="507" text-anchor="end" class="state-text last-13" xml:space="preserve">'#'</text>
+    <text x="1153" y="507" text-anchor="end" class="state-text last-14" xml:space="preserve">'#'</text>
+    <text x="1153" y="507" text-anchor="end" class="state-text last-15" xml:space="preserve">'#'</text>
+    <text x="1153" y="507" text-anchor="end" class="state-text last-16" xml:space="preserve">'#'</text>
+    <text x="1153" y="507" text-anchor="end" class="state-text last-17" xml:space="preserve">']'</text>
+    <text x="882" y="539" class="muted" font-size="14">bytes run</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text run-0" xml:space="preserve">00 / 51</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text run-1" xml:space="preserve">01 / 51</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text run-2" xml:space="preserve">02 / 51</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text run-3" xml:space="preserve">03 / 51</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text run-4" xml:space="preserve">04 / 51</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text run-5" xml:space="preserve">05 / 51</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text run-6" xml:space="preserve">06 / 51</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text run-7" xml:space="preserve">07 / 51</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text run-8" xml:space="preserve">08 / 51</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text run-9" xml:space="preserve">09 / 51</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text run-10" xml:space="preserve">10 / 51</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text run-11" xml:space="preserve">11 / 51</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text run-12" xml:space="preserve">12 / 51</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text run-13" xml:space="preserve">13 / 51</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text run-14" xml:space="preserve">14 / 51</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text run-15" xml:space="preserve">15 / 51</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text run-16" xml:space="preserve">16 / 51</text>
+    <text x="1153" y="539" text-anchor="end" class="state-text run-17" xml:space="preserve">17 / 51</text>
+    <text x="1153" y="539" text-anchor="end" class="state-amber run-18" xml:space="preserve">18 / 51</text>
+  </g>
+</svg>

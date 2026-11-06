@@ -102,6 +102,76 @@ pub fn parseInto(src: []const u8, base: Config) error{InvalidToml}!Config {
     return p.run(base);
 }
 
+/// Where and why a parse failed: byte offset into the BOM-stripped source,
+/// 1-based line and column.
+pub const ParseErrorPos = struct {
+    pos: usize = 0,
+    line: u32 = 1,
+    col: u32 = 1,
+};
+
+pub fn parseIntoPos(src: []const u8, base: Config, err: *ParseErrorPos) error{InvalidToml}!Config {
+    var p = Parser{ .src = stripBom(src) };
+    return p.run(base) catch |e| {
+        err.* = errorPos(p.src, p.i);
+        return e;
+    };
+}
+
+fn errorPos(src: []const u8, at: usize) ParseErrorPos {
+    const pos = @min(at, src.len);
+    var line: u32 = 1;
+    var line_start: usize = 0;
+    for (src[0..pos], 0..) |c, i| {
+        if (c == '\n') {
+            line += 1;
+            line_start = i + 1;
+        }
+    }
+    return .{ .pos = pos, .line = line, .col = @intCast(pos - line_start + 1) };
+}
+
+// Startup/reload diagnostics. GUI-subsystem Windows builds and macOS apps
+// launched from Finder have no visible stderr, so messages are also kept in a
+// small bounded buffer that main feeds to the terminal as text.
+var diag_store: [2048]u8 = undefined;
+var diag_len: usize = 0;
+var diag_visible_override: ?bool = null;
+
+fn stderrIsTerminal() bool {
+    if (builtin.os.tag == .windows) {
+        const h = GetStdHandle(@bitCast(@as(i32, -12)));
+        var mode: u32 = 0;
+        return h != null and GetConsoleMode(h, &mode) != 0;
+    }
+    if (!builtin.link_libc) return true;
+    return std.c.isatty(2) != 0;
+}
+
+extern "kernel32" fn GetStdHandle(id: u32) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn GetConsoleMode(h: ?*anyopaque, mode: *u32) callconv(.winapi) i32;
+
+/// Reports to stderr and, when stderr is not a terminal, queues the message
+/// for display inside the window. Dropped when the buffer is full.
+pub fn report(comptime fmt: []const u8, args: anytype) void {
+    if (!builtin.is_test) std.debug.print("velocitty: " ++ fmt ++ "\n", args);
+    if (diag_visible_override orelse stderrIsTerminal()) return;
+    var tmp: [512]u8 = undefined;
+    // Plain text: the queue is fed through `VtState.feedText`, which prints
+    // and runs C0 controls but does not parse escape sequences.
+    const msg = std.fmt.bufPrint(&tmp, "velocitty: " ++ fmt ++ "\r\n", args) catch tmp[0..0];
+    if (diag_len + msg.len > diag_store.len) return;
+    @memcpy(diag_store[diag_len..][0..msg.len], msg);
+    diag_len += msg.len;
+}
+
+/// Returns queued diagnostics (valid until the next `report`) and clears them.
+pub fn takeDiagnostics() []const u8 {
+    const out = diag_store[0..diag_len];
+    diag_len = 0;
+    return out;
+}
+
 pub fn parseScheme(src: []const u8) error{InvalidToml}!Scheme {
     return (try parse(src)).scheme;
 }
@@ -116,7 +186,8 @@ pub fn loadFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ?Config {
 pub fn load(io: std.Io, gpa: std.mem.Allocator) Config {
     var cfg: Config = .{};
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (userConfigPath(&buf)) |path| overlayFile(io, gpa, path, &cfg);
+    var cbufs: ConfigBufs = undefined;
+    if (userConfigPath(io, &cbufs)) |path| overlayFile(io, gpa, path, &cfg);
     overlayFile(io, gpa, "config.toml", &cfg);
     if (omarchyThemePath(&buf, "colors.toml")) |path| overlayFile(io, gpa, path, &cfg);
     if (omarchyThemePath(&buf, "alacritty.toml")) |path| overlayFile(io, gpa, path, &cfg);
@@ -134,10 +205,19 @@ fn fillUnsetFont(io: std.Io, gpa: std.mem.Allocator, buf: []u8, cfg: *Config) vo
     if (cfg.font_size == 0) cfg.font_size = fontSizeFallback(io, omarchyThemePath(buf, "colors.toml"));
 }
 
+/// Point size when none is configured. 8/9 pt is Omarchy's convention and is
+/// tiny on Windows and macOS, which get 12 pt.
+fn defaultFontSize(os: std.Target.Os.Tag, omarchy_theme: bool) f32 {
+    return switch (os) {
+        .windows, .macos => 12,
+        else => if (omarchy_theme) 9 else 8,
+    };
+}
+
 fn fontSizeFallback(io: std.Io, theme_colors: ?[]const u8) f32 {
-    const path = theme_colors orelse return 8;
-    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return 8;
-    return if (st.kind == .file) 9 else 8;
+    const path = theme_colors orelse return defaultFontSize(builtin.os.tag, false);
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return defaultFontSize(builtin.os.tag, false);
+    return defaultFontSize(builtin.os.tag, st.kind == .file);
 }
 
 /// Fingerprint of config/theme/font files. Changes when Omarchy swaps the theme.
@@ -145,7 +225,10 @@ pub fn watchStamp(io: std.Io) u64 {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     var stamp: u64 = 0;
     stamp ^= fileStamp(io, "config.toml");
-    if (userConfigPath(&buf)) |path| stamp = mix(stamp, fileStamp(io, path));
+    var cbufs: ConfigBufs = undefined;
+    for (configCandidates(&cbufs)) |cand| {
+        if (cand) |path| stamp = mix(stamp, fileStamp(io, path));
+    }
     if (omarchyCurrentPath(&buf, "theme.name")) |path| stamp = mix(stamp, fileStamp(io, path));
     if (omarchyThemePath(&buf, "colors.toml")) |path| stamp = mix(stamp, fileStamp(io, path));
     if (omarchyThemePath(&buf, "alacritty.toml")) |path| stamp = mix(stamp, fileStamp(io, path));
@@ -170,8 +253,9 @@ fn fileStamp(io: std.Io, path: []const u8) u64 {
 fn overlayFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8, cfg: *Config) void {
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch return;
     defer gpa.free(bytes);
-    cfg.* = parseInto(bytes, cfg.*) catch {
-        std.debug.print("velocitty: invalid config {s}\n", .{path});
+    var err: ParseErrorPos = .{};
+    cfg.* = parseIntoPos(bytes, cfg.*, &err) catch {
+        report("invalid config {s} line {d} column {d}", .{ path, err.line, err.col });
         return;
     };
 }
@@ -190,18 +274,58 @@ fn xdgConfigPath(buf: []u8, rel: []const u8) ?[]u8 {
     return null;
 }
 
-fn userConfigPath(buf: []u8) ?[]u8 {
-    if (envSpan("XDG_CONFIG_HOME")) |xdg| return std.fmt.bufPrint(buf, "{s}/velocitty/config.toml", .{xdg}) catch null;
-    if (builtin.os.tag == .windows) {
-        if (envSpan("APPDATA")) |dir| return std.fmt.bufPrint(buf, "{s}/velocitty/config.toml", .{dir}) catch null;
-        if (envSpan("USERPROFILE")) |dir| return std.fmt.bufPrint(buf, "{s}/AppData/Roaming/velocitty/config.toml", .{dir}) catch null;
-        return null;
+const config_rel = "velocitty/config.toml";
+const max_candidates = 4;
+const ConfigBufs = [max_candidates][std.fs.max_path_bytes]u8;
+
+/// Config file candidates in priority order: $XDG_CONFIG_HOME, the platform
+/// native location, then ~/.config (Windows: %USERPROFILE%, then %HOME%).
+/// Linux keeps its single XDG-or-~/.config location.
+fn configCandidates(bufs: *ConfigBufs) [max_candidates]?[]const u8 {
+    var out: [max_candidates]?[]const u8 = @splat(null);
+    switch (builtin.os.tag) {
+        .windows => {
+            if (envSpan("XDG_CONFIG_HOME")) |xdg| out[0] = std.fmt.bufPrint(&bufs[0], "{s}/" ++ config_rel, .{xdg}) catch null;
+            if (envSpan("APPDATA")) |dir| {
+                out[1] = std.fmt.bufPrint(&bufs[1], "{s}/" ++ config_rel, .{dir}) catch null;
+            } else if (envSpan("USERPROFILE")) |dir| {
+                out[1] = std.fmt.bufPrint(&bufs[1], "{s}/AppData/Roaming/" ++ config_rel, .{dir}) catch null;
+            }
+            if (envSpan("USERPROFILE")) |dir| out[2] = std.fmt.bufPrint(&bufs[2], "{s}/.config/" ++ config_rel, .{dir}) catch null;
+            if (envSpan("HOME")) |dir| out[3] = std.fmt.bufPrint(&bufs[3], "{s}/.config/" ++ config_rel, .{dir}) catch null;
+        },
+        .macos => {
+            if (envSpan("XDG_CONFIG_HOME")) |xdg| out[0] = std.fmt.bufPrint(&bufs[0], "{s}/" ++ config_rel, .{xdg}) catch null;
+            if (envSpan("HOME")) |dir| {
+                out[1] = std.fmt.bufPrint(&bufs[1], "{s}/Library/Application Support/" ++ config_rel, .{dir}) catch null;
+                out[2] = std.fmt.bufPrint(&bufs[2], "{s}/.config/" ++ config_rel, .{dir}) catch null;
+            }
+        },
+        else => out[0] = xdgConfigPath(&bufs[0], config_rel),
     }
-    if (builtin.os.tag == .macos) {
-        if (envSpan("HOME")) |dir| return std.fmt.bufPrint(buf, "{s}/Library/Application Support/velocitty/config.toml", .{dir}) catch null;
-        return null;
+    return out;
+}
+
+/// First candidate for which `exists` is true; with none present, the first
+/// candidate (the location a new file is expected at).
+fn pickConfigPath(cands: []const ?[]const u8, ctx: anytype, comptime exists: fn (@TypeOf(ctx), []const u8) bool) ?[]const u8 {
+    var first: ?[]const u8 = null;
+    for (cands) |cand| {
+        const path = cand orelse continue;
+        if (first == null) first = path;
+        if (exists(ctx, path)) return path;
     }
-    return xdgConfigPath(buf, "velocitty/config.toml");
+    return first;
+}
+
+fn fileExists(io: std.Io, path: []const u8) bool {
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    return st.kind == .file;
+}
+
+fn userConfigPath(io: std.Io, bufs: *ConfigBufs) ?[]const u8 {
+    const cands = configCandidates(bufs);
+    return pickConfigPath(&cands, io, fileExists);
 }
 
 fn omarchyCurrentPath(buf: []u8, name: []const u8) ?[]u8 {
@@ -864,11 +988,13 @@ test "font size fallback requires an actual Omarchy theme file" {
     const dir_len = try tmp.dir.realPath(io, &path_buf);
     const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/colors.toml", .{path_buf[0..dir_len]});
     defer std.testing.allocator.free(path);
-    try std.testing.expectEqual(@as(f32, 8), fontSizeFallback(io, null));
-    try std.testing.expectEqual(@as(f32, 8), fontSizeFallback(io, path));
+    const none = defaultFontSize(builtin.os.tag, false);
+    const themed = defaultFontSize(builtin.os.tag, true);
+    try std.testing.expectEqual(none, fontSizeFallback(io, null));
+    try std.testing.expectEqual(none, fontSizeFallback(io, path));
     try tmp.dir.writeFile(io, .{ .sub_path = "colors.toml", .data = "foreground = '#ffffff'\n" });
-    try std.testing.expectEqual(@as(f32, 9), fontSizeFallback(io, path));
-    try std.testing.expectEqual(@as(f32, 8), fontSizeFallback(io, path_buf[0..dir_len]));
+    try std.testing.expectEqual(themed, fontSizeFallback(io, path));
+    try std.testing.expectEqual(none, fontSizeFallback(io, path_buf[0..dir_len]));
 }
 
 test "alacritty tables" {
@@ -1134,4 +1260,56 @@ test "invalid" {
     try std.testing.expectError(error.InvalidToml, parse("[general]\nwhitelist = \"true\"\n"));
     const ignored = try parse("foreground = \"#gg0000\"\nmode = \"dark\"\nforeground = 1\n");
     try std.testing.expectEqual(Grid.Color.default_fg, ignored.scheme.fg);
+}
+
+test "parse error position reports line and column" {
+    var err: ParseErrorPos = .{};
+    try std.testing.expectError(error.InvalidToml, parseIntoPos("[font]\nsize = 12\n\nbad line here\n", .{}, &err));
+    try std.testing.expectEqual(@as(u32, 4), err.line);
+    try std.testing.expect(err.col >= 1);
+    try std.testing.expect(err.pos >= 16);
+    _ = try parseIntoPos("[font]\nsize = 12\n", .{}, &err);
+}
+
+test "error position helper" {
+    const e = errorPos("ab\ncd", 4);
+    try std.testing.expectEqual(@as(u32, 2), e.line);
+    try std.testing.expectEqual(@as(u32, 2), e.col);
+    try std.testing.expectEqual(@as(u32, 1), errorPos("x", 99).line);
+}
+
+test "default font size per OS" {
+    try std.testing.expectEqual(@as(f32, 12), defaultFontSize(.windows, false));
+    try std.testing.expectEqual(@as(f32, 12), defaultFontSize(.macos, true));
+    try std.testing.expectEqual(@as(f32, 8), defaultFontSize(.linux, false));
+    try std.testing.expectEqual(@as(f32, 9), defaultFontSize(.linux, true));
+}
+
+test "config path selection order" {
+    const Fake = struct {
+        present: []const []const u8,
+        fn has(self: @This(), path: []const u8) bool {
+            for (self.present) |p| if (std.mem.eql(u8, p, path)) return true;
+            return false;
+        }
+    };
+    const cands = [_]?[]const u8{ "xdg", null, "native", "home" };
+    try std.testing.expectEqualStrings("xdg", pickConfigPath(&cands, Fake{ .present = &.{ "xdg", "native", "home" } }, Fake.has).?);
+    try std.testing.expectEqualStrings("native", pickConfigPath(&cands, Fake{ .present = &.{ "native", "home" } }, Fake.has).?);
+    try std.testing.expectEqualStrings("home", pickConfigPath(&cands, Fake{ .present = &.{"home"} }, Fake.has).?);
+    try std.testing.expectEqualStrings("xdg", pickConfigPath(&cands, Fake{ .present = &.{} }, Fake.has).?);
+    const none = [_]?[]const u8{ null, null };
+    try std.testing.expect(pickConfigPath(&none, Fake{ .present = &.{} }, Fake.has) == null);
+}
+
+test "diagnostics queue is bounded and drained" {
+    diag_visible_override = false;
+    defer diag_visible_override = null;
+    _ = takeDiagnostics();
+    report("invalid config {s} line {d}", .{ "x.toml", 3 });
+    const got = takeDiagnostics();
+    try std.testing.expect(std.mem.indexOf(u8, got, "x.toml line 3") != null);
+    try std.testing.expectEqual(@as(usize, 0), takeDiagnostics().len);
+    for (0..100) |_| report("filler filler filler filler filler filler", .{});
+    try std.testing.expect(takeDiagnostics().len <= diag_store.len);
 }

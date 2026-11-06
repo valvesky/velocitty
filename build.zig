@@ -59,7 +59,7 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     const bench_mod = b.createModule(.{
-        .root_source_file = b.path("src/bench.zig"),
+        .root_source_file = b.path(if (b.option(bool, "bench-profile", "Instrument isSpanObsolete in the benchmark") orelse false) "src/bench-profile.zig" else "src/bench.zig"),
         .target = target,
         .optimize = b.option(std.builtin.OptimizeMode, "bench-optimize", "Bench optimize mode (default ReleaseFast)") orelse .ReleaseFast,
         .link_libc = true,
@@ -232,5 +232,5 @@ fn addStbTrueType(mod: *std.Build.Module, b: *std.Build) void {
     mod.addIncludePath(b.path("lib"));
     const flags: []const []const u8 = &.{ "-std=c99", "-fno-sanitize=undefined" };
     mod.addCSourceFile(.{ .file = b.path("src/type/stb_truetype.c"), .flags = flags });
-    mod.addCSourceFile(.{ .file = b.path("src/stb_image.c"), .flags = flags });
+    mod.addCSourceFile(.{ .file = b.path("src/image.c"), .flags = flags });
 }

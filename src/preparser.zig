@@ -137,6 +137,7 @@ pub const Preparser = struct {
     exact: bool = false,
     rows: u16 = 0,
     visibility_ready: bool = false,
+    test_overwrite_proofs: if (@import("builtin").is_test) usize else void = if (@import("builtin").is_test) 0 else {},
     screens: u2 = 0,
     barriers: u2 = 0,
     scroll_lfs: [2]u32 = .{ 0, 0 },
@@ -169,57 +170,96 @@ pub const Preparser = struct {
         return self.scan(slice, start, view, initial);
     }
 
-    /// One consumption-time predicate, shared by all spans in this batch.
-    /// The reverse proof is lazy and cached, never repeated per text span.
-    pub fn isSpanObsolete(self: *Preparser, index: usize) bool {
+    /// Prefix query for a suffix of the indexed text run. On success `cut`
+    /// points to the CR before the retained replacement. The VT guards modes.
+    pub const Overwrite = struct { bytes: []const u8, cut: *usize, col: u16, cols: u16 };
+
+    /// One consumption-time predicate. A null query uses the lazy, cached
+    /// whole-span proof; an overwrite query proves only its returned prefix.
+    pub inline fn isSpanObsolete(self: *Preparser, index: usize, overwrite: ?Overwrite) bool {
+        if (overwrite) |o| {
+            if (comptime @hasDecl(@import("root"), "obsolescencePrefixSample")) return @import("root").obsolescencePrefixSample(self, index, o);
+            return self.isOverwriteObsoleteImpl(index, o);
+        }
+        if (comptime @hasDecl(@import("root"), "obsolescenceSpanSample")) return @import("root").obsolescenceSpanSample(self, index);
+        return self.isSpanObsoleteImpl(index);
+    }
+
+    pub fn isOverwriteObsoleteImpl(self: *Preparser, index: usize, o: Overwrite) bool {
+        if (self.exact or self.runs.items[index].kind != .text or o.col != 0) return false;
+        // Each update must cover the previous one, fit without wrapping,
+        // and contain only printable ASCII. A final CR is retained until
+        // the next update is present in this same bounded run.
+        var pos: usize = 0;
+        var previous: usize = 0;
+        var cut: usize = 0;
+        while (pos < o.bytes.len) {
+            const n: usize = SIMD.skipOutRange(o.bytes[pos..], 0x20, 0x7e);
+            const available = @as(usize, o.cols) -| (if (pos == 0) o.col else 0);
+            if (n < 64 or n >= available or n < previous) break;
+            if (pos != 0) cut = pos - 1;
+            previous = n;
+            pos += n;
+            if (pos == o.bytes.len or o.bytes[pos] != '\r') break;
+            pos += 1;
+        }
+        if (cut == 0) return false;
+        o.cut.* = cut;
+        if (comptime @import("builtin").is_test) self.test_overwrite_proofs += 1;
+        return true;
+    }
+
+    pub inline fn isSpanObsoleteImpl(self: *Preparser, index: usize) bool {
         const span = self.runs.items[index];
         if (span.kind != .text and span.role != .lf) return false;
         if (self.exact) return false;
         if (span.flags.ghost) return true;
         if (self.blind) return false;
-        if (!self.visibility_ready) {
-            self.visibility_ready = true;
-            const need: u32 = 2 * @as(u32, self.rows) -| 1;
-            // No clear and too few scrolling LFs means no safe cutoff:
-            // CSI-heavy, non-scrolling input takes this O(1) exit.
-            var remaining = self.barriers;
-            inline for (0..2) |k| {
-                if (self.scroll_lfs[k] >= need) remaining |= @as(u2, 1) << k;
-            }
-            remaining &= self.screens;
-            var lfs = [2]u32{ 0, 0 };
-            var i = self.runs.items.len;
-            while (i > 0 and remaining != 0) {
-                i -= 1;
-                const run = self.runs.items[i];
-                const screen = run.flags.screen;
-                const bit = @as(u2, 1) << screen;
-                var kills: u2 = 0;
-                switch (run.role) {
-                    .lf => {
-                        if (!run.flags.scrolls) {
-                            lfs[screen] = 0;
-                        } else {
-                            lfs[screen] += 1;
-                            if (lfs[screen] >= need) kills = bit;
-                        }
-                    },
-                    .motion => lfs[screen] = 0,
-                    .barrier => kills = bit,
-                    .barrier_alt => kills = 0b10,
-                    .barrier_all => kills = 0b11,
-                    else => {},
-                }
-                inline for (0..2) |k| {
-                    const mask = @as(u2, 1) << k;
-                    if (kills & remaining & mask != 0) self.cut[k] = @intCast(i);
-                }
-                remaining &= ~kills;
-                if (run.flags.moves) lfs[screen] = 0;
-                if (run.flags.resets) lfs = .{ 0, 0 };
-            }
-        }
+        if (!self.visibility_ready) self.prepareVisibility();
         return index < self.cut[span.flags.screen];
+    }
+
+    noinline fn prepareVisibility(self: *Preparser) void {
+        self.visibility_ready = true;
+        const need: u32 = 2 * @as(u32, self.rows) -| 1;
+        // No clear and too few scrolling LFs means no safe cutoff:
+        // CSI-heavy, non-scrolling input takes this O(1) exit.
+        var remaining = self.barriers;
+        inline for (0..2) |k| {
+            if (self.scroll_lfs[k] >= need) remaining |= @as(u2, 1) << k;
+        }
+        remaining &= self.screens;
+        var lfs = [2]u32{ 0, 0 };
+        var i = self.runs.items.len;
+        while (i > 0 and remaining != 0) {
+            i -= 1;
+            const run = self.runs.items[i];
+            const screen = run.flags.screen;
+            const bit = @as(u2, 1) << screen;
+            var kills: u2 = 0;
+            switch (run.role) {
+                .lf => {
+                    if (!run.flags.scrolls) {
+                        lfs[screen] = 0;
+                    } else {
+                        lfs[screen] += 1;
+                        if (lfs[screen] >= need) kills = bit;
+                    }
+                },
+                .motion => lfs[screen] = 0,
+                .barrier => kills = bit,
+                .barrier_alt => kills = 0b10,
+                .barrier_all => kills = 0b11,
+                else => {},
+            }
+            inline for (0..2) |k| {
+                const mask = @as(u2, 1) << k;
+                if (kills & remaining & mask != 0) self.cut[k] = @intCast(i);
+            }
+            remaining &= ~kills;
+            if (run.flags.moves) lfs[screen] = 0;
+            if (run.flags.resets) lfs = .{ 0, 0 };
+        }
     }
 
     // ------------------------------------------------------------ scan
@@ -304,7 +344,7 @@ pub const Preparser = struct {
             // CSI: found and parsed in one pass, straight into the drain's
             // arrays (the VT applies this parse).
             if (self.csi_ok and (self.csis.items.len == max_csis or
-                self.csi_params.items.len + Csi.max_params > max_csi_params or
+                self.csi_params.items.len + Csi.param_slots > max_csi_params or
                 self.csi_subs.items.len + Csi.max_subs > max_csi_subs))
                 return .{ .held = @intCast(rest.len), .retry = true };
             const ok = self.reserveCsi();
@@ -348,7 +388,7 @@ pub const Preparser = struct {
     /// cleared: the VT parses the bytes itself) when it cannot grow.
     inline fn reserveCsi(self: *Preparser) bool {
         if (self.csi_ok and self.csis.items.len < self.csis.capacity and
-            self.csi_params.capacity - self.csi_params.items.len >= Csi.max_params and
+            self.csi_params.capacity - self.csi_params.items.len >= Csi.param_slots and
             self.csi_subs.capacity - self.csi_subs.items.len >= Csi.max_subs) return true;
         return self.growCsi();
     }
@@ -356,7 +396,7 @@ pub const Preparser = struct {
     noinline fn growCsi(self: *Preparser) bool {
         if (!self.csi_ok) return false;
         self.reserveBounded(CsiHead, &self.csis, 1, max_csis) catch return self.csiFailed();
-        self.reserveBounded(Csi.Param, &self.csi_params, Csi.max_params, max_csi_params) catch return self.csiFailed();
+        self.reserveBounded(Csi.Param, &self.csi_params, Csi.param_slots, max_csi_params) catch return self.csiFailed();
         self.reserveBounded(u32, &self.csi_subs, Csi.max_subs, max_csi_subs) catch return self.csiFailed();
         return true;
     }
@@ -768,22 +808,22 @@ test "isSpanObsolete is lazy cached and never prunes SGR" {
     const bytes = "a-long-ASCII-run\x1b[31mb\x1b[32mc\x1b[33md\x1b[34me\x1b[35mf\x1b[36mg\x1b[37mh\x1b[0mi\x1b[2JX";
     _ = parser.prepare(bytes, 0, .{ .rows = 4, .alt = false }, false, null);
     try std.testing.expect(!parser.visibility_ready);
-    try std.testing.expect(!parser.isSpanObsolete(1)); // SGR needs no visibility proof.
+    try std.testing.expect(!parser.isSpanObsolete(1, null)); // SGR needs no visibility proof.
     try std.testing.expect(!parser.visibility_ready);
     try std.testing.expectEqual(@as(usize, 9), parser.csis.items.len);
     var text: usize = 0;
     for (parser.runs.items, 0..) |run, i| {
         try std.testing.expect(!run.flags.ghost); // Framing did not consume or mark text.
         if (run.kind == .text) {
-            try std.testing.expectEqual(text < 9, parser.isSpanObsolete(i));
+            try std.testing.expectEqual(text < 9, parser.isSpanObsolete(i, null));
             text += 1;
         } else {
-            try std.testing.expect(!parser.isSpanObsolete(i));
+            try std.testing.expect(!parser.isSpanObsolete(i, null));
         }
     }
     try std.testing.expect(parser.visibility_ready);
     const cut = parser.cut;
-    for (0..100) |_| try std.testing.expect(parser.isSpanObsolete(0));
+    for (0..100) |_| try std.testing.expect(parser.isSpanObsolete(0, null));
     try std.testing.expectEqualSlices(u32, &cut, &parser.cut);
     try std.testing.expectEqual(@as(u8, 'J'), parser.csiAt(8).final);
 }
@@ -794,22 +834,22 @@ test "exact mode bypasses obsolescence and a new batch resets its cache" {
     const view: View = .{ .rows = 4, .alt = false };
     _ = parser.prepare("old\x1b[2Jnew", 0, view, true, null);
     parser.runs.items[0].flags.ghost = true; // Exact mode must override old tags too.
-    for (parser.runs.items, 0..) |_, i| try std.testing.expect(!parser.isSpanObsolete(i));
+    for (parser.runs.items, 0..) |_, i| try std.testing.expect(!parser.isSpanObsolete(i, null));
     try std.testing.expect(!parser.visibility_ready);
     _ = parser.prepare("old\x1b[2Jnew", 0, view, false, null);
-    try std.testing.expect(parser.isSpanObsolete(0));
+    try std.testing.expect(parser.isSpanObsolete(0, null));
     try std.testing.expect(parser.visibility_ready);
     _ = parser.prepare("fresh", 0, view, false, null);
     try std.testing.expect(!parser.visibility_ready);
     try std.testing.expectEqualSlices(u32, &.{ 0, 0 }, &parser.cut);
-    try std.testing.expect(!parser.isSpanObsolete(0));
+    try std.testing.expect(!parser.isSpanObsolete(0, null));
 }
 
 test "size and SGR pressure never prove visible text obsolete" {
     var parser = try Preparser.init(std.testing.allocator);
     defer parser.deinit();
     _ = parser.prepare("A\x1b[31mB\x1b[32mC", 0, .{ .rows = 4, .alt = false }, false, null);
-    for (parser.runs.items, 0..) |_, i| try std.testing.expect(!parser.isSpanObsolete(i));
+    for (parser.runs.items, 0..) |_, i| try std.testing.expect(!parser.isSpanObsolete(i, null));
 }
 
 test "rectangle copies restart the scrolling visibility proof" {
@@ -817,10 +857,10 @@ test "rectangle copies restart the scrolling visibility proof" {
     defer parser.deinit();
     const bytes = "A\n\x1b[1;1;1;1;1;2;1;1$v\n\x1b[1;1;1;1;1;2;1;1$v\n";
     _ = parser.prepare(bytes, 0, .{ .rows = 2, .alt = false }, false, null);
-    for (parser.runs.items, 0..) |_, i| try std.testing.expect(!parser.isSpanObsolete(i));
+    for (parser.runs.items, 0..) |_, i| try std.testing.expect(!parser.isSpanObsolete(i, null));
     // A later complete clear still proves all earlier cells dead.
     _ = parser.prepare(bytes ++ "\x1b[2J", 0, .{ .rows = 2, .alt = false }, false, null);
-    try std.testing.expect(parser.isSpanObsolete(0));
+    try std.testing.expect(parser.isSpanObsolete(0, null));
 }
 
 test "obsolete spans distinguish screens and keep XTRESTORE conservative" {
@@ -828,16 +868,16 @@ test "obsolete spans distinguish screens and keep XTRESTORE conservative" {
     defer parser.deinit();
     const view: View = .{ .rows = 4, .alt = false };
     _ = parser.prepare("A\x1b[?1049hB", 0, view, false, null);
-    try std.testing.expect(!parser.isSpanObsolete(0));
+    try std.testing.expect(!parser.isSpanObsolete(0, null));
     try std.testing.expectEqual(@as(u32, 0), parser.cut[0]);
     try std.testing.expectEqual(@as(u32, 1), parser.cut[1]);
     _ = parser.prepare("A\x1b[?1049hB\x1bcC", 0, view, false, null);
-    try std.testing.expect(parser.isSpanObsolete(0));
-    try std.testing.expect(parser.isSpanObsolete(2));
-    try std.testing.expect(!parser.isSpanObsolete(4));
+    try std.testing.expect(parser.isSpanObsolete(0, null));
+    try std.testing.expect(parser.isSpanObsolete(2, null));
+    try std.testing.expect(!parser.isSpanObsolete(4, null));
     _ = parser.prepare("A\x1b[2JB\x1b[?1r", 0, view, false, null);
     try std.testing.expect(parser.blind);
-    try std.testing.expect(!parser.isSpanObsolete(0));
+    try std.testing.expect(!parser.isSpanObsolete(0, null));
     try std.testing.expectEqualSlices(u32, &.{ 0, 0 }, &parser.cut);
 }
 
@@ -936,4 +976,23 @@ test "metadata is bounded and reused without allocation after warmup" {
             if (pass == 1) try std.testing.expectEqual(allocations, failing.alloc_index);
         }
     }
+}
+
+test "overwrite prefix proof checks position, coverage, exact and run boundary" {
+    var p = try Preparser.init(std.testing.allocator);
+    defer p.deinit();
+    const old = "12345678901234567890123456789012345678901234567890123456789012345678901234567890";
+    const shorter = "1234567890123456789012345678901234567890123456789012345678901234";
+    const full = old ++ "\r" ++ old;
+    var cut: usize = 0;
+    _ = p.prepare(full, 0, .{ .rows = 3, .alt = false }, false, null);
+    try std.testing.expect(p.isSpanObsolete(0, .{ .bytes = full, .cut = &cut, .col = 0, .cols = 120 }));
+    try std.testing.expectEqual(old.len, cut);
+    try std.testing.expect(!p.isSpanObsolete(0, .{ .bytes = full, .cut = &cut, .col = 10, .cols = 120 }));
+    try std.testing.expect(!p.isSpanObsolete(0, .{ .bytes = full, .cut = &cut, .col = 0, .cols = 80 }));
+    const shrinking = old ++ "\r" ++ shorter;
+    _ = p.prepare(shrinking, 0, .{ .rows = 3, .alt = false }, false, null);
+    try std.testing.expect(!p.isSpanObsolete(0, .{ .bytes = shrinking, .cut = &cut, .col = 0, .cols = 120 }));
+    _ = p.prepare(full, 0, .{ .rows = 3, .alt = false }, true, null);
+    try std.testing.expect(!p.isSpanObsolete(0, .{ .bytes = full, .cut = &cut, .col = 0, .cols = 120 }));
 }

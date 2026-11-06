@@ -11,21 +11,21 @@
 - Input pipeline: `circbuffer.zig` (owns `preparser.zig` run preparation) → `vt.zig` → `draw.zig` → Peak present.
 - `grid.zig`: cells, interned styles, scrollback, and reflow.
 - `c0.zig`, `esc.zig`, `csi.zig`, `osc.zig`, `dcs.zig`: protocol dispatch; `csiparse.zig`: shared CSI parser.
-- `kitty.zig`, `sixel.zig`: image storage and graphics protocols.
+- `kitty.zig`, `sixel.zig`: image storage and graphics protocols; `image.c`: PNG/JPEG/GIF decoding via vendored wuffs (`lib/wuffs-v0.4.c`). The app decodes visible images on worker threads (`Store.async_decode`); tests and benchmarks decode synchronously.
 - `type.zig`, `type/`, `simd.zig`: fonts, rasterization, and SIMD utilities.
 - `scheme.zig`: theme/config loading; `key.zig` and `select.zig`: key encoding and selection.
 - Desktop metadata, Windows resources, and all icon formats live in `assets/`; the manual Unicode rendering fixture is `tests/fixtures/unicode.txt`.
 - `assets/icon.svg` is the canonical icon. Regenerate other formats with `python3 scripts/branding.py --icon-only` (omit the flag only when intentionally updating the wordmark/GIF).
-- `docs/index.html` and `docs/design-1.3.html` share `docs/style.css`.
-- Whenever updating the vs-Ghostty benchmark or its chart, regenerate the chart and refresh `docs/velocitty-vs-ghostty.png`, the image referenced by `docs/design-1.3.html`.
+- Documentation pages, including `docs/index.html`, `docs/design-1.3.html`, and `docs/design-1.3.1.html`, share `docs/style.css`.
+- Whenever updating the vs-Ghostty benchmark or its chart, regenerate the chart and refresh `docs/velocitty-vs-ghostty.png`. Keep `docs/design-1.3.html` pinned to its archived `docs/velocitty-vs-ghostty-1.3.png`; the new progress-proof gains are recorded separately in `docs/design-1.3.1.html`.
 
 ## Common checks
 - `zig build check`: compile portable tests; `zig build test`: run them and native Peak checks.
 - `python3 tests/package_test.py`: package layout checks.
 - Linux inline checks (musl avoids host GNU CRT `.sframe` issues):
   ```sh
-  zig test src/main.zig src/type/stb_truetype.c src/stb_image.c -Ilib -lc -target x86_64-linux-musl
-  zig test src/firehose_test.zig src/stb_image.c -Ilib -lc -target x86_64-linux-musl
+  zig test src/main.zig src/type/stb_truetype.c src/image.c src/platform/font.c -Ilib -lc -target x86_64-linux-musl
+  zig test src/firehose_test.zig src/image.c -Ilib -lc -target x86_64-linux-musl
   ```
 - Select targeted checks from the testing reference. Rendering regressions live inline in `src/draw.zig`; there is no standalone golden/render harness.
 - Report checks actually run, observed outcomes, and skips; do not copy historical pass counts.

@@ -104,7 +104,7 @@ const ascii_n = ascii_hi - ascii_lo + 1;
 const Resolved = struct { id: FontId, gid: u16 };
 const memo_n = 4096;
 const MemoEntry = struct { key: u32, id: FontId, gid: u16 };
-const memo_empty: MemoEntry = .{ .key = std.math.maxInt(u32), .id = @enumFromInt(0), .gid = 0 };
+const memo_empty: MemoEntry = .{ .key = std.math.maxInt(u32), .id = @fromBackingInt(@intCast(0)), .gid = 0 };
 
 pub const Face = struct {
     id: FontId,
@@ -204,10 +204,13 @@ pub const Context = struct {
     /// `bytes` must outlive this context. The first added face becomes primary.
     pub fn addFont(self: *Context, bytes: []const u8, options: FaceOptions) Error!FontId {
         const font = try TrueType.Font.openIndex(bytes, options.index);
-        const id: FontId = @enumFromInt(@as(u32, @intCast(self.faces.items.len)));
+        const id: FontId = @fromBackingInt(@intCast(@as(u32, @intCast(self.faces.items.len))));
         var opened = font;
-        if (!self.options.color_emoji) opened.color = null;
-        if (!opened.outline and opened.color == null) return error.InvalidFont;
+        if (!self.options.color_emoji) {
+            opened.color = null;
+            opened.sbix = null;
+        }
+        if (!opened.outline and opened.color == null and opened.sbix == null) return error.InvalidFont;
         try self.faces.append(self.allocator, .{
             .id = id,
             .font = opened,
@@ -298,14 +301,14 @@ pub const Context = struct {
     }
 
     pub fn select(self: *Context, id: FontId) void {
-        assert(@intFromEnum(id) < self.faces.items.len);
+        assert(@backingInt(id) < self.faces.items.len);
         self.primary = id;
         self.clearMemo();
     }
 
     pub fn setFallbacks(self: *Context, ids: []const FontId) Error!void {
         for (ids) |id| {
-            assert(@intFromEnum(id) < self.faces.items.len);
+            assert(@backingInt(id) < self.faces.items.len);
         }
         self.clearMemo();
         self.fallbacks.clearRetainingCapacity();
@@ -357,7 +360,7 @@ pub const Context = struct {
     pub fn metrics(self: *const Context, size_px: f32) Error!TrueType.Metrics {
         assert(size_px > 0);
         const id = self.primary orelse return error.InvalidFont;
-        return self.faces.items[@intFromEnum(id)].font.metrics(size_px);
+        return self.faces.items[@backingInt(id)].font.metrics(size_px);
     }
 
     /// Hot-path lookup. No stats, no raster; hits refresh LRU.
@@ -376,7 +379,7 @@ pub const Context = struct {
         if (!styled and codepoint == 0xFFFD) return self.replacement;
         const resolved = self.resolveMemo(codepoint, style) catch return null;
         const key: GlyphKey = .{
-            .font_id = @intFromEnum(resolved.id),
+            .font_id = @backingInt(resolved.id),
             .glyph_id = resolved.gid,
             .size_px = size_u,
             .flags = styleFlags(style),
@@ -428,7 +431,7 @@ pub const Context = struct {
         }
         const resolved = try self.resolveMemo(codepoint, style);
         const key: GlyphKey = .{
-            .font_id = @intFromEnum(resolved.id),
+            .font_id = @backingInt(resolved.id),
             .glyph_id = resolved.gid,
             .size_px = size_u,
             .flags = styleFlags(style),
@@ -450,7 +453,7 @@ pub const Context = struct {
     fn rasterizeAt(self: *Context, id: FontId, gid: u16, size_u: u16) Error!Glyph {
         self.stats.misses += 1;
         const size: f32 = @floatFromInt(size_u);
-        const face = self.faces.items[@intFromEnum(id)];
+        const face = self.faces.items[@backingInt(id)];
         const t0 = nowNs();
         const bmp = try face.font.rasterize(self.allocator, gid, size);
         defer self.allocator.free(bmp.pixels);
@@ -502,7 +505,7 @@ pub const Context = struct {
     }
 
     fn drawableGlyph(self: *const Context, id: FontId, codepoint: u21) Error!?u16 {
-        const face = self.faces.items[@intFromEnum(id)];
+        const face = self.faces.items[@backingInt(id)];
         const g = (try face.font.glyphIndex(codepoint)) orelse return null;
         if (g == 0) return null;
         const space = codepoint == 0x20 or codepoint == 0xA0 or
@@ -806,8 +809,8 @@ test "lazy font identity includes the collection member" {
     const second = (try ctx.loadLazyFont(0)).?;
     try std.testing.expect(second != primary);
     try std.testing.expectEqual(@as(usize, 2), ctx.faces.items.len);
-    try std.testing.expectEqual(@as(u16, 1000), (try ctx.faces.items[@intFromEnum(primary)].font.metrics(16)).units_per_em);
-    try std.testing.expectEqual(@as(u16, 2000), (try ctx.faces.items[@intFromEnum(second)].font.metrics(16)).units_per_em);
+    try std.testing.expectEqual(@as(u16, 1000), (try ctx.faces.items[@backingInt(primary)].font.metrics(16)).units_per_em);
+    try std.testing.expectEqual(@as(u16, 2000), (try ctx.faces.items[@backingInt(second)].font.metrics(16)).units_per_em);
     try std.testing.expectEqual(second, (try ctx.loadLazyFont(1)).?);
     try std.testing.expectEqual(@as(usize, 2), ctx.faces.items.len);
     try std.testing.expectEqual(@as(usize, 1), ctx.owned_fonts.items.len);
@@ -826,4 +829,20 @@ test "fontconfig collection loads the selected outline face" {
     try std.testing.expect(selected.outline);
     // This character has locale-specific glyph forms in Noto's CJK collection.
     try std.testing.expect((try first.glyphIndex(0x9AA8)) != (try selected.glyphIndex(0x9AA8)));
+}
+
+test "sbix fonts honor the color option and populate the RGBA glyph cache" {
+    const bytes = @import("type/sbix.zig").testing.font();
+    var ctx = try Context.init(std.testing.allocator, .{ .color_emoji = false });
+    defer ctx.deinit();
+    try std.testing.expectError(error.InvalidFont, ctx.addFont(&bytes, .{}));
+    ctx.options.color_emoji = true;
+    const id = try ctx.addFont(&bytes, .{});
+    const glyph_value = try ctx.glyph(0x1f600, 16);
+    try std.testing.expectEqual(id, glyph_value.font_id);
+    try std.testing.expect(glyph_value.color);
+    try std.testing.expectEqual(@as(u16, 2), glyph_value.width);
+    const at = @as(usize, glyph_value.atlas_y) * ctx.color_atlas.width + glyph_value.atlas_x;
+    try std.testing.expectEqual(@as(u32, 0x80c8140a), ctx.color_atlas.pixels[at]);
+    try std.testing.expect(ctx.peekGlyph(0x1f600, 16).?.color);
 }

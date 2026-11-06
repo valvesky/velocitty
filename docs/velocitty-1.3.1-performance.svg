@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1120" viewBox="0 0 1800 1120" role="img" aria-labelledby="title description" font-family="system-ui, -apple-system, Segoe UI, sans-serif">
+<title id="title">Velocitty 1.3.1: fewer instructions for progress redraws</title>
+<desc id="description">User-mode instructions normalized to the 1.3 baseline. Lower is better. Progress redraws use about 65 percent fewer instructions.</desc>
+<rect width="1800" height="1120" fill="#fcfcfb"/>
+<text x="80" y="100" font-size="54" font-weight="500" fill="#0b0b0b">Less work for progress redraws</text>
+<text x="80" y="151" font-size="28" fill="#52514e">User-mode instructions · 1.3 baseline = 100% · lower is better</text>
+<rect x="80" y="190" width="28" height="23" rx="3" fill="#c3c2b7"/>
+<text x="122" y="210" font-size="24" fill="#52514e">1.3 before</text>
+<rect x="370" y="190" width="28" height="23" rx="3" fill="#15836b"/>
+<text x="412" y="210" font-size="24" fill="#52514e">1.3.1 progress proof</text>
+<text x="1720" y="259" text-anchor="end" font-size="23" fill="#52514e">Change</text>
+<line x1="570.0" y1="275" x2="570.0" y2="940" stroke="#e1e0d9"/>
+<text x="570.0" y="259" text-anchor="middle" font-size="21" fill="#52514e">0%</text>
+<line x1="772.5" y1="275" x2="772.5" y2="940" stroke="#e1e0d9"/>
+<text x="772.5" y="259" text-anchor="middle" font-size="21" fill="#52514e">25%</text>
+<line x1="975.0" y1="275" x2="975.0" y2="940" stroke="#e1e0d9"/>
+<text x="975.0" y="259" text-anchor="middle" font-size="21" fill="#52514e">50%</text>
+<line x1="1177.5" y1="275" x2="1177.5" y2="940" stroke="#e1e0d9"/>
+<text x="1177.5" y="259" text-anchor="middle" font-size="21" fill="#52514e">75%</text>
+<line x1="1380.0" y1="275" x2="1380.0" y2="940" stroke="#e1e0d9"/>
+<text x="1380.0" y="259" text-anchor="middle" font-size="21" fill="#52514e">100%</text>
+<text x="80" y="315" font-size="29" font-weight="600" fill="#0b0b0b">Progress redraws</text>
+<text x="80" y="346" font-size="22" fill="#52514e">106-byte updates</text>
+<text x="80" y="380" font-size="23" fill="#52514e">137.91M → 48.48M</text>
+<rect data-row="0" data-series="before" x="570" y="305" width="810" height="24" rx="3" fill="#c3c2b7"/>
+<rect data-row="0" data-series="after" x="570" y="343" width="284.724" height="24" rx="3" fill="#15836b"/>
+<text x="1394" y="326" font-size="22" fill="#52514e">100%</text>
+<text x="868.724" y="364" font-size="22" fill="#0b0b0b">35.2%</text>
+<text x="1720" y="357" text-anchor="end" font-size="30" font-weight="500" fill="#15836b">-64.8%</text>
+<text x="80" y="445" font-size="29" font-weight="600" fill="#0b0b0b">Short redraws</text>
+<text x="80" y="476" font-size="22" fill="#52514e">26-byte updates</text>
+<text x="80" y="510" font-size="23" fill="#52514e">255.12M → 251.17M</text>
+<rect data-row="1" data-series="before" x="570" y="435" width="810" height="24" rx="3" fill="#c3c2b7"/>
+<rect data-row="1" data-series="after" x="570" y="473" width="797.445" height="24" rx="3" fill="#15836b"/>
+<text x="1394" y="456" font-size="22" fill="#52514e">100%</text>
+<text x="1381.445" y="494" font-size="22" fill="#0b0b0b">98.5%</text>
+<text x="1720" y="487" text-anchor="end" font-size="30" font-weight="500" fill="#15836b">-1.5%</text>
+<text x="80" y="575" font-size="29" font-weight="600" fill="#0b0b0b">Scrolling ASCII</text>
+<text x="80" y="606" font-size="22" fill="#52514e">CRLF lines</text>
+<text x="80" y="640" font-size="23" fill="#52514e">100.58M → 99.27M</text>
+<rect data-row="2" data-series="before" x="570" y="565" width="810" height="24" rx="3" fill="#c3c2b7"/>
+<rect data-row="2" data-series="after" x="570" y="603" width="799.444" height="24" rx="3" fill="#15836b"/>
+<text x="1394" y="586" font-size="22" fill="#52514e">100%</text>
+<text x="1383.444" y="624" font-size="22" fill="#0b0b0b">98.7%</text>
+<text x="1720" y="617" text-anchor="end" font-size="30" font-weight="500" fill="#15836b">-1.3%</text>
+<text x="80" y="705" font-size="29" font-weight="600" fill="#0b0b0b">Unicode</text>
+<text x="80" y="736" font-size="22" fill="#52514e">Mixed scripts and emoji</text>
+<text x="80" y="770" font-size="23" fill="#52514e">298.15M → 296.55M</text>
+<rect data-row="3" data-series="before" x="570" y="695" width="810" height="24" rx="3" fill="#c3c2b7"/>
+<rect data-row="3" data-series="after" x="570" y="733" width="805.648" height="24" rx="3" fill="#15836b"/>
+<text x="1394" y="716" font-size="22" fill="#52514e">100%</text>
+<text x="1389.648" y="754" font-size="22" fill="#0b0b0b">99.5%</text>
+<text x="1720" y="747" text-anchor="end" font-size="30" font-weight="500" fill="#15836b">-0.5%</text>
+<text x="80" y="835" font-size="29" font-weight="600" fill="#0b0b0b">CSI redraws</text>
+<text x="80" y="866" font-size="22" fill="#52514e">Cursor moves and short SGR</text>
+<text x="80" y="900" font-size="23" fill="#52514e">746.36M → 740.90M</text>
+<rect data-row="4" data-series="before" x="570" y="825" width="810" height="24" rx="3" fill="#c3c2b7"/>
+<rect data-row="4" data-series="after" x="570" y="863" width="804.074" height="24" rx="3" fill="#15836b"/>
+<text x="1394" y="846" font-size="22" fill="#52514e">100%</text>
+<text x="1388.074" y="884" font-size="22" fill="#0b0b0b">99.3%</text>
+<text x="1720" y="877" text-anchor="end" font-size="30" font-weight="500" fill="#15836b">-0.7%</text>
+<line x1="80" y1="969" x2="1720" y2="969" stroke="#e1e0d9" stroke-width="2"/>
+<text x="80" y="1011" font-size="23" fill="#52514e">Intel Core i7-10610U · 120×80 cells · 1 MiB ring · median of 3 interleaved runs</text>
+<text x="80" y="1047" font-size="22" fill="#52514e">perf stat instructions:u · +terminal-stream --drop · no rendering or presentation · 2026-11-02</text>
+<text x="80" y="1083" font-size="21" fill="#52514e">Identical input per workload. These are instruction counts, not frame rates or input-latency measurements.</text>
+</svg>

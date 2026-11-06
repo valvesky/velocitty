@@ -97,21 +97,92 @@ static void windows_argv_test(void)
 #endif
 
 #ifdef PEAK_MACOS
+#include <pthread.h>
+#include "peak_macos_input.h"
+#include "peak_macos_present.h"
+
+struct macos_wake_args { int fd; int window_event; };
+
+static void *macos_delayed_wake(void *opaque)
+{
+    struct macos_wake_args *args = opaque;
+    struct timespec delay = {0, 40000000};
+    nanosleep(&delay, NULL);
+    if (args->window_event) {
+        @autoreleasepool {
+            NSEvent *ev = [NSEvent otherEventWithType:NSEventTypeApplicationDefined
+                location:NSZeroPoint modifierFlags:0 timestamp:0 windowNumber:0
+                context:nil subtype:0 data1:12345 data2:0];
+            [peak_macos_app postEvent:ev atStart:YES];
+        }
+    } else {
+        assert(write(args->fd, "x", 1) == 1);
+    }
+    return NULL;
+}
+
+static void macos_wait_test(PeakWindow *win)
+{
+    int fds[2];
+    assert(pipe(fds) == 0);
+    for (int window_event = 0; window_event < 2; window_event++) {
+        struct macos_wake_args args = {fds[1], window_event};
+        pthread_t thread;
+        int woke = 0;
+        NSEvent *ev;
+        while ((ev = [peak_macos_app nextEventMatchingMask:NSEventMaskAny
+            untilDate:[NSDate distantPast] inMode:NSDefaultRunLoopMode dequeue:YES])) {}
+        uint64_t start = peak_get_time();
+        assert(pthread_create(&thread, NULL, macos_delayed_wake, &args) == 0);
+        while (!woke && peak_get_time() - start < 700000000ull) {
+            struct peak_macos_win *w = win->internal.w;
+            w->q.n = 0; w->q.h = 0;
+            peak_wait(win, &fds[0], 1, 1000);
+            if (!window_event) {
+                struct pollfd pfd = {fds[0], POLLIN, 0};
+                woke = poll(&pfd, 1, 0) > 0;
+            } else {
+                while ((ev = [peak_macos_app nextEventMatchingMask:NSEventMaskAny
+                    untilDate:[NSDate distantPast] inMode:NSDefaultRunLoopMode dequeue:YES])) {
+                    if ([ev type] == NSEventTypeApplicationDefined && [ev data1] == 12345) woke = 1;
+                }
+            }
+            if (!window_event) peak_internal_macos_pump(win->internal.w);
+        }
+        uint64_t elapsed = peak_get_time() - start;
+        assert(pthread_join(thread, NULL) == 0);
+        assert(woke && elapsed < 700000000ull);
+        if (!window_event) { char byte; assert(read(fds[0], &byte, 1) == 1); }
+    }
+    close(fds[0]);
+    close(fds[1]);
+}
+
 static void macos_events_test(void)
 {
     assert(peak_init());
+    macos_present_test();
     PeakWindow win = peak_window_open("Velocitty native regression", 320, 160, 0);
     struct peak_macos_win *w = win.internal.w;
     PeakEvent ev;
     assert(w && ![w->window isReleasedWhenClosed]);
     assert([w->view acceptsFirstResponder]);
+    macos_input_test(w);
+    macos_pointer_test(w);
+    assert(peak_window_refresh_rate(&win) <= 500);
+    macos_wait_test(&win);
+    peak_window_present(&win);
+    CGColorSpaceRef color_space = w->color_space;
+    assert(color_space && w->layer.contents);
+    peak_window_present(&win);
+    assert(w->color_space == color_space && w->layer.contents);
     w->q.n = 0; w->q.h = 0;
     [(PeakMacView *)w->view insertText:@"a😀" replacementRange:NSMakeRange(NSNotFound, 0)];
     assert(peak_q_pop(&w->q, &ev) && ev.text.n == 5);
     assert(memcmp(ev.text.bytes, "a\xf0\x9f\x98\x80", 5) == 0);
-    [(PeakMacDelegate *)w->delegate windowDidResignKey:nil];
+    [(PeakMacDelegate *)w->delegate windowDidResignKey:[NSNotification notificationWithName:NSWindowDidResignKeyNotification object:w->window]];
     assert(peak_q_pop(&w->q, &ev) && ev.type == PEAK_EVENT_FOCUS && !ev.focus.on);
-    [(PeakMacDelegate *)w->delegate windowDidBecomeKey:nil];
+    [(PeakMacDelegate *)w->delegate windowDidBecomeKey:[NSNotification notificationWithName:NSWindowDidBecomeKeyNotification object:w->window]];
     assert(peak_q_pop(&w->q, &ev) && ev.type == PEAK_EVENT_FOCUS && ev.focus.on);
     [w->window performClose:nil];
     int closed = 0;
