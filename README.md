@@ -30,6 +30,8 @@
     <a href="#config">Config</a>
     ·
     <a href="#shoutouts">Shoutouts</a>
+    ·
+    <a href="#code-signing-policy">Code signing policy</a>
 </p>
 
 Velocitty is a lightning-fast terminal for Omarchy. 
@@ -111,3 +113,16 @@ Desktop notifications and kitty file/temporary-file image transfers currently us
 - [ghostty](https://ghostty.org) --- Glyph rendering and style caching.
 - [foot](https://codeberg.org/dnkl/foot) --- Profile optimized builds and VT features.
 - [vt](https://github.com/valvesky/vt) --- My previous shot at a terminal.
+
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://signpath.io), certificate by [SignPath Foundation](https://signpath.org).
+
+The sole maintainer is [Vasco Alves](https://github.com/valvesky) (@valvesky). He fills every role. Pull requests are reviewed before merge, and each signing request needs his approval.
+
+- Committers and reviewers: [Vasco Alves](https://github.com/valvesky) ([contributors](https://github.com/valvesky/velocitty/graphs/contributors))
+- Approvers: [Vasco Alves](https://github.com/valvesky)
+
+Only release artifacts built by this repository's GitHub Actions release workflow ([release.yml](.github/workflows/release.yml)) from this repository's source get signed.
+
+This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it.
