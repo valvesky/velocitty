@@ -14,6 +14,43 @@ def gh(*args):
     return subprocess.check_output(["gh", *args], text=True).strip()
 
 
+WINDOWS_UNSIGNED = "packages-windows"
+WINDOWS_SIGNED = "packages-windows-signed"
+OTHER_RELEASE_ARTIFACTS = ("packages-linux", "packages-macos")
+
+
+def windows_artifact_name(root):
+    signed = Path(root) / WINDOWS_SIGNED
+    if signed.is_dir() and any(path.is_file() for path in signed.rglob("*")):
+        return WINDOWS_SIGNED
+    return WINDOWS_UNSIGNED
+
+
+def select_release_files(root, expected):
+    """Choose the files to publish from a `gh run download` directory.
+
+    Windows packages come from packages-windows-signed when that artifact
+    exists, and from packages-windows otherwise. Other artifact directories,
+    including the unsigned PE files uploaded only as SignPath inputs, are ignored.
+    """
+    root = Path(root)
+    chosen = {}
+    for name in (*OTHER_RELEASE_ARTIFACTS, windows_artifact_name(root)):
+        directory = root / name
+        if not directory.is_dir():
+            continue
+        for file in directory.rglob("*"):
+            if not file.is_file():
+                continue
+            if file.name in chosen:
+                raise RuntimeError(f"duplicate package: {file.name}")
+            chosen[file.name] = file
+    actual = set(chosen)
+    if actual != expected:
+        raise RuntimeError(f"release package mismatch: missing={expected - actual}, extra={actual - expected}")
+    return chosen
+
+
 def main():
     version = re.search(r'\.version = "([^"]+)"', Path("build.zig.zon").read_text())[1]
     tag = f"v{version}"
@@ -24,12 +61,6 @@ def main():
         subprocess.run(["gh", "run", "download", os.environ["GITHUB_RUN_ID"], "--repo", repo, "--dir", str(temp)], check=True)
         dist = Path("dist")
         dist.mkdir(exist_ok=True)
-        for file in temp.rglob("*"):
-            if file.is_file():
-                target = dist / file.name
-                if target.exists():
-                    raise RuntimeError(f"duplicate package: {file.name}")
-                shutil.copyfile(file, target)
         expected = {
             f"velocitty-{version}-{arch}-linux-{abi}.tar.gz"
             for arch in ("x86_64", "aarch64") for abi in ("gnu", "musl")
@@ -38,9 +69,8 @@ def main():
             f"velocitty-{version}-x86_64-windows-gnu-setup.exe",
             f"velocitty-{version}-universal-macos.dmg",
         }
-        actual = {file.name for file in dist.iterdir() if file.is_file()}
-        if actual != expected:
-            raise RuntimeError(f"release package mismatch: missing={expected-actual}, extra={actual-expected}")
+        for name, file in select_release_files(temp, expected).items():
+            shutil.copyfile(file, dist / name)
         sums = []
         for name in sorted(expected):
             file = dist / name
