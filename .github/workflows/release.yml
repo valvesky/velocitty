@@ -30,6 +30,8 @@ jobs:
         run: zig build test -Dtarget=x86_64-linux-musl
       - name: Package layout regressions
         run: python3 tests/package_test.py
+      - name: Release signing selection regressions
+        run: python3 tests/release_signing_test.py
       - name: Build and package four Linux targets
         run: zig build package -Drelease-os=linux -j2
       - name: Native GNU window and PTY smoke
@@ -136,16 +138,226 @@ jobs:
           path: packages/*.dmg
           if-no-files-found: error
 
-  publish:
+  # Sign the application, then rebuild the portable zip and Inno Setup installer
+  # from that signed executable, then sign the installer. SignPath cannot open
+  # an Inno Setup payload, so the executable has to be signed before the
+  # installer is compiled. Each request uploads one PE file. upload-artifact
+  # zips it, which is the layout in .signpath/artifact-configuration.xml.
+  # Linux tarballs and the macOS disk image are not signed.
+  # Without SIGNPATH_API_TOKEN the job succeeds and publish keeps the unsigned
+  # Windows packages. Each signing request waits up to 60 minutes for approval.
+  sign:
+    name: Sign Windows artifacts
+    needs: windows
     if: github.event_name == 'push' && (startsWith(github.ref, 'refs/heads/release/') || startsWith(github.ref, 'refs/tags/v'))
-    needs: [linux, windows, macos]
+    runs-on: windows-latest
+    timeout-minutes: 140
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check SignPath token
+        id: signpath
+        shell: pwsh
+        env:
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SIGNPATH_API_TOKEN)) {
+            Write-Host "SIGNPATH_API_TOKEN is not set. The release will publish unsigned Windows artifacts."
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "enabled=false"
+          } else {
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "enabled=true"
+          }
+
+      - uses: actions/checkout@v7.0.1
+        if: steps.signpath.outputs.enabled == 'true'
+
+      - name: Install Inno Setup if needed
+        if: steps.signpath.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $iscc = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - uses: actions/download-artifact@v8.0.2
+        if: steps.signpath.outputs.enabled == 'true'
+        with:
+          name: packages-windows
+          path: unsigned
+
+      - name: Extract unsigned velocitty.exe
+        if: steps.signpath.outputs.enabled == 'true'
+        shell: pwsh
+        run: python scripts/windows_sign.py extract-exe unsigned unsigned-exe/velocitty.exe
+
+      - name: Upload unsigned application
+        id: upload-unsigned-exe
+        if: steps.signpath.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: signpath-unsigned-velocitty-exe
+          path: unsigned-exe/velocitty.exe
+          if-no-files-found: error
+
+      - name: Sign application
+        id: sign-exe
+        if: steps.signpath.outputs.enabled == 'true'
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: 42f31b5d-7538-4692-a5fc-bfebc92df329
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'velocitty' }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG || 'test-signing' }}
+          github-artifact-id: ${{ steps.upload-unsigned-exe.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signed-exe
+
+      - name: Record application signing request
+        if: steps.signpath.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $url = "${{ steps.sign-exe.outputs.signing-request-web-url }}"
+          Write-Host "Application signing request: $url"
+          "Application signing request: $url" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+
+      - name: Require the signed application
+        if: steps.signpath.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath signed-exe\velocitty.exe)) {
+            Get-ChildItem -Recurse signed-exe | Format-Table FullName | Out-String | Write-Host
+            throw "signed executable was not extracted to signed-exe\velocitty.exe"
+          }
+
+      - name: Package portable zip and installer from the signed application
+        if: steps.signpath.outputs.enabled == 'true'
+        shell: pwsh
+        run: python scripts/windows_sign.py package-signed signed-exe/velocitty.exe signed-packages
+
+      - name: Check the portable zip contains the signed application
+        if: steps.signpath.outputs.enabled == 'true'
+        shell: pwsh
+        run: python scripts/windows_sign.py assert-exe signed-packages signed-exe/velocitty.exe
+
+      - name: Install, launch and uninstall the rebuilt installer
+        if: steps.signpath.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $installer = (Get-ChildItem signed-packages\*-setup.exe).FullName
+          $install = "$env:RUNNER_TEMP\Velocitty-signed"
+          $p = Start-Process -FilePath $installer -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/DIR=$install") -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "Installer failed: $($p.ExitCode)" }
+          python tests/desktop_smoke.py "$install\velocitty.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $p = Start-Process -FilePath "$install\unins000.exe" -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART') -Wait -PassThru
+          if ($p.ExitCode -ne 0 -or (Test-Path "$install\velocitty.exe")) { throw "Uninstall failed" }
+
+      - name: Stage the installer for signing
+        if: steps.signpath.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force unsigned-setup | Out-Null
+          Copy-Item -Path signed-packages\*-setup.exe -Destination unsigned-setup\
+          $files = @(Get-ChildItem unsigned-setup -Filter *.exe -File)
+          if ($files.Count -ne 1) { throw "expected one installer to sign, found $($files.Count)" }
+
+      - name: Upload unsigned installer
+        id: upload-unsigned-setup
+        if: steps.signpath.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: signpath-unsigned-setup
+          path: unsigned-setup/*.exe
+          if-no-files-found: error
+
+      - name: Sign installer
+        id: sign-setup
+        if: steps.signpath.outputs.enabled == 'true'
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: 42f31b5d-7538-4692-a5fc-bfebc92df329
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'velocitty' }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG || 'test-signing' }}
+          github-artifact-id: ${{ steps.upload-unsigned-setup.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signed-setup
+
+      - name: Record installer signing request
+        if: steps.signpath.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $url = "${{ steps.sign-setup.outputs.signing-request-web-url }}"
+          Write-Host "Installer signing request: $url"
+          "Installer signing request: $url" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+
+      - name: Replace the installer and check both signatures
+        if: steps.signpath.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          function Assert-Authenticode([string] $Path) {
+            $sig = Get-AuthenticodeSignature -LiteralPath $Path
+            $status = [string]$sig.Status
+            Write-Host "$Path Authenticode status=$status"
+            if ($sig.SignerCertificate) {
+              Write-Host "signer=$($sig.SignerCertificate.Subject)"
+            }
+            $rejected = @('NotSigned', 'HashMismatch', 'NotSupportedFileFormat')
+            if ($status -in $rejected -or -not $sig.SignerCertificate) {
+              throw "$Path has no usable Authenticode signature (status=$status)"
+            }
+          }
+          $signed = @(Get-ChildItem signed-setup -Filter *.exe -File)
+          if ($signed.Count -ne 1) {
+            Get-ChildItem -Recurse signed-setup | Format-Table FullName | Out-String | Write-Host
+            throw "expected one signed installer, found $($signed.Count)"
+          }
+          $dest = @(Get-ChildItem signed-packages -Filter *-setup.exe -File)
+          if ($dest.Count -ne 1) { throw "expected one installer output, found $($dest.Count)" }
+          $before = (Get-FileHash -Algorithm SHA256 -LiteralPath $dest[0].FullName).Hash
+          $signedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $signed[0].FullName).Hash
+          if ($before -eq $signedHash) { throw "signed installer is identical to the unsigned installer" }
+          Copy-Item -LiteralPath $signed[0].FullName -Destination $dest[0].FullName -Force
+          python scripts/windows_sign.py extract-exe signed-packages verify-exe/velocitty.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $unsignedExe = (Get-FileHash -Algorithm SHA256 -LiteralPath unsigned-exe\velocitty.exe).Hash
+          $signedExe = (Get-FileHash -Algorithm SHA256 -LiteralPath verify-exe\velocitty.exe).Hash
+          if ($unsignedExe -eq $signedExe) { throw "signed executable is identical to the unsigned executable" }
+          Assert-Authenticode (Resolve-Path verify-exe\velocitty.exe).Path
+          Assert-Authenticode (Resolve-Path signed-packages\*-setup.exe).Path
+
+      - name: Upload signed Windows packages
+        if: steps.signpath.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: packages-windows-signed
+          path: |
+            signed-packages/*.zip
+            signed-packages/*-setup.exe
+          if-no-files-found: error
+
+  publish:
+    needs: [linux, windows, macos, sign]
+    if: >-
+      always() &&
+      needs.linux.result == 'success' &&
+      needs.windows.result == 'success' &&
+      needs.macos.result == 'success' &&
+      (needs.sign.result == 'success' || needs.sign.result == 'skipped') &&
+      github.event_name == 'push' &&
+      (startsWith(github.ref, 'refs/heads/release/') || startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-24.04
     permissions:
       contents: write
       actions: read
     steps:
       - uses: actions/checkout@v7.0.1
-      - name: Publish complete unsigned release
+      - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}

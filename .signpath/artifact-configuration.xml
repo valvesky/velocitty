@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  GitHub Actions upload-artifact stores each signing input as a zip.
+  That zip is the SignPath root. It contains exactly one Portable Executable
+  at the archive root, with no extra files:
+
+    velocitty.exe
+      The application binary. The release workflow signs this first.
+    velocitty-<version>-x86_64-windows-gnu-setup.exe
+      The Inno Setup installer. The workflow compiles it from the signed
+      velocitty.exe, then submits this second request.
+
+  The same configuration covers both requests. Linux tarballs and the macOS
+  disk image are not submitted.
+-->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1"
+                        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                        xsi:schemaLocation="http://signpath.io/artifact-configuration/v1 https://app.signpath.io/Web/artifact-configuration/v1.xsd">
+  <zip-file>
+    <pe-file path="*.exe" min-matches="1" max-matches="1">
+      <authenticode-sign description="Velocitty" description-url="https://github.com/valvesky/velocitty"/>
+    </pe-file>
+  </zip-file>
+</artifact-configuration>
