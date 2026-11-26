@@ -138,6 +138,7 @@ fn encodeLegacy(
         .backspace => {
             if (mods.ctrl and !mods.alt and !mods.super) return "\x08";
             if (onlyAlt(mods)) return "\x1b\x7f";
+            if (m == 2 and modify_other_keys < 2) return "\x7f";
             if (any and modify_other_keys >= 1) return mok(127, m, buf);
             return "\x7f";
         },
